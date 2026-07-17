@@ -1,0 +1,25 @@
+# Секреты — никогда в git (§8.2: только .env, chmod 600)
+.env
+.env.*
+!.env.example
+
+# Окружение и сборка
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Состояние инстанса — живёт в ~/agents/<name>/state/, не в репо (§4)
+*.db
+*.db-wal
+*.db-shm
+
+# Кэши инструментов
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Артефакты цикла разработки
+.forge/
