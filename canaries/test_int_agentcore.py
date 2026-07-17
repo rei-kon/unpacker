@@ -77,7 +77,7 @@ async def test_resume_after_evict_remembers(store: Store) -> None:
             "INT-B-resume",
             f"claude_session_id={cid1}; ответ после evict+resume={answer!r}",
         )
-        assert secret in answer.upper(), (
+        assert secret in answer.text.upper(), (
             f"resume после evict не восстановил контекст — §5.1 сломан. Ответ: {answer!r}"
         )
     finally:
@@ -96,6 +96,51 @@ async def test_warm_reuse_no_reconnect(store: Store) -> None:
         live2 = pool.get_live(sess.id)
         write_results_note("INT-B-warm", f"тёплый клиент переиспользован: {live1 is live2}")
         assert live1 is live2, "клиент пересоздан вместо тёплого переиспользования"
+    finally:
+        await pool.close_all()
+
+
+@requires_live_sdk
+async def test_max_turns_classified_live(store: Store) -> None:
+    """§5.4: SDK на max_turns=1 реально отдаёт subtype='error_max_turns' → outcome max_turns.
+
+    Форсим: даём MCP-тул и просим вызвать — ход 1 уходит на tool, ответа за 1 ход не выходит.
+    """
+    from claude_agent_sdk import create_sdk_mcp_server, tool
+
+    @tool("echo", "Вернуть переданный текст.", {"text": str})
+    async def echo(args):
+        return {"content": [{"type": "text", "text": str(args.get("text", ""))}]}
+
+    server = create_sdk_mcp_server(name="c", version="1.0.0", tools=[echo])
+
+    def builder(*, cwd, resume, model):
+        kw = {
+            "cwd": cwd,
+            "permission_mode": "bypassPermissions",
+            "setting_sources": ["user", "project"],
+            "disallowed_tools": list(DANGEROUS_TOOLS),
+            "mcp_servers": {"c": server},
+            "allowed_tools": ["mcp__c__echo"],
+            "max_turns": 1,  # ход на tool → ответа не остаётся → error_max_turns
+        }
+        if resume:
+            kw["resume"] = resume
+        return ClaudeAgentOptions(**kw)
+
+    pool = ClientPool(factory=lambda o: ClaudeSDKClient(options=o), ceiling=3, idle_timeout=1800)
+    core = AgentCore(store=store, pool=pool, options_builder=builder, response_timeout=120)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    try:
+        result = await core.ask(
+            sess.id, "Вызови инструмент echo с text='привет', потом отдельно скажи готово."
+        )
+        write_results_note(
+            "INT-C-maxturns", f"outcome={result.outcome.kind}; detail={result.outcome.detail!r}"
+        )
+        assert result.outcome.kind == "max_turns", (
+            f"max_turns=1 не дал error_max_turns — §5.4 классификация неверна: {result.outcome}"
+        )
     finally:
         await pool.close_all()
 
@@ -124,6 +169,6 @@ async def test_interrupt_via_core_bypasses_lock(store: Store) -> None:
         # Клиент жив: следующий ask обслужен
         answer = await core.ask(sess.id, "Скажи ровно: ЖИВ")
         write_results_note("INT-B-interrupt", f"ответ после interrupt={answer!r}")
-        assert "ЖИВ" in answer.upper(), f"клиент не пережил interrupt: {answer!r}"
+        assert "ЖИВ" in answer.text.upper(), f"клиент не пережил interrupt: {answer!r}"
     finally:
         await pool.close_all()
