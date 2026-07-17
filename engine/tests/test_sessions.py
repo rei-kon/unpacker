@@ -1,5 +1,7 @@
 """SQLite session store — resume диалога Claude после рестарта процесса."""
+
 import pytest
+
 from engine.core.sessions import SessionStore
 
 

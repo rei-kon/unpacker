@@ -1,4 +1,5 @@
 """Allow-list гейт — бот отвечает ТОЛЬКО разрешённым Telegram user ID и только в личке."""
+
 from engine.core.security import AllowList, is_private_chat
 
 

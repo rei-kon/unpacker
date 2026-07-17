@@ -4,6 +4,7 @@
 Telegram рендерит только свой MarkdownV2 со строгим эскейпом — ручной эскейп хрупок,
 поэтому используем telegramify-markdown. При любой ошибке → None (вызов уйдёт плейн-текстом).
 """
+
 from __future__ import annotations
 
 import logging

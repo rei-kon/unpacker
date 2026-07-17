@@ -1,4 +1,5 @@
 """Конвертация Markdown → Telegram MarkdownV2 (мягко: не крашится, эскейпит)."""
+
 from engine.core.formatting import to_telegram_markdown
 
 

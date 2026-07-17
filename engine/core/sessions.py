@@ -4,6 +4,7 @@ resume в Agent SDK завязан на совпадение cwd: при нес�
 сессию (issue #555), поэтому cwd задаёт вызывающий и держит его неизменным.
 Канарейка на это поведение — canaries/test_c2_resume_cwd.py.
 """
+
 from __future__ import annotations
 
 import sqlite3

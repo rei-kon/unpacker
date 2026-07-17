@@ -5,13 +5,13 @@
 - AssistantMessage: объект с .content = [блоки]
 - ResultMessage: объект с .total_cost_usd (и именем класса ResultMessage)
 """
-import pytest
+
 from engine.core.streaming import (
+    _utf16_units,
+    collect_response_with_session,
     extract_text,
     is_result,
-    collect_response_with_session,
     split_message,
-    _utf16_units,
 )
 
 
@@ -22,6 +22,7 @@ class FakeTextBlock:
 
 class FakeToolBlock:
     """блок без .text (напр. tool_use) — не должен ломать сборку"""
+
     def __init__(self, name):
         self.name = name
 

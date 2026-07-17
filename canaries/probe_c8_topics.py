@@ -13,6 +13,7 @@
 
 Токен — только тестового бота. Живых ботов (director, icoach, gefest…) не трогаем.
 """
+
 from __future__ import annotations
 
 import asyncio

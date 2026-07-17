@@ -23,3 +23,6 @@ build/
 
 # Артефакты цикла разработки
 .forge/
+
+# Сырой лог прогона канареек — факты человек оформляет в docs/canaries/<дата>-results.md
+docs/canaries/last-run.log

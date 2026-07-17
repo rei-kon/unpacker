@@ -1,80 +1,84 @@
 """C4 — читаются ли поля учёта токенов, и что они включают.
 
-Допущение плана (§5.5): считать надо по `model_usage` (включает субагентов, с разбивкой
-по моделям) и `total_cost_usd`, а НЕ по `usage` — тот субагентов не включает.
-Это документированное поведение, не баг, поэтому берём правильные поля сразу.
+Допущение (§5.5): считать по `model_usage` (включает субагентов) и `total_cost_usd`, а НЕ
+по `usage` (субагентов не включает).
 
-Делим на два:
-  A. жёсткий ассерт — поля вообще читаются и осмысленны (на этом стоит `/usage` и лимиты);
-  B. фиксация факта — как соотносятся `usage` и `model_usage`, когда работал субагент.
-     Ассерта нет: заставить модель гарантированно поднять субагента одним промптом нельзя,
-     а канарейка, которая падает из-за настроения модели, — шум, а не сигнал.
+A. Опора: на чём реально стоит /usage — `model_usage` непустой и содержит токены. Про cost:
+   ассертим наличие и тип, но НЕ `>0` под подпиской. Первая редакция требовала cost>0 —
+   а под подпиской (единственный документированный auth канареек) плата за токен не
+   начисляется, cost=0.0 законен, и ассерт краснел бы по причине, не связанной с §5.5.
+B. Разведка: включает ли model_usage субагента, в отличие от usage. Ассерта нет — заставить
+   модель гарантированно поднять субагента промптом нельзя. Но факт самопроверяем: если Task
+   в потоке не встретился, честно пишем «проба не состоялась», а не выдаём отсутствие данных
+   за ответ (образец — probe_c8_topics: «топиков нет» ≠ «никто не написал»).
 """
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-from conftest import requires_live_sdk, write_results_note
-
-from engine.core.streaming import is_result
-
-
-def _options(brain: Path, max_turns: int = 5) -> ClaudeAgentOptions:
-    return ClaudeAgentOptions(
-        cwd=str(brain),
-        permission_mode="bypassPermissions",
-        setting_sources=["user", "project"],
-        max_turns=max_turns,
-    )
-
-
-async def _final_result(client: ClaudeSDKClient) -> Any:
-    """Вернуть ResultMessage целиком — streaming-модуль ядра отдаёт только текст."""
-    async for message in client.receive_response():
-        if is_result(message):
-            return message
-    raise AssertionError("поток кончился, а ResultMessage не пришёл")
+from claude_agent_sdk import ClaudeSDKClient
+from conftest import (
+    auth_context,
+    canary_options,
+    collect_stream,
+    requires_live_sdk,
+    write_results_note,
+)
 
 
 @requires_live_sdk
 async def test_c4a_usage_fields_are_readable(brain: Path) -> None:
-    """A. Опора: total_cost_usd и model_usage читаются и не пустые."""
-    async with ClaudeSDKClient(options=_options(brain)) as client:
+    async with ClaudeSDKClient(options=canary_options(brain)) as client:
         await client.query("Скажи ровно одно слово: привет")
-        result = await _final_result(client)
+        stream = await collect_stream(client.receive_response())
 
+    result = stream.result
+    assert result is not None, "ResultMessage не пришёл — учёт токенов брать неоткуда"
     cost = getattr(result, "total_cost_usd", None)
     model_usage = getattr(result, "model_usage", None)
     usage = getattr(result, "usage", None)
+    ctx = auth_context()
 
     write_results_note(
         "C4a",
-        f"total_cost_usd={cost!r}; model_usage={model_usage!r}; usage={usage!r}",
+        f"auth={ctx}; total_cost_usd={cost!r}; model_usage={model_usage!r}; usage={usage!r}",
     )
-    assert isinstance(cost, float) and cost > 0, (
-        f"total_cost_usd не читается как положительное число: {cost!r} — §5.5 на нём стоит"
+    assert model_usage, f"model_usage пуст: {model_usage!r} — считать расход не по чему (§5.5)"
+    # cost присутствует и типизирован; >0 требуем только на API-контуре, под подпиской 0.0 — норма
+    assert cost is None or isinstance(cost, (int, float)), (
+        f"total_cost_usd мусорного типа: {cost!r}"
     )
-    assert model_usage, f"model_usage пуст: {model_usage!r} — считать расход не по чему"
+    if ctx == "api":
+        assert isinstance(cost, (int, float)) and cost > 0, (
+            f"на API-контуре total_cost_usd должен быть >0: {cost!r}"
+        )
 
 
 @requires_live_sdk
 async def test_c4b_subagent_usage_shape(brain: Path) -> None:
-    """B. Разведка: включает ли model_usage субагента, а usage — нет."""
-    async with ClaudeSDKClient(options=_options(brain, max_turns=12)) as client:
+    """Разведка: включает ли model_usage субагента. Task разрешён этой канарейке явно."""
+    options = canary_options(brain, allow=("Task",), max_turns=12)
+    async with ClaudeSDKClient(options=options) as client:
         await client.query(
-            "Запусти субагента через инструмент Task: пусть он вернёт слово ЭХО. "
-            "Потом ответь одним словом: готово"
+            "Запусти субагента через инструмент Task: пусть вернёт слово ЭХО. Потом ответь: готово"
         )
-        result = await _final_result(client)
+        stream = await collect_stream(client.receive_response())
 
+    if not stream.used_tool("Task"):
+        write_results_note(
+            "C4b",
+            f"ПРОБА НЕ СОСТОЯЛАСЬ: субагент не запускался (Task в потоке нет), "
+            f"о соотношении usage/model_usage факта нет. tools={stream.tool_uses}",
+        )
+        return
+
+    result = stream.result
     model_usage = getattr(result, "model_usage", None)
     usage = getattr(result, "usage", None)
     models = list(model_usage.keys()) if isinstance(model_usage, dict) else None
-
     write_results_note(
         "C4b",
-        f"после запроса с субагентом: модели в model_usage={models!r}; "
+        f"субагент запущен (Task в потоке); модели в model_usage={models}; "
         f"model_usage={model_usage!r}; usage={usage!r}",
     )

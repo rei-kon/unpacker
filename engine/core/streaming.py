@@ -5,9 +5,11 @@ Duck-typing по структуре SDK (не импортируем класс�
 - сообщение  → есть итерируемый .content (список блоков)
 - финал      → ResultMessage (по имени класса) или наличие .total_cost_usd
 """
+
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 TELEGRAM_LIMIT = 4096  # лимит Telegram — в единицах UTF-16, см. split_message
 _EMPTY_PLACEHOLDER = "…"

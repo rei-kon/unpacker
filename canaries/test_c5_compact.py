@@ -1,51 +1,59 @@
 """C5 — работает ли `/compact` слэш-строкой в headless.
 
-Это не проверка допущения, а **разведка по открытому вопросу №1** плана: «`/compact` в headless
-— канарейка фазы 0 решит: слэш-строка или программный фолбэк». Поэтому здесь нет жёсткого
-ассерта: у нас нет ожидания, которое можно опровергнуть. Есть вопрос, на который нужен
-записанный ответ — от него зависит, попадёт ли `/compact` в фазу 2 (§5.5, слой 2).
+Разведка по открытому вопросу №1 плана: слэш-строка или программный фолбёк. Ассерта нет —
+у нас нет ожидания, только вопрос, требующий записанного ответа (от него зависит, попадёт
+ли `/compact` в фазу 2, §5.5 слой 2).
 
-Ассерт тут был бы враньём: он превратил бы «мы не знаем» в «мы требуем».
+Первая редакция читала ТЕКСТ ответа модели — а «Хорошо, сжимаю историю» неотличимо от
+реального сжатия, и разведка ошибалась в обе стороны. Единственный измеримый признак
+компакта — падение занятости контекста. Меряем get_context_usage() до и после; факт — числа,
+а не болтовня модели.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-from conftest import requires_live_sdk, write_results_note
+from claude_agent_sdk import ClaudeSDKClient
+from conftest import canary_options, collect_stream, requires_live_sdk, write_results_note
 
-from engine.core.streaming import collect_response_with_session
+
+def _tokens(usage: Any) -> Any:
+    if isinstance(usage, dict):
+        return usage.get("totalTokens")
+    return getattr(usage, "totalTokens", None)
 
 
 @requires_live_sdk
 async def test_c5_compact_slash_string(brain: Path) -> None:
-    options = ClaudeAgentOptions(
-        cwd=str(brain),
-        permission_mode="bypassPermissions",
-        setting_sources=["user", "project"],
-        max_turns=5,
-    )
+    async with ClaudeSDKClient(options=canary_options(brain)) as client:
+        # Набиваем историю — компактить пустоту бессмысленно
+        for word in ("раз", "два", "три"):
+            await client.query(f"Скажи ровно одно слово: {word}")
+            await collect_stream(client.receive_response())
 
-    async with ClaudeSDKClient(options=options) as client:
-        # Сперва набиваем хоть какую-то историю — компактить пустоту бессмысленно
-        await client.query("Скажи ровно одно слово: раз")
-        await collect_response_with_session(client.receive_response())
-        await client.query("Скажи ровно одно слово: два")
-        await collect_response_with_session(client.receive_response())
+        before = _tokens(await client.get_context_usage())
 
         try:
             await client.query("/compact")
-            text, session = await collect_response_with_session(client.receive_response())
-            outcome = f"ответ={text!r}; session_id={session!r}"
+            stream = await collect_stream(client.receive_response())
+            outcome = f"ответ={stream.full_text!r}; session_id={stream.session_id}"
         except Exception as exc:  # noqa: BLE001 — исключение это тоже ответ на вопрос
             outcome = f"исключение: {exc!r}"
 
+        after = _tokens(await client.get_context_usage())
+
         # Живой ли клиент после /compact — отдельный вопрос той же важности
         try:
-            await client.query("Скажи ровно одно слово: три")
-            after, _ = await collect_response_with_session(client.receive_response())
-            alive = f"клиент жив, ответ={after!r}"
+            await client.query("Скажи ровно одно слово: четыре")
+            tail = await collect_stream(client.receive_response())
+            alive = f"клиент жив, ответ={tail.full_text!r}"
         except Exception as exc:  # noqa: BLE001
             alive = f"клиент умер после /compact: {exc!r}"
 
-    write_results_note("C5", f"/compact слэш-строкой → {outcome} | после: {alive}")
+    shrank = isinstance(before, int) and isinstance(after, int) and after < before
+    write_results_note(
+        "C5",
+        f"totalTokens до={before} после={after} (сжалось={shrank}) | {outcome} | после: {alive}",
+    )

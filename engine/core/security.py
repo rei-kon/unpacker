@@ -2,6 +2,7 @@
 
 Fail-closed: неизвестный/пустой/None/не-личный чат → запрет.
 """
+
 from __future__ import annotations
 
 
@@ -13,9 +14,7 @@ def is_private_chat(chat_type: str | None) -> bool:
 class AllowList:
     def __init__(self, allowed_ids: list[int]):
         # храним только int — строки/None/bool не должны случайно совпасть
-        self._allowed = {
-            i for i in allowed_ids if isinstance(i, int) and not isinstance(i, bool)
-        }
+        self._allowed = {i for i in allowed_ids if isinstance(i, int) and not isinstance(i, bool)}
 
     def is_allowed(self, user_id: int | None) -> bool:
         if not isinstance(user_id, int) or isinstance(user_id, bool):

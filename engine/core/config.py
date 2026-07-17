@@ -1,4 +1,5 @@
 """Конфиг из окружения / .env (Pydantic Settings)."""
+
 from __future__ import annotations
 
 from typing import Annotated
@@ -8,9 +9,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # Telegram
     telegram_bot_token: str
