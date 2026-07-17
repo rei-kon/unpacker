@@ -52,6 +52,9 @@ DANGEROUS_TOOLS = [
     "KillShell",
     "WebFetch",
     "WebSearch",
+    # Субагент: в SDK 0.2.121 тул зовётся Agent (не Task) — наследует bypassPermissions,
+    # свой контекст без «будь безобиден». Режем оба имени; C4b разрешает явно через allow.
+    "Agent",
     "Task",
 ]
 

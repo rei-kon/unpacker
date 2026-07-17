@@ -19,7 +19,7 @@ SHELL := bash
 # У этого юзера должен быть свой auth: `claude setup-token` под ним, либо
 # CLAUDE_CODE_OAUTH_TOKEN в его окружении. Токен НЕ передаём флагами (утечка в ps/history).
 CANARY_SSH ?= canary@openclaw
-VPS_DIR    ?= /root/canary-unpacker
+VPS_DIR    ?= /home/canary/canary-unpacker
 
 install:
 	uv sync --extra dev
@@ -54,7 +54,7 @@ canary-preflight:
 # ЗАПИШЕТ поверх одноимённых файлов живого сервиса (напр. при опечатке VPS_DIR).
 # exclude .env/.env.* — секрет не должен уехать на VPS и осесть там (нет --delete).
 canary-remote:
-	@case '$(VPS_DIR)' in /root/canary-*) ;; *) echo "VPS_DIR='$(VPS_DIR)' вне /root/canary-* — отказ (защита от записи поверх чужого)"; exit 1;; esac
+	@case '$(VPS_DIR)' in /home/*/canary-*|/root/canary-*) ;; *) echo "VPS_DIR='$(VPS_DIR)' вне */canary-* — отказ (защита от записи поверх чужого)"; exit 1;; esac
 	rsync -az --exclude '.venv' --exclude '.git' --exclude '__pycache__' \
 		--exclude '.pytest_cache' --exclude '.mypy_cache' --exclude '.ruff_cache' \
 		--exclude '.env' --exclude '.env.*' \

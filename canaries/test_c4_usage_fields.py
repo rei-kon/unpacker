@@ -57,18 +57,22 @@ async def test_c4a_usage_fields_are_readable(brain: Path) -> None:
 
 @requires_live_sdk
 async def test_c4b_subagent_usage_shape(brain: Path) -> None:
-    """Разведка: включает ли model_usage субагента. Task разрешён этой канарейке явно."""
-    options = canary_options(brain, allow=("Task",), max_turns=12)
+    """Разведка: включает ли model_usage субагента.
+
+    Прогон 2026-07-18 показал: тул субагента в SDK 0.2.121 зовётся `Agent` (поля
+    subagent_type/run_in_background), не `Task`. Разрешаем оба имени — устойчиво к версии.
+    """
+    options = canary_options(brain, allow=("Agent", "Task"), max_turns=12)
     async with ClaudeSDKClient(options=options) as client:
         await client.query(
-            "Запусти субагента через инструмент Task: пусть вернёт слово ЭХО. Потом ответь: готово"
+            "Запусти субагента (инструмент Agent/Task): пусть вернёт ЭХО. Потом ответь: готово"
         )
         stream = await collect_stream(client.receive_response())
 
-    if not stream.used_tool("Task"):
+    if not (stream.used_tool("Agent") or stream.used_tool("Task")):
         write_results_note(
             "C4b",
-            f"ПРОБА НЕ СОСТОЯЛАСЬ: субагент не запускался (Task в потоке нет), "
+            f"ПРОБА НЕ СОСТОЯЛАСЬ: субагент не запускался (Agent/Task в потоке нет), "
             f"о соотношении usage/model_usage факта нет. tools={stream.tool_uses}",
         )
         return
