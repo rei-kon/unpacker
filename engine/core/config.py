@@ -30,8 +30,20 @@ class Settings(BaseSettings):
     # Auth подписки (наследуется subprocess claude CLI)
     claude_code_oauth_token: str | None = None
 
-    # Хранилище сессий
-    db_path: str = "sessions.db"
+    # Инстанс-состояние (§4: живёт в ~/agents/<name>/state/, не в мозге)
+    db_path: str = "state.db"
+    health_path: str = "health.json"
+
+    # Проекты/мозги
+    # Дефолтный проект окна при первом сообщении; пусто → первый активный из БД.
+    default_project_slug: str | None = None
+    # Простой клиента до idle-evict (§5.1) — сек; освобождает RAM в тишине.
+    idle_timeout: float = 1800.0
+
+    @property
+    def owner_user_id(self) -> int | None:
+        """Владелец = первый из allow-list (кому шлём health-алерты §5.4)."""
+        return self.allowed_user_ids[0] if self.allowed_user_ids else None
 
     @field_validator("allowed_user_ids", mode="before")
     @classmethod
