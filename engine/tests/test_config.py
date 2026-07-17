@@ -33,13 +33,6 @@ def test_loads_from_env(monkeypatch):
     assert s.allowed_user_ids == [111, 222]
 
 
-def test_default_office_cwd(monkeypatch):
-    for k, v in _base_env().items():
-        monkeypatch.setenv(k, v)
-    s = _settings()
-    assert s.office_cwd == "/root/ai-office-v2"
-
-
 def test_allowed_ids_single(monkeypatch):
     for k, v in _base_env(ALLOWED_USER_IDS="555").items():
         monkeypatch.setenv(k, v)

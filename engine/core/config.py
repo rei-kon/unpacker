@@ -17,7 +17,8 @@ class Settings(BaseSettings):
     allowed_user_ids: Annotated[list[int], NoDecode]
 
     # Агент
-    office_cwd: str = "/root/ai-office-v2"
+    # office_cwd удалён: в модели §5.2 cwd берётся из projects.brain_path (store.py),
+    # дефолт на боевой каталог был миной молчаливого отказа (находка ревью Фазы 0).
     system_prompt: str | None = None
     # append-личность поверх пресета claude_code: один движок обслуживает любую
     # папку-мозг, сохраняя весь тулинг Claude Code
