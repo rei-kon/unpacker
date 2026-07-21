@@ -19,9 +19,10 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, ReactionTypeEmoji
 
+from engine.adapters.telegram.draft import DraftStreamer
 from engine.adapters.telegram.render import render_result, render_tool_status
 from engine.adapters.telegram.router import NoProjectError, SessionRouter
-from engine.core.events import ToolStarted
+from engine.core.events import TextDelta, TextStart, ToolStarted
 from engine.core.formatting import to_telegram_markdown
 from engine.core.pool import ClientPool
 from engine.core.security import AllowList
@@ -195,7 +196,21 @@ class TelegramBot:
         except Exception:  # noqa: BLE001 — typing косметический, не должен рвать обработку
             pass
 
-        on_event = self._make_status_handler(message)
+        status = self._make_status_handler(message)
+        draft = DraftStreamer(self._bot, chat_id=chat_id, thread_id=thread_id)
+
+        def on_event(event) -> None:
+            # Велс-трюк §9: текст «печатается» черновиком; статусы тулов — как раньше.
+            # Осознанная косметика: при двух параллельных сообщениях одного топика черновик
+            # второго может появиться раньше финала первого (session_lock отпускается до
+            # отправки финала) — данные не теряются, строгий порядок не гарантируем.
+            if isinstance(event, TextDelta):
+                draft.on_delta(event.text)
+            elif isinstance(event, TextStart):
+                draft.on_reset()
+            elif status is not None:
+                status(event)
+
         try:
             result = await self._router.on_message(
                 chat_id=chat_id,
@@ -207,6 +222,9 @@ class TelegramBot:
         except NoProjectError:
             await self._reply(message, "Пока нет ни одного развёрнутого проекта.")
             return
+        finally:
+            # Черновик убираем ДО финала: финал приходит отдельным аккуратным сообщением.
+            await draft.finish()
         for chunk in split_message(render_result(result)):
             await self._reply(message, chunk)
 

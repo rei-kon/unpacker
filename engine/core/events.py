@@ -4,11 +4,14 @@ verbose 0 обслуживает collect_response_with_session (только ф�
 нужны события ПО ХОДУ: «запускаю инструмент X» — статус-сообщение, которое редактируется.
 Здесь ядро превращает поток SDK в события; РЕНДЕРИНГ (статус в чат) — забота адаптера (Срез D).
 
-События (verbose-уровни §5.3):
+События (verbose-уровни §5.3 + псевдо-стриминг §9):
   • ToolStarted — начат tool-вызов (verbose ≥1 показывает как статус);
+  • TextStart  — началось новое assistant-сообщение (черновик «печатает…» начинается заново);
+  • TextDelta  — кусок текста по мере генерации (include_partial_messages);
   • Final — финал: текст последнего содержательного сообщения + session_id + Outcome (§5.4).
 
-Duck-typing, как в streaming.py — классы SDK не импортируем.
+Дельты субагентов (parent_tool_use_id) не эмитятся — в черновик владельца чужая болтовня
+не течёт. Duck-typing, как в streaming.py — классы SDK не импортируем.
 """
 
 from __future__ import annotations
@@ -27,13 +30,23 @@ class ToolStarted:
 
 
 @dataclass(frozen=True)
+class TextStart:
+    pass
+
+
+@dataclass(frozen=True)
+class TextDelta:
+    text: str
+
+
+@dataclass(frozen=True)
 class Final:
     text: str
     session_id: str | None
     outcome: Outcome
 
 
-Event = ToolStarted | Final
+Event = ToolStarted | TextStart | TextDelta | Final
 
 
 async def stream_events(messages: AsyncIterator[Any]) -> AsyncIterator[Event]:
@@ -50,6 +63,20 @@ async def stream_events(messages: AsyncIterator[Any]) -> AsyncIterator[Event]:
         sid = getattr(message, "session_id", None)
         if isinstance(sid, str) and sid:
             session_id = sid
+
+        raw = getattr(message, "event", None)
+        if isinstance(raw, dict):  # StreamEvent (партиал) — у него нет .content и .total_cost_usd
+            if getattr(message, "parent_tool_use_id", None):
+                continue  # болтовня субагента — не для черновика
+            etype = raw.get("type")
+            if etype == "message_start":
+                yield TextStart()
+            elif etype == "content_block_delta":
+                delta = raw.get("delta") or {}
+                text = delta.get("text")
+                if delta.get("type") == "text_delta" and isinstance(text, str):
+                    yield TextDelta(text)
+            continue
 
         if is_result(message):
             yield Final(last_text, session_id, classify_result(message))

@@ -35,6 +35,9 @@ def _options_builder(settings: Settings):
             "cwd": cwd,
             "permission_mode": "bypassPermissions",
             "setting_sources": ["user", "project"],
+            # Псевдо-стриминг §9 (Велс-трюк): токен-дельты для черновика «печатает…».
+            # Событий становится на порядок больше — on_event обязан оставаться дешёвым.
+            "include_partial_messages": True,
         }
         if resume:
             kw["resume"] = resume
