@@ -1,0 +1,47 @@
+[Unit]
+# ИСТИННЫЙ templated-юнит: одно определение обслуживает всех агентов через agent-tg@<name>.
+# Пер-агентные пути выведены из имени инстанса %i — файл одинаков для всех агентов, так что
+# передеплой агента B не затирает WorkingDirectory/EnvironmentFile агента A.
+# Инстанс-каталог: REPLACE_WITH_AGENTS_BASE/%i (несёт .env + state/).
+# Движок — общий клон (REPLACE_WITH_RUNTIME_PATH), НИКОГДА не копируется под агента.
+Description=unpacker — Claude Agent SDK Telegram-бот (%i)
+After=network-online.target
+Wants=network-online.target
+# Анти-крашлуп: StartLimit* читаются systemd ТОЛЬКО из [Unit] (в [Service] молча игнорятся).
+# 5 стартов за 60с → unit уходит в failed, а не рестартует вечно (напр. при битом токене).
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=REPLACE_WITH_LINUX_USER
+# cwd = инстанс-каталог по имени %i. Относительный DB_PATH/HEALTH_PATH из .env резолвятся отсюда;
+# проверено: `uv run --project` НЕ меняет cwd.
+WorkingDirectory=REPLACE_WITH_AGENTS_BASE/%i
+EnvironmentFile=REPLACE_WITH_AGENTS_BASE/%i/.env
+# PATH обязателен: SDK спавнит `claude` по PATH-lookup. systemd-дефолт PATH не включает per-user
+# установки (~/.local/bin, npm-prefix) — без этого бот поднимется, но КАЖДОЕ сообщение упадёт
+# (claude не найден). Включаем домашние bin RUN_USER + системные.
+Environment=PATH=REPLACE_WITH_RUN_HOME/.local/bin:REPLACE_WITH_RUN_HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Общий движок через --project; никогда не копируется под агента. `python -m engine` — точка входа.
+ExecStart=REPLACE_WITH_UV_PATH run --project REPLACE_WITH_RUNTIME_PATH python -m engine
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+# mixed: SIGTERM главному процессу (грациозное закрытие asyncio), затем SIGKILL всей cgroup по
+# таймауту — иначе subprocess `claude`/node осиротеют при restart и накопятся (утечка RAM/дескрипторов).
+KillMode=mixed
+# Тест-бот НЕ нуждается в sudo (в отличие от мета-агента Распаковщика §7.5, C3) → режем привилегии.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-tg-%i
+
+[Install]
+# autostart после reboot — критерий С1 «переживает reboot».
+WantedBy=multi-user.target
