@@ -450,3 +450,38 @@ def test_brains_that_promise_files_teach_the_real_marker():
             assert paths, (
                 f"{doc.relative_to(REPO)}: движок не распознал маркер из документа: {marker}"
             )
+
+
+# ── README не спорит сам с собой (M-10) ──────────────────────────────────────
+
+# Фича, у которой в Settings есть выключатель, в движке ЕСТЬ. Значит числить её в «чего ещё
+# нет» нельзя: ученик не станет пользоваться тем, что README объявил недоделанным.
+FEATURE_SWITCHES = {
+    "кнопк": "buttons_enabled",
+    "приём файл": "uploads_enabled",
+    "отдача файл": "send_file_enabled",
+}
+
+
+def _readme_section(anchor: str) -> str:
+    """Текст от строки с якорем до ближайшего разделителя `---` или заголовка."""
+    text = README.read_text()
+    start = text.index(anchor)
+    rest = text[start:]
+    for stop in ("\n---", "\n## "):
+        if stop in rest:
+            rest = rest[: rest.index(stop)]
+    return rest.lower()
+
+
+def test_readme_does_not_list_shipped_features_as_missing():
+    """M-10: кнопки и файлы стояли в разделе «чего ещё нет», хотя это содержимое релиза.
+
+    Источник правды — выключатели в `Settings`: если у фичи есть флаг, фича в движке есть.
+    """
+    missing_section = _readme_section("Чего ещё нет")
+    for word, field in FEATURE_SWITCHES.items():
+        assert field in Settings.model_fields, f"поле {field} переименовали — поправь карту теста"
+        assert word not in missing_section, (
+            f"README числит «{word}…» в недоделанном, хотя в движке есть выключатель {field}"
+        )
