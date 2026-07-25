@@ -311,7 +311,9 @@ latest_tag() { git -C "$1" tag --sort=-v:refname 2>/dev/null | head -1 || true; 
 # Приватный репо анонимно не клонируется. Дружелюбный путь — gh device-flow: короткий код
 # вводится в браузере на ноутбуке (тот же жест, что claude setup-token).
 ensure_repo_auth() {
-  git ls-remote --exit-code "$REPO_URL" >/dev/null 2>&1 && return 0
+  # GIT_TERMINAL_PROMPT=0: без него git по HTTPS спрашивает логин/пароль прямо в терминале
+  # и ждёт вечно — для новичка это «установка зависла». Пусть лучше честно откажет.
+  GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$REPO_URL" >/dev/null 2>&1 && return 0
   say "  ! репо курса приватный — GitHub просит авторизацию"
   # Вход по коду требует живого человека у терминала. В --non-interactive его запускать
   # нельзя: процесс повис бы навсегда, ожидая ввод (типовая порча автоматических прогонов).
@@ -323,7 +325,7 @@ ensure_repo_auth() {
     say "    сейчас откроется код для входа: скопируй его и введи на github.com/login/device"
     run gh auth login --hostname github.com --git-protocol https --web
     run gh auth setup-git
-    git ls-remote --exit-code "$REPO_URL" >/dev/null 2>&1 && return 0
+    GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$REPO_URL" >/dev/null 2>&1 && return 0
   fi
   block "нет доступа к репо $REPO_URL. Дружелюбный путь: поставь gh ($SUDO apt-get install -y gh) и запусти install.sh снова — он проведёт через вход по коду. Путь для продвинутых: сделай fine-grained PAT с правом Contents:Read и запусти с --repo https://<логин>:<PAT>@github.com/<owner>/<repo>.git"
   flush_blockers

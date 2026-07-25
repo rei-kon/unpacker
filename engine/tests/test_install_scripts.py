@@ -1062,3 +1062,33 @@ def test_update_dry_run_does_not_claim_it_updated(tmp_path):
     assert r.returncode == 0, out
     assert "готово" not in out
     assert "ничего не изменено" in out
+
+
+def test_install_probes_private_repo_without_credential_prompt(tmp_path):
+    """Проба доступа к репо не должна уметь спросить логин/пароль.
+
+    На свежем VPS git по HTTPS спрашивает логин прямо в терминале и ждёт вечно — для
+    новичка это «установка зависла». GIT_TERMINAL_PROMPT=0 превращает это в честный отказ.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "tmux", "claude", "sudo", "apt-get"))
+    probe_git = stub / "git"
+    probe_git.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "ls-remote" ]; then\n'
+        '  printf "ls-remote prompt=%s\\n" "${GIT_TERMINAL_PROMPT:-unset}" >> "$STUB_LOG"\n'
+        "  exit 128\nfi\nexit 0\n"
+    )
+    probe_git.chmod(0o755)
+    run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(tmp_path / "opt" / "unpacker"),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    assert "ls-remote prompt=0" in (tmp_path / "stub.log").read_text()
