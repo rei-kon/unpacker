@@ -15,7 +15,12 @@
 # Файл пишет install.sh (root:root, 0644). Мы его ПАРСИМ ПОСТРОЧНО, а НЕ сорсим: привычка
 # `source` любого конфига — ровно тот класс дыр, что SEC-1/SEC-2 (подложенный файл = код от
 # root). Берём только известные ключи, значения без подстановок и без шелл-метасимволов.
-ENGINE_CONF="${UNPACKER_ENGINE_CONF:-/etc/unpacker/engine.conf}"
+# Путь к карте берём в порядке: уже заданный вызывающим (install.sh сорсит этот файл, чтобы
+# резолвить пути ТЕМ ЖЕ кодом, и свой ENGINE_CONF у него уже вычислен) → явный
+# UNPACKER_ENGINE_CONF → каталог из UNPACKER_ETC → системный дефолт. Без первых двух звеньев
+# мы затирали значение вызывающего своим дефолтом: install.sh писал карту в один каталог, а
+# читал бы из другого — тот самый класс «две вселенных путей», ради которого карта и введена.
+ENGINE_CONF="${ENGINE_CONF:-${UNPACKER_ENGINE_CONF:-${UNPACKER_ETC:-/etc/unpacker}/engine.conf}}"
 CONF_RUN_USER="" CONF_RUNTIME="" CONF_AGENTS_BASE="" CONF_BRAINS_BASE="" CONF_UV_BIN=""
 CONF_VENV=""
 _ENGINE_CONF_LOADED="false"

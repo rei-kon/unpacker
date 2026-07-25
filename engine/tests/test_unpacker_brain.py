@@ -28,6 +28,7 @@ from pathlib import Path
 # иначе тест зелёный на файле, который движок у ученика отвергнет. Фикстуры api_base и
 # isolated_runtime приходят из engine/tests/conftest.py — импортировать их больше не нужно.
 from engine.core.brain import load_passport
+
 REPO = Path(__file__).resolve().parents[2]
 BRAIN = REPO / "brains" / "unpacker"
 CLAUDE_MD = BRAIN / "CLAUDE.md"
@@ -42,13 +43,10 @@ SCRIPTS = {
     "update.sh": REPO / "update.sh",
 }
 
-# Флаги, которых в скриптах пока нет: их добавляет параллельная зона deploy (решение Р5 —
-# секреты передаются файлом, а не argv, иначе токен навсегда в /var/log/auth.log).
-# Список СТРОГИЙ: как только флаг появился в скрипте, тест ниже краснеет и требует убрать его
-# отсюда — иначе «временное исключение» осталось бы в репо навсегда.
-PENDING_FLAGS = {
-    "deploy.sh": {"--token-file", "--cc-token-file"},
-}
+# Долгов нет: `--token-file`/`--cc-token-file` доехали в deploy.sh (Р5 — секрет передаётся
+# файлом, а не argv, иначе токен навсегда в /var/log/auth.log). Пустой словарь оставлен
+# сознательно: пока он пуст, проверка «мозг не выдумывает флаги» работает без дырок.
+PENDING_FLAGS: dict[str, set[str]] = {}
 
 
 def _brain_docs() -> list[Path]:
@@ -219,15 +217,17 @@ def _script_flags(path: Path) -> set[str]:
     return set(re.findall(r"--[a-z][a-z0-9-]+", path.read_text()))
 
 
-def test_pending_flags_are_still_missing():
-    """Страховка от вечного исключения: появился флаг — убери его из PENDING_FLAGS."""
-    for script, flags in PENDING_FLAGS.items():
-        real = _script_flags(SCRIPTS[script])
-        arrived = sorted(flags & real)
-        assert not arrived, (
-            f"{script} уже знает {arrived} — убери их из PENDING_FLAGS, "
-            "иначе проверка выдуманных флагов остаётся дырявой"
-        )
+def test_no_pending_flags_left():
+    """Страховка от вечного исключения: список долгов обязан быть пустым.
+
+    Каждое имя здесь — это флаг, который мозгу разрешено печатать, не имея его в скрипте.
+    То есть ровно та ситуация, от которой защищает соседний тест: агент говорит владельцу
+    команду, а скрипт отвечает «Неизвестный флаг».
+    """
+    assert not PENDING_FLAGS, (
+        f"долги по флагам не закрыты: {PENDING_FLAGS} — реализовать флаг в скрипте "
+        "или убрать его из документов мозга, но не держать исключение"
+    )
 
 
 def test_brain_mentions_only_real_script_flags():

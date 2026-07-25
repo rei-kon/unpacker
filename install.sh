@@ -717,11 +717,24 @@ dialog_step() {
 # тихо рапортовала успех. Здесь же лечится и потеря TG_BRAINS_BASE при env_reset (ADV-09).
 write_machine_config() {
   local body
-  body="$(printf '# Машинный конфиг движка «Распаковщик» — единая карта путей.\n# Пишет install.sh. Читают deploy/_common.sh и update.sh: ПОСТРОЧНО, без source.\n# Правь только если знаешь, что делаешь: сюда смотрят все точки входа.\nTG_RUN_USER=%s\nTG_RUNTIME=%s\nTG_AGENTS_BASE=%s\nTG_BRAINS_BASE=%s\nTG_UV_BIN=%s\n' \
-    "$RUN_USER" "$ENGINE_DIR" "$AGENTS_BASE" "$BRAINS_DIR" "$UV_BIN")"
-  run_root mkdir -p "$ETC_DIR"
+  # TG_VENV обязателен: venv вынесен из дерева движка (Р1), и без этой строки `uv` у deploy.sh
+  # уйдёт в дефолтный $RUNTIME/.venv — то есть в root-owned каталог, куда run-user писать не
+  # может. Симптом был бы «деплой нового бота падает на правах», причина — невидима.
+  body="$(printf '# Машинный конфиг движка «Распаковщик» — единая карта путей.\n# Пишет install.sh. Читают deploy/_common.sh и update.sh: ПОСТРОЧНО, без source.\n# Правь только если знаешь, что делаешь: сюда смотрят все точки входа.\nTG_RUN_USER=%s\nTG_RUNTIME=%s\nTG_AGENTS_BASE=%s\nTG_BRAINS_BASE=%s\nTG_UV_BIN=%s\nTG_VENV=%s\n' \
+    "$RUN_USER" "$ENGINE_DIR" "$AGENTS_BASE" "$BRAINS_DIR" "$UV_BIN" "$UV_PROJECT_ENVIRONMENT")"
+  if ! run_root mkdir -p "$ETC_DIR" 2>/dev/null; then
+    block "не создать каталог $ETC_DIR" "sudo mkdir -p $ETC_DIR"
+    flush_blockers
+  fi
   write_root_file "$ENGINE_CONF" "$body" 0644
   run_root chown root:root "$ENGINE_CONF" 2>/dev/null || true
+  # Проверяем ФАКТ записи, а не отсутствие ошибки: write_root_file применяет права
+  # best-effort, и молча потерянная карта путей вернула бы весь класс ADV-05/ADV-09
+  # («каждая точка входа читает свою вселенную путей и рапортует успех»).
+  if [ ! -s "$ENGINE_CONF" ] && [ "$DRY_RUN" != "true" ]; then
+    block "карта путей $ENGINE_CONF не записалась" "проверь права на $ETC_DIR и запусти установщик снова"
+    flush_blockers
+  fi
   say "    карта путей: $ENGINE_CONF"
 }
 

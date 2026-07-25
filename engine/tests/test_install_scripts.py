@@ -925,6 +925,13 @@ def test_install_records_paths_in_machine_config(tmp_path):
     assert not conf["TG_UV_BIN"].startswith("/root/"), (
         "uv из /root недостижим для юзера движка (mode 700) — это и есть C4"
     )
+    # Стык зон: deploy/_common.sh читает TG_VENV, чтобы `uv sync`/`uv run` от run-user'а не
+    # полезли в $RUNTIME/.venv — дерево движка root-owned и go-w (Р1), там запись запрещена.
+    # Без этой строки деплой любого нового бота из чата упирается в права, а причина не видна.
+    assert conf["TG_VENV"], "venv движка обязан быть в карте путей (Р1: он вынесен из дерева)"
+    assert not conf["TG_VENV"].startswith(str(engine)), (
+        "venv внутри root-owned дерева движка недостижим для записи юзеру движка"
+    )
     path = tmp_path / "etc" / "unpacker" / "engine.conf"
     assert oct(path.stat().st_mode)[-3:] == "644", "карту путей читают все точки входа"
 

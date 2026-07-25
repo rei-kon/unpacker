@@ -205,21 +205,11 @@ def test_passport_fields_without_consumer_are_marked_honestly():
 # в карте настроек они присутствуют только как закомментированные имена.
 SECRET_FIELDS = frozenset({"telegram_bot_token", "claude_code_oauth_token"})
 
-# Ручки, которых в шаблоне пока нет. Их вписывает параллельная зона deploy (M-13 + Р8).
-# Список СТРОГИЙ: появился ключ в шаблоне — тест краснеет и требует убрать его отсюда.
-PENDING_ENV_KEYS = frozenset(
-    {
-        "SYSTEM_PROMPT",
-        "SYSTEM_PROMPT_APPEND",
-        "MAX_TURNS",
-        "BUTTONS_ENABLED",
-        "BUTTONS_PATH",
-        "UPLOADS_ENABLED",
-        "UPLOADS_DIR",
-        "MAX_UPLOAD_BYTES",
-        "SEND_FILE_ENABLED",
-    }
-)
+# Долгов больше нет: все ручки Фазы 1b доехали в шаблон (шесть — из зоны deploy, три
+# оставшихся — SYSTEM_PROMPT/SYSTEM_PROMPT_APPEND/MAX_TURNS — дописаны при сшивке зон).
+# Список оставлен пустым сознательно: если кто-то снова заведёт «временное исключение»,
+# тест ниже потребует его объяснить, а не тихо унести полноту карты настроек.
+PENDING_ENV_KEYS: frozenset[str] = frozenset()
 
 
 def _env_template_keys() -> set[str]:
@@ -248,12 +238,16 @@ def test_env_template_documents_every_settings_field():
     )
 
 
-def test_pending_env_keys_are_still_missing():
-    """Страховка от вечного исключения: ключ появился в шаблоне — убери его из PENDING."""
-    arrived = sorted(PENDING_ENV_KEYS & _env_template_keys())
-    assert not arrived, (
-        f"шаблон .env уже знает {arrived} — убери их из PENDING_ENV_KEYS, "
-        "иначе полнота карты настроек больше ничем не держится"
+def test_no_pending_env_keys_left():
+    """Страховка от вечного исключения: список долгов обязан быть пустым.
+
+    Исключение имело смысл, пока ключи дописывала параллельная зона. Теперь любое имя здесь —
+    это дырка в карте настроек: ученик о ручке не узнает, потому что единственный документ,
+    который он видит (шаблон .env), про неё молчит.
+    """
+    assert not PENDING_ENV_KEYS, (
+        f"долги по шаблону .env не закрыты: {sorted(PENDING_ENV_KEYS)} — "
+        "вписать ключи в deploy/templates/.env.template, а не держать исключение"
     )
 
 
