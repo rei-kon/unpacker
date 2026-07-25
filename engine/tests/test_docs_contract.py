@@ -22,6 +22,7 @@ from pathlib import Path
 
 from engine.core.brain import BrainPassport, PassportError, load_passport
 from engine.core.config import Settings
+from engine.core.sendfile import extract_send_files
 
 REPO = Path(__file__).resolve().parents[2]
 README = REPO / "README.md"
@@ -425,3 +426,27 @@ def test_docs_do_not_claim_that_shipped_files_are_missing():
     assert not problems, "документ объявляет отсутствующим то, что уже в репо:\n" + "\n".join(
         problems
     )
+
+
+def test_brains_that_promise_files_teach_the_real_marker():
+    """Обещание «пришлю файлом» без названного маркера — мёртвая фича (M-04, док-половина).
+
+    Отдача файла в движке одна: агент пишет в ответ `[SEND_FILE:путь]`, движок вырезает маркер
+    и отправляет документ. Модель узнаёт про этот контракт только из текста, который к ней
+    доехал, — значит мозг, обещающий файлы, обязан назвать маркер. Пример из документа
+    скармливаем ПРОДАКШН-парсеру: разойдётся синтаксис — тест покраснеет.
+    """
+    for doc in (BRAINS / "_template" / "CLAUDE.md", EXAMPLES / "assistant" / "CLAUDE.md"):
+        text = doc.read_text()
+        if not re.search(r"присылаешь файлом|пришлю файлом|отдаёшь файлом", text):
+            continue
+        markers = re.findall(r"\[SEND_FILE:[^\]\n]*\]", text)
+        assert markers, (
+            f"{doc.relative_to(REPO)} обещает отдать файл, но не называет маркер "
+            "`[SEND_FILE:путь]` — модель про механизм не узнает и обещание останется словами"
+        )
+        for marker in markers:
+            _, paths = extract_send_files(marker)
+            assert paths, (
+                f"{doc.relative_to(REPO)}: движок не распознал маркер из документа: {marker}"
+            )
