@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from aiogram.types import Chat, Message, Update, User, Voice
@@ -74,7 +75,9 @@ def wired(tmp_path):
 
 def _msg(**fields) -> Message:
     """Настоящий aiogram Message — не SimpleNamespace."""
-    base = {
+    # dict[str, Any]: Message принимает 200+ опциональных полей, и вывод типов по литералу
+    # заставил бы mypy сверять **kwargs с каждым из них
+    base: dict[str, Any] = {
         "message_id": 1,
         "date": datetime.now(tz=UTC),
         "chat": Chat(id=CHAT_ID, type="private"),

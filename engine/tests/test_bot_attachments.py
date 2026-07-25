@@ -596,3 +596,191 @@ async def test_help_mentions_files(stand):
     s = _build(stand)
     await s.tg._on_help(_message(text="/help"))
     assert "файл" in s.bot.text.lower()
+
+
+# ── M8: дублёр Bot, который ПАДАЕТ — иначе «ответ не потерян» не проверено ────
+
+
+class FailingBot(FakeBot):
+    """Дублёр Bot, у которого отказывают отдельные вызовы.
+
+    Прошлый дублёр не падал никогда, поэтому все ветки «ответ не потерян» (сбой
+    send_document, фолбэк MarkdownV2 → плейн) были непокрыты: код в них мог быть любым.
+    """
+
+    def __init__(self, *, fail_document=False, fail_markdown=False, fail_all_text=False):
+        super().__init__()
+        self.fail_document = fail_document
+        self.fail_markdown = fail_markdown
+        self.fail_all_text = fail_all_text
+        self.attempts: list[str] = []
+
+    async def send_message(self, chat_id, text, **kw):
+        self.attempts.append(kw.get("parse_mode") or "plain")
+        if self.fail_all_text:
+            raise RuntimeError("Telegram недоступен")
+        if self.fail_markdown and kw.get("parse_mode") == "MarkdownV2":
+            raise RuntimeError("can't parse entities")
+        return await super().send_message(chat_id, text, **kw)
+
+    async def send_document(self, chat_id, document, **kw):
+        if self.fail_document:
+            raise RuntimeError("file too big for Telegram")
+        return await super().send_document(chat_id, document, **kw)
+
+
+async def test_failed_document_is_explained_in_words(stand):
+    """Файл не ушёл — человек обязан узнать об этом словами, а не тишиной."""
+    bot = FailingBot(fail_document=True)
+    s = _build(stand, bot=bot, core=FakeCore("Готово [SEND_FILE:kp.pdf]"))
+    await s.tg._on_text(_message(text="дай КП"))
+    assert bot.documents == []
+    # текст уходит в MarkdownV2 — сравниваем по разэкранированному виду
+    plain = bot.text.replace("\\", "")
+    assert "kp.pdf" in plain and "не отправ" in plain.lower()
+
+
+async def test_text_of_answer_survives_document_failure(stand):
+    """Сбой отправки файла не должен утащить за собой текст ответа."""
+    bot = FailingBot(fail_document=True)
+    s = _build(stand, bot=bot, core=FakeCore("Вот итог работы [SEND_FILE:kp.pdf]"))
+    await s.tg._on_text(_message(text="дай"))
+    assert "итог" in bot.text
+
+
+async def test_markdown_failure_falls_back_to_plain(stand):
+    """Битая разметка → шлём плейном: ответ важнее оформления."""
+    bot = FailingBot(fail_markdown=True)
+    s = _build(stand, bot=bot, core=FakeCore("**жирный** и `код`"))
+    await s.tg._on_text(_message(text="привет"))
+    assert bot.attempts == ["MarkdownV2", "plain"], bot.attempts
+    assert "жирный" in bot.text
+
+
+async def test_total_send_failure_does_not_raise(stand):
+    """Telegram лежит целиком: хендлер логирует и выходит, а не рушит polling."""
+    bot = FailingBot(fail_markdown=True, fail_all_text=True)
+    s = _build(stand, bot=bot, core=FakeCore("ответ"))
+    await s.tg._on_text(_message(text="привет"))  # не должно бросить
+    assert bot.messages == []
+
+
+async def test_reaction_failure_does_not_block_the_answer(stand):
+    """Реакция 👀 косметическая: её сбой не должен съесть сообщение."""
+    s = _build(stand)
+    msg = _message(text="привет")
+
+    async def boom(items):
+        raise RuntimeError("реакции запрещены в этом чате")
+
+    msg.react = boom
+    await s.tg._on_text(msg)
+    assert s.core.prompts == ["привет"]
+
+
+async def test_typing_failure_does_not_block_the_answer(stand):
+    """send_chat_action тоже косметика."""
+    bot = FakeBot()
+
+    async def boom(*a, **kw):
+        raise RuntimeError("flood")
+
+    bot.send_chat_action = boom
+    s = _build(stand, bot=bot)
+    await s.tg._on_text(_message(text="привет"))
+    assert s.core.prompts == ["привет"]
+
+
+async def test_callback_answer_failure_does_not_block_the_prompt(stand):
+    """Просроченный callback.answer — не повод не выполнить кнопку."""
+    s = _build(stand)
+    cb = _callback(encode_trigger(0, BUTTONS[0]))
+
+    async def boom(text=None, **kw):
+        raise RuntimeError("query is too old")
+
+    cb.answer = boom
+    await s.tg._on_callback(cb)
+    assert s.core.prompts == [BUTTONS[0].prompt]
+
+
+# ── S5: мелкие ветки, которые раньше никто не проходил ───────────────────────
+
+
+async def test_stop_in_a_fresh_window_does_not_lie(stand):
+    """M8: «Стоп» без активной сессии отвечал «⏹ Прервал» — прерывать было нечего."""
+    s = _build(stand)
+    await s.tg._on_stop(_message(text="/stop"))
+    assert s.core.interrupts == []
+    assert "прервал" not in s.bot.text.lower(), f"обещание не по делу: {s.bot.text!r}"
+
+
+async def test_stop_after_a_real_message_reports_interrupt(stand):
+    s = _build(stand)
+    await s.tg._on_text(_message(text="привет"))
+    s.bot.messages.clear()
+    await s.tg._on_stop(_message(text="/stop"))
+    assert s.core.interrupts and "прервал" in s.bot.text.lower()
+
+
+async def test_system_stop_button_in_fresh_window_does_not_lie(stand):
+    """Тот же путь через системную кнопку — сообщение должно быть тем же."""
+    s = _build(stand)
+    await s.tg._on_callback(_callback("sys:stop"))
+    assert s.core.interrupts == []
+    assert "прервал" not in s.bot.text.lower()
+
+
+async def test_message_without_attachment_falls_through(stand):
+    """`_on_attachment` на сообщении без вложения — ничего не делает и не падает."""
+    s = _build(stand)
+    await s.tg._on_attachment(_message(text="просто текст"))
+    assert s.core.asks == [] and s.bot.messages == []
+
+
+async def test_answer_without_project_is_explained(stand):
+    """Нет активного проекта — говорим словами, а не молчим (NoProjectError)."""
+    stand.store.projects.disable("office")
+    s = _build(stand)
+    await s.tg._on_text(_message(text="привет"))
+    assert "проект" in s.bot.text.lower()
+
+
+async def test_attachment_without_project_is_explained(stand):
+    stand.store.projects.disable("office")
+    s = _build(stand)
+    doc = SimpleNamespace(file_id="D1", file_name="f.pdf", file_size=10)
+    await s.tg._on_attachment(_message(document=doc))
+    assert "проект" in s.bot.text.lower()
+
+
+async def test_verbose_one_shows_a_tool_status_once(stand):
+    """verbose=1: ровно одно статус-сообщение на запрос, а не на каждый ToolStarted."""
+    from engine.core.events import ToolStarted
+
+    class ToolCore(FakeCore):
+        async def ask(self, session_id, prompt, on_event=None):
+            self.asks.append((session_id, prompt))
+            if on_event is not None:
+                on_event(ToolStarted(name="Read"))
+                on_event(ToolStarted(name="Bash"))
+            return AskResult(text="готово", outcome=Outcome("ok", ""))
+
+    s = _build(stand, core=ToolCore())
+    await s.tg._on_text(_message(text="первый"))
+    sid = s.core.asks[0][0]
+    stand.store.sessions.set_verbose(sid, 1)
+    s.bot.messages.clear()
+    await s.tg._on_text(_message(text="второй"))
+    await asyncio.sleep(0)  # статус уходит create_task'ом
+    statuses = [m for m in s.bot.messages if "⚙" in m["text"]]
+    assert len(statuses) == 1, f"ожидался один статус, получено {len(statuses)}"
+
+
+async def test_sandbox_is_empty_without_a_project(stand):
+    """Нет проекта → нет мозга → относительный путь не резолвится (fail-closed §8.2)."""
+    stand.store.projects.disable("office")
+    s = _build(stand)
+    sandbox = s.tg._sandbox(100, 7)
+    assert sandbox.base is None
+    assert sandbox.roots == [stand.state.resolve()]

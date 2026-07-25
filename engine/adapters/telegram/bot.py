@@ -256,8 +256,8 @@ class TelegramBot:
         if not self._guard(message):
             return
         chat_id, thread_id, _ = self._coords(message)
-        await self._router.stop(chat_id, thread_id)
-        await self._reply(message, "⏹ Прервал.")
+        # текст берём у роутера: в свежем окне прерывать нечего, и врать про это нельзя (M8)
+        await self._reply(message, await self._router.stop(chat_id, thread_id))
 
     async def _on_close(self, message: Message) -> None:
         if not self._guard(message):
@@ -412,8 +412,7 @@ class TelegramBot:
         elif action == "status":
             await self._send(chat_id, thread_id, self._router.status_text(chat_id, thread_id))
         elif action == "stop":
-            await self._router.stop(chat_id, thread_id)
-            await self._send(chat_id, thread_id, "⏹ Прервал.")
+            await self._send(chat_id, thread_id, await self._router.stop(chat_id, thread_id))
         else:
             assert_never(action)
 
@@ -565,7 +564,9 @@ class TelegramBot:
             return None
         return build_keyboard(self._buttons.get())
 
-    def _make_status_handler(self, chat_id: int, thread_id: int | None):
+    def _make_status_handler(
+        self, chat_id: int, thread_id: int | None
+    ) -> Callable[[Event], None] | None:
         """verbose ≥1: одно статус-сообщение «⚙️ запускаю X…» на первый tool-вызов.
 
         Ровно ОДНО сообщение на запрос (не на каждый ToolStarted) — иначе tool-heavy задача
@@ -580,7 +581,7 @@ class TelegramBot:
 
         shown = {"done": False}
 
-        def handler(event) -> None:
+        def handler(event: Event) -> None:
             if isinstance(event, ToolStarted) and not shown["done"]:
                 shown["done"] = True
                 asyncio.create_task(
