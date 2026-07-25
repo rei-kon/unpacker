@@ -9,23 +9,35 @@
 # Использование:
 #   deploy.sh --surface tg --name <slug> --token <BOT_TOKEN> --users <id,id> \
 #             --brain <git-url|local-path> [--project-slug <slug>] [--brand "<имя>"] \
-#             [--cc-token <OAUTH>] [--default-model <m>] [--dry-run] [--skip-preflight]
+#             [--cc-token <OAUTH>] [--default-model <m>] [--role agent|unpacker] \
+#             [--audience internal|client] [--auth-mode subscription|api] [--api-key <KEY>] \
+#             [--limit-requests-per-day N] [--limit-tokens-per-day N] \
+#             [--dry-run] [--skip-preflight]
 #
-# AUTH = ТОЛЬКО ПОДПИСКА (§8.1 внутренний контур). Движок бежит на Pro/Max-токене
-#   (CLAUDE_CODE_OAUTH_TOKEN из `claude setup-token`). API-ключ (ANTHROPIC_API_KEY) здесь
-#   не используется, не предлагается и не пишется — код-гейт клиентского контура (фаза 4).
+# КОНТУР AUTH — выбирается явно (§8.1). По умолчанию subscription (внутренний контур):
+#   движок бежит на Pro/Max-токене (CLAUDE_CODE_OAUTH_TOKEN из `claude setup-token`).
+#   --auth-mode api — контур на ANTHROPIC_API_KEY, требует лимитов; смешивать контуры нельзя.
+#   --audience client (бот общается с внешними людьми) на подписке = отказ КОДОМ: обслуживать
+#   третьих лиц с подписки запрещено ToS. Клиентская поверхность целиком — Фаза 4 (нет ToolPolicy).
 #
 # --cc-token: долгоживущий токен из `claude setup-token` (подписка). Пишется в .env инстанса как
 #   CLAUDE_CODE_OAUTH_TOKEN → бот не зависит от ambient ~/.claude (чей access-token протухает → 401).
+#
+# --role unpacker: инстанс мета-агента «Распаковщик» (§7.5) — ему дополнительно ставится
+#   systemd drop-in (sudo работает: без NoNewPrivileges) и sudoers-whitelist на конкретные скрипты.
+#
+# КОДЫ ВОЗВРАТА: 2 — плохие аргументы; 3 — не пройден гейт §7.3 / preflight.
+#   Гейты §7.3 исполняет КОД и они НЕ снимаются --skip-preflight: «уговорить словами» нельзя.
 #
 # ВАЖНО: bypassPermissions под root ЗАПРЕЩЁН самим CLI. run-user не может быть root — безусловный
 #   блокер (даже под --skip-preflight). Заведи непривилегированного юзера: TG_RUN_USER=<user>
 #   (или запусти из-под него через sudo, тогда SUDO_USER подхватится). При `sudo` от root uv/claude
 #   резолвятся В КОНТЕКСТЕ RUN_USER, а не root (иначе /root/.local/bin/uv недостижим для юнита).
 #
-# Шаги: preflight → общий движок (pull/uv sync под RUN_USER) → мозг (clone/copy; ГРЯЗНЫЙ git-мозг =
-#   СТОП; scrub .env/.git/симлинков; требуется CLAUDE.md) → инстанс + .env (chmod 600, секреты через
-#   printf, НЕ перезатирая) → сид проекта → templated systemd agent-tg@<name>.service + enable --now.
+# Шаги: гейты §7.3 (контур auth, мозг, чистота git-мозга, имя, занятость токена, getMe) → preflight →
+#   общий движок (pull/uv sync под RUN_USER) → мозг (clone/copy; scrub .env/.git/симлинков) →
+#   инстанс + .env (chmod 600, секреты через printf, НЕ перезатирая) → buttons.yaml (мост из мозга) →
+#   сид проекта → templated systemd agent-tg@<name>.service + enable --now.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,6 +48,10 @@ resolve_run_identity
 
 SURFACE="" NAME="" TOKEN="" USERS="" BRAIN_REPO="" PROJECT_SLUG="" BRAND=""
 CC_TOKEN="" DEFAULT_MODEL="" DRY_RUN="false" SKIP_PREFLIGHT="false"
+ROLE="agent" AUDIENCE="internal" AUTH_MODE="subscription" API_KEY=""
+LIMIT_RPD="" LIMIT_TPD=""
+# Куда стучимся за getMe. Переопределяется под локальный Bot API / прокси (и под тесты гейта).
+TG_API_BASE="${TG_API_BASE:-https://api.telegram.org}"
 
 usage() { awk 'NR==1{next} /^set -euo pipefail/{exit} {sub(/^# ?/,"");print}' "$0"; exit "${1:-0}"; }
 
@@ -50,6 +66,12 @@ while [ $# -gt 0 ]; do
     --brand)          BRAND="$2"; shift 2 ;;
     --cc-token)       CC_TOKEN="$2"; shift 2 ;;
     --default-model)  DEFAULT_MODEL="$2"; shift 2 ;;
+    --role)           ROLE="$2"; shift 2 ;;
+    --audience)       AUDIENCE="$2"; shift 2 ;;
+    --auth-mode)      AUTH_MODE="$2"; shift 2 ;;
+    --api-key)        API_KEY="$2"; shift 2 ;;
+    --limit-requests-per-day) LIMIT_RPD="$2"; shift 2 ;;
+    --limit-tokens-per-day)   LIMIT_TPD="$2"; shift 2 ;;
     --dry-run)        DRY_RUN="true"; shift ;;
     --skip-preflight) SKIP_PREFLIGHT="true"; shift ;;
     -h|--help)        usage 0 ;;
@@ -91,6 +113,26 @@ valid_slug "$PROJECT_SLUG" || { echo "--project-slug '$PROJECT_SLUG': недоп
 # (BRAND/DEFAULT_MODEL уходят в seed через argv — им шелл-валидация не нужна, апостроф ок.)
 safe_arg "$BRAIN_REPO" || { echo "--brain '$BRAIN_REPO': недопустимые символы (шелл-метасимволы запрещены)" >&2; exit 2; }
 [ -z "${TG_RUNTIME_URL:-}" ] || safe_arg "${TG_RUNTIME_URL}" || { echo "TG_RUNTIME_URL: недопустимые символы" >&2; exit 2; }
+# TG_API_BASE влияет на сетевой запрос гейта — метасимволы тут тоже не нужны.
+safe_arg "$TG_API_BASE" || { echo "TG_API_BASE: недопустимые символы" >&2; exit 2; }
+
+case "$ROLE" in
+  agent|unpacker) : ;;
+  *) echo "--role '$ROLE': допустимо agent|unpacker" >&2; exit 2 ;;
+esac
+case "$AUDIENCE" in
+  internal|client) : ;;
+  *) echo "--audience '$AUDIENCE': допустимо internal|client" >&2; exit 2 ;;
+esac
+case "$AUTH_MODE" in
+  subscription|api) : ;;
+  *) echo "--auth-mode '$AUTH_MODE': допустимо subscription|api" >&2; exit 2 ;;
+esac
+for lim in "$LIMIT_RPD" "$LIMIT_TPD"; do
+  [ -z "$lim" ] && continue
+  printf '%s' "$lim" | grep -Eq '^[1-9][0-9]*$' \
+    || { echo "лимит '$lim': нужно целое > 0 (--limit-requests-per-day / --limit-tokens-per-day)" >&2; exit 2; }
+done
 
 RUNTIME="${TG_RUNTIME:-/opt/unpacker}"
 RUNTIME_URL="${TG_RUNTIME_URL:-}"
@@ -112,6 +154,160 @@ asuser_argv() {
   elif [ "$RUN_USER" = "$(id -un)" ]; then "$@";
   else sudo -u "$RUN_USER" -H "$@"; fi
 }
+
+# asuser_real: как asuser, но ИСПОЛНЯЕТ даже в --dry-run. Только для ЧТЕНИЯ (гейты):
+# «грязный мозг» надо проверить и в dry-run, иначе план обещает деплой, который не поедет.
+asuser_real() {
+  if [ "$RUN_USER" = "$(id -un)" ]; then bash -c "$*";
+  else sudo -u "$RUN_USER" -H bash -c "$*"; fi
+}
+
+# ── ГЕЙТЫ §7.3 — исполняет КОД, не LLM ──────────────────────────────────────
+# Философия §7.5: Распаковщик-мозг собирает данные и показывает план, но пройти проверку
+# «уговорив» не может — она здесь, в bash. Гейты гоняются ВСЕГДА: и в --dry-run (чтобы
+# план не обещал невозможного), и под --skip-preflight (иначе флаг = обход гейта).
+
+gate_fail() {
+  echo "  ✗ $1" >&2
+  echo "==> ГЕЙТ §7.3 НЕ ПРОЙДЕН — деплой остановлен. Это код, а не мнение: почини причину." >&2
+  exit 3
+}
+
+# redact: секреты инстанса → [REDACTED] перед любой печатью (§8.2 secret-scrubber).
+redact() {
+  local s="$1"
+  s="${s//$TOKEN/[REDACTED]}"
+  if [ -n "$CC_TOKEN" ]; then s="${s//$CC_TOKEN/[REDACTED]}"; fi
+  if [ -n "$API_KEY" ]; then s="${s//$API_KEY/[REDACTED]}"; fi
+  printf '%s' "$s"
+}
+
+brain_is_url() { case "$1" in *://*|git@*:*) return 0 ;; *) return 1 ;; esac; }
+
+# getMe: 0 — токен живой (GETME_USER=имя бота), 1 — Telegram отверг, 2 — не дозвонились.
+# URL уходит curl'у через --config (stdin), а НЕ через argv: иначе токен видно в `ps` (§8.2).
+GETME_USER="" GETME_ERR=""
+tg_getme() {
+  local raw code body
+  if ! raw="$(printf 'url = "%s/bot%s/getMe"\n' "$TG_API_BASE" "$TOKEN" \
+              | curl -sS --max-time 15 --config - -w '\n%{http_code}' 2>&1)"; then
+    GETME_ERR="$(redact "$raw")"; return 2
+  fi
+  code="${raw##*$'\n'}"; body="${raw%$'\n'*}"
+  # нормализуем пробелы: у Bot API «"ok":true», у локальных серверов бывает «"ok": true»
+  body="$(printf '%s' "$body" | tr -d ' \t\n')"
+  if [ "$code" != "200" ]; then GETME_ERR="HTTP $code — $(redact "$body")"; return 1; fi
+  case "$body" in *'"ok":true'*) ;; *) GETME_ERR="ответ без ok:true — $(redact "$body")"; return 1 ;; esac
+  GETME_USER="$(printf '%s' "$body" | sed -n 's/.*"username":"\([A-Za-z0-9_]*\)".*/\1/p')"
+  return 0
+}
+
+gates() {
+  echo "==> гейты §7.3 (проверяет КОД: словами их не обойти)"
+
+  # 1. Контур auth (§8.1). Клиентская поверхность на подписке — нарушение ToS и оно
+  #    энфорсится Anthropic (прецедент 04.04.2026), поэтому отказ здесь, а не в README.
+  if [ "$AUDIENCE" = "client" ] && [ "$AUTH_MODE" != "api" ]; then
+    gate_fail "клиентская поверхность (--audience client) на контуре подписки запрещена ToS:
+      обслуживать третьих лиц с Pro/Max нельзя. Нужен свой API-ключ: --auth-mode api --api-key <KEY>
+      плюс лимиты (--limit-requests-per-day, --limit-tokens-per-day)."
+  fi
+  if [ "$AUDIENCE" = "client" ]; then
+    gate_fail "клиентская поверхность целиком — Фаза 4 конституции: в движке ещё нет ToolPolicy
+      (урезание Bash/Write) и LimitsPolicy fail-closed. Поднимать бота для внешних людей без них
+      я не буду — это fail-closed, а не забывчивость. Сейчас поддержан только --audience internal."
+  fi
+  if [ "$AUTH_MODE" = "api" ]; then
+    [ -n "$API_KEY" ] || gate_fail "контур api выбран, но нет --api-key <ANTHROPIC_API_KEY>."
+    { [ -n "$LIMIT_RPD" ] && [ -n "$LIMIT_TPD" ]; } || gate_fail \
+      "для API-контура обязательны лимиты: --limit-requests-per-day N --limit-tokens-per-day N
+      (pay-per-token без потолка = счёт на любую сумму)."
+    [ -z "$CC_TOKEN" ] || gate_fail "смешаны контуры: --auth-mode api и --cc-token (подписка).
+      Один инстанс — один контур (§8.1). Оставь что-то одно."
+    echo "  ✓ контур auth: api (лимиты: $LIMIT_RPD запр./сут, $LIMIT_TPD ток./сут)"
+    echo "  ! энфорс лимитов в движке — Фаза 4: сейчас они пишутся в .env как декларация,"
+    echo "    ядро их ещё не читает. Держи потолок на стороне биллинга Anthropic."
+  else
+    [ -z "$API_KEY" ] || gate_fail "смешаны контуры: --api-key при --auth-mode subscription.
+      Один инстанс — один контур (§8.1)."
+    echo "  ✓ контур auth: subscription (внутренний, аудитория $AUDIENCE)"
+  fi
+
+  # 2. Мозг: существует и несёт личность. Проверяем ИСТОЧНИК до любых мутаций —
+  #    иначе опечатка в пути уходила в `git clone` и падала уже после провизии.
+  if brain_is_url "$BRAIN_REPO"; then
+    echo "  ✓ мозг: git-URL (наличие CLAUDE.md проверю после клона)"
+  elif [ -d "$BRAIN_REPO" ]; then
+    [ -f "$BRAIN_REPO/CLAUDE.md" ] \
+      || gate_fail "в мозге '$BRAIN_REPO' нет CLAUDE.md — это не папка-мозг (§4: минимум один CLAUDE.md)."
+    echo "  ✓ мозг: $BRAIN_REPO (CLAUDE.md на месте)"
+  else
+    gate_fail "мозг '$BRAIN_REPO' не найден: это ни существующая папка, ни git-URL. Проверь путь."
+  fi
+
+  # 3. Рабочее дерево git-мозга чистое (§6.1): иначе следующий `git pull` упрётся в конфликт
+  #    и «идемпотентный повторный деплой» умрёт. Читаем как ВЛАДЕЛЕЦ репо: root против
+  #    чужого репо получает 'dubious ownership' и молча выглядел бы как «чисто».
+  if [ -d "$BRAIN_REPO/.git" ]; then
+    local st
+    if st="$(asuser_real "git -C '$BRAIN_REPO' status --porcelain" 2>/dev/null)"; then
+      [ -z "$st" ] || gate_fail "мозг-источник '$BRAIN_REPO' — git с ГРЯЗНЫМ деревом (dirty).
+      Закоммить или спрячь правки (git stash) и повтори."
+      echo "  ✓ мозг-git: рабочее дерево чистое"
+    else
+      gate_fail "не смог проверить чистоту git-мозга '$BRAIN_REPO' (права / dubious ownership?).
+      Молча считать его чистым нельзя — останавливаюсь."
+    fi
+  fi
+
+  # 4. Имя инстанса уникально: имя ↔ бот держим 1:1. Повторный деплой ТОГО ЖЕ бота — норма
+  #    (идемпотентность), а вот занять чужое имя другим токеном = потерять привязку и логи.
+  if [ -f "$INST/.env" ]; then
+    local cur
+    cur="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$INST/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    if [ -n "$cur" ] && [ "$cur" != "$TOKEN" ]; then
+      gate_fail "имя '$NAME' уже занято ДРУГИМ ботом (в $INST/.env другой токен).
+      Возьми другое --name либо снеси инстанс осознанно: systemctl disable --now agent-tg@$NAME && rm -rf $INST"
+    fi
+    echo "  ✓ имя '$NAME': это повторный деплой того же бота (идемпотентно)"
+  else
+    echo "  ✓ имя '$NAME': свободно"
+  fi
+
+  # 5. Токен не занят другим живым инстансом: два polling'а на один токен = 409 у обоих,
+  #    боты «дерутся» за апдейты и оба выглядят сломанными.
+  if [ -d "$AGENTS_BASE" ]; then
+    local d other
+    for d in "$AGENTS_BASE"/*/; do
+      [ -d "$d" ] || continue
+      other="$(basename "$d")"
+      [ "$other" = "$NAME" ] && continue
+      [ -f "${d}.env" ] || continue
+      if printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN" | grep -qxFf - "${d}.env" 2>/dev/null; then
+        gate_fail "этот токен уже ЗАНЯТ инстансом '$other' ($d) — двойной polling даст 409
+      и оба бота начнут терять сообщения. Возьми у @BotFather отдельного бота либо сноси '$other'."
+      fi
+    done
+  fi
+  echo "  ✓ токен не занят другим инстансом"
+
+  # 6. Токен валиден по getMe. Сеть недоступна → ОТКАЗ, а не тихий проход: молча пропущенный
+  #    гейт хуже отсутствующего (ученик увидит «деплой ок» и мёртвого бота).
+  command -v curl >/dev/null 2>&1 || gate_fail "нужен curl для проверки токена (apt install curl)."
+  local g=0
+  set +e; tg_getme; g=$?; set -e
+  case "$g" in
+    0) echo "  ✓ токен валиден (getMe): бот @${GETME_USER:-неизвестен}, сам токен — [REDACTED]" ;;
+    1) gate_fail "Telegram отверг токен (getMe): $GETME_ERR
+      Токен в выводе — [REDACTED]. Проверь его у @BotFather (не отозван ли) и передай заново." ;;
+    2) gate_fail "не смог проверить токен: сеть до $TG_API_BASE недоступна ($GETME_ERR).
+      Тихого прохода мимо гейта нет — почини сеть/прокси (или укажи TG_API_BASE) и повтори." ;;
+  esac
+
+  echo "    все гейты §7.3 пройдены"
+}
+
+gates
 
 # ── preflight: падать РАНО и ВНЯТНО ─────────────────────────────────────────
 preflight() {
@@ -172,18 +368,7 @@ fi
 # sync под RUN_USER: .venv/managed-python обязаны принадлежать тому, кто бежит юнит (иначе EACCES).
 asuser_argv "$UV_BIN" sync --project "$RUNTIME"
 
-# ── 2. мозг (ГРЯЗНЫЙ git-мозг = СТОП §6.1; scrub; требуется CLAUDE.md §7.3) ──
-if [ "$DRY_RUN" != "true" ]; then
-  # dirty-check ИСТОЧНИКА как ВЛАДЕЛЬЦА: root против canary-owned репо даёт 'dubious ownership',
-  # git падает — и 2>/dev/null проглотил бы это как «чисто». Гоняем как RUN_USER (владелец на VPS).
-  if [ -d "$BRAIN_REPO/.git" ]; then
-    if st="$(asuser "git -C '$BRAIN_REPO' status --porcelain" 2>/dev/null)"; then
-      [ -z "$st" ] || { echo "  ✗ мозг-источник '$BRAIN_REPO' — git с ГРЯЗНЫМ деревом (dirty). Закоммить/спрячь и повтори." >&2; exit 3; }
-    else
-      echo "  ✗ не смог проверить чистоту мозга '$BRAIN_REPO' (права/dubious ownership?). Останавливаюсь." >&2; exit 3
-    fi
-  fi
-fi
+# ── 2. мозг (чистота источника проверена гейтом; scrub; CLAUDE.md после клона) ─
 # materialize (условия — локальный stat; root читает /home/*; git-операции идут asuser)
 if [ -d "$BRAIN/.git" ]; then
   asuser "git -C '$BRAIN' pull --ff-only" || echo "warn: brain pull пропущен (расхождение/сеть) — проверь мозг вручную"
@@ -221,18 +406,51 @@ if [ -f "$INST/.env" ]; then
   fi
 else
   if [ "$DRY_RUN" = "true" ]; then
-    echo "[dry-run] записал бы $INST/.env (chmod 600, TELEGRAM_BOT_TOKEN$( [ -n "$CC_TOKEN" ] && echo ' + CLAUDE_CODE_OAUTH_TOKEN') через printf)"
+    echo "[dry-run] записал бы $INST/.env (chmod 600, AUTH_MODE=$AUTH_MODE, TELEGRAM_BOT_TOKEN и"
+    echo "          прочие секреты — через printf, без argv; значения в чат не печатаются)"
   else
     TMP_ENV="$(mktemp)"
-    # Не-секретные плейсхолдеры — через sed. Секреты (bot-token, cc-token) — printf-дописью,
+    # Не-секретные плейсхолдеры — через sed. Секреты (bot-token, cc-token, api-key) — printf-дописью,
     # чтобы НЕ светиться в argv sed (ps/proc/set -x) — §8.2.
     sed -e "s|{{USERS}}|$USERS|g" -e "s|{{PROJECT_SLUG}}|$PROJECT_SLUG|g" \
         "$HERE/templates/.env.template" > "$TMP_ENV"
+    # Контур (§8.1) фиксируем в .env: инстанс живёт в ОДНОМ контуре, и это видно глазами.
+    printf 'AUTH_MODE=%s\n' "$AUTH_MODE" >> "$TMP_ENV"
     printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN" >> "$TMP_ENV"
-    [ -n "$CC_TOKEN" ] && printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$CC_TOKEN" >> "$TMP_ENV"
+    if [ "$AUTH_MODE" = "api" ]; then
+      printf 'ANTHROPIC_API_KEY=%s\n' "$API_KEY" >> "$TMP_ENV"
+      # Декларация лимитов: энфорс — Фаза 4 (LimitsPolicy), гейт про это предупредил.
+      printf 'LIMIT_REQUESTS_PER_DAY=%s\nLIMIT_TOKENS_PER_DAY=%s\n' "$LIMIT_RPD" "$LIMIT_TPD" >> "$TMP_ENV"
+    elif [ -n "$CC_TOKEN" ]; then
+      printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$CC_TOKEN" >> "$TMP_ENV"
+    fi
     install -m 600 "$TMP_ENV" "$INST/.env"; rm -f "$TMP_ENV"
     [ "$RUN_USER" = "$(id -un)" ] || $SUDO chown "$RUN_USER" "$INST/.env"
-    echo "    .env записан (chmod 600, секреты через printf)"
+    echo "    .env записан (chmod 600, контур $AUTH_MODE, секреты через printf)"
+  fi
+fi
+
+# ── 3b. мост «мозг → инстанс»: buttons.yaml (контракт со срезом С2) ──────────
+# Кнопки-триггеры живут в паспорте мозга (.brain.yaml), а рабочая копия — в инстансе:
+# владелец правит её у себя, и синк мозга её НЕ перезатирает (та же дисциплина, что у .env, §4).
+# Владелец модуля engine/brainkit.py — срез С2. Если его ещё нет, деплой НЕ падает:
+# бот без кнопок работоспособен, а молча пропущенный шаг был бы хуже громкого предупреждения.
+BUTTONS="$INST/buttons.yaml"
+if [ -f "$BUTTONS" ]; then
+  echo "    buttons.yaml уже есть — не трогаю (idempotent)"
+elif [ "$DRY_RUN" = "true" ]; then
+  echo "[dry-run] экспортировал бы кнопки: python -m engine.brainkit export-buttons --brain $BRAIN --out $BUTTONS"
+else
+  # --directory, а НЕ --project: `uv run --project` НЕ меняет cwd, и `python -m` подхватил бы
+  # пакет `engine` из каталога вызова (у deploy.sh это обычно чей-то чекаут репо) вместо
+  # общего движка. Ловится тестом моста: со --project мост «не видел» модуль в рантайме.
+  if bk_out="$(asuser_argv "$UV_BIN" run --directory "$RUNTIME" python -m engine.brainkit \
+                export-buttons --brain "$BRAIN" --out "$BUTTONS" 2>&1)"; then
+    echo "    buttons.yaml экспортирован из мозга (engine.brainkit)"
+  else
+    echo "warn: не смог экспортировать buttons.yaml через engine.brainkit — кнопки-триггеры"
+    echo "      останутся пустыми (бот работает). Причина (первая строка):"
+    printf '%s\n' "$bk_out" | head -1 | sed 's/^/      /'
   fi
 fi
 
@@ -241,10 +459,41 @@ fi
 if [ "$DRY_RUN" = "true" ]; then
   echo "[dry-run] сид проекта: slug=$PROJECT_SLUG brand='$BRAND' brain=$BRAIN db=$INST/state/state.db"
 else
-  seed_args=("$UV_BIN" run --project "$RUNTIME" python -m engine.seed
+  # --directory (см. про мост выше): гарантирует, что `engine` берётся из общего движка.
+  seed_args=("$UV_BIN" run --directory "$RUNTIME" python -m engine.seed
              --db "$INST/state/state.db" --slug "$PROJECT_SLUG" --name "$BRAND" --brain "$BRAIN")
   [ -n "$DEFAULT_MODEL" ] && seed_args+=(--model "$DEFAULT_MODEL")
   asuser_argv "${seed_args[@]}"
+fi
+
+# ── 4b. модель прав мета-агента (§7.5) — только --role unpacker ──────────────
+# Обычному агенту sudo не нужен и он его НЕ получает: послабления живут в drop-in'е
+# конкретного инстанса, базовый agent-tg@.service остаётся под NoNewPrivileges=true.
+if [ "$ROLE" = "unpacker" ]; then
+  echo "==> Распаковщик: модель прав §7.5 (drop-in юнита + sudoers-whitelist)"
+  if command -v systemctl >/dev/null 2>&1; then
+    DROPIN_DIR="/etc/systemd/system/agent-tg@$NAME.service.d"
+    if [ "$DRY_RUN" = "true" ]; then
+      echo "[dry-run] поставил бы drop-in $DROPIN_DIR/10-unpacker.conf (NoNewPrivileges=no, остальной hardening)"
+    else
+      $SUDO mkdir -p "$DROPIN_DIR"
+      # daemon-reload не зову: шаг 5 ниже всё равно его делает перед enable --now
+      $SUDO install -m 644 "$HERE/templates/unpacker-dropin.conf" "$DROPIN_DIR/10-unpacker.conf"
+      echo "    drop-in установлен: $DROPIN_DIR/10-unpacker.conf"
+    fi
+  else
+    echo "warn: нет systemctl — drop-in Распаковщика не поставлен (dev-хост). На VPS шаг сработает."
+  fi
+  # Права ставит отдельный идемпотентный скрипт. Его провал НЕ роняет деплой: бот уже живой,
+  # а права доставляются одной командой — её и печатаем, чтобы человек не гадал.
+  if [ "$DRY_RUN" = "true" ]; then
+    "$HERE/install-sudoers.sh" --dry-run || echo "warn: sudoers-whitelist в этих условиях не встанет (см. ✗ выше)"
+  else
+    "$HERE/install-sudoers.sh" || {
+      echo "warn: sudoers-whitelist не установлен — Распаковщик не сможет разворачивать ботов."
+      echo "      Поставь вручную (нужен root):  sudo TG_RUN_USER=$RUN_USER TG_RUNTIME=$RUNTIME $HERE/install-sudoers.sh"
+    }
+  fi
 fi
 
 # ── 5. systemd templated unit + autostart ───────────────────────────────────
