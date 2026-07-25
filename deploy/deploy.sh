@@ -7,9 +7,11 @@
 # живёт в отдельном инстанс-каталоге $AGENTS_BASE/<name>.
 #
 # Использование:
-#   deploy.sh --surface tg --name <slug> --token <BOT_TOKEN> --users <id,id> \
+#   deploy.sh --surface tg --name <slug> (--token <BOT_TOKEN> | --token-file <путь>) \
+#             --users <id,id> \
 #             --brain <git-url|local-path> [--project-slug <slug>] [--brand "<имя>"] \
-#             [--cc-token <OAUTH>] [--default-model <m>] [--role agent|unpacker] \
+#             [--cc-token <OAUTH> | --cc-token-file <путь>] \
+#             [--default-model <m>] [--role agent|unpacker] \
 #             [--audience internal|client] [--auth-mode subscription|api] [--api-key <KEY>] \
 #             [--limit-requests-per-day N] [--limit-tokens-per-day N] \
 #             [--dry-run] [--skip-preflight]
@@ -22,6 +24,10 @@
 #
 # --cc-token: долгоживущий токен из `claude setup-token` (подписка). Пишется в .env инстанса как
 #   CLAUDE_CODE_OAUTH_TOKEN → бот не зависит от ambient ~/.claude (чей access-token протухает → 401).
+#
+# СЕКРЕТЫ ФАЙЛОМ (--token-file / --cc-token-file, режим 600): аргумент `sudo` виден в `ps` и
+#   НАВСЕГДА оседает в /var/log/auth.log и в history root (SEC-4). Поэтому install.sh и мозг
+#   Распаковщика передают секреты только файлом; --token/--cc-token остаются для рук человека.
 #
 # --role unpacker: инстанс мета-агента «Распаковщик» (§7.5) — ему дополнительно ставится
 #   systemd drop-in (sudo работает: без NoNewPrivileges) и sudoers-whitelist на конкретные скрипты.
@@ -53,6 +59,7 @@ resolve_run_identity
 
 SURFACE="" NAME="" TOKEN="" USERS="" BRAIN_REPO="" PROJECT_SLUG="" BRAND=""
 CC_TOKEN="" DEFAULT_MODEL="" DRY_RUN="false" SKIP_PREFLIGHT="false"
+TOKEN_FILE="" CC_TOKEN_FILE="" TOKEN_FROM="" CC_FROM=""
 ROLE="agent" AUDIENCE="internal" AUTH_MODE="subscription" API_KEY=""
 LIMIT_RPD="" LIMIT_TPD=""
 # Куда стучимся за getMe. Переопределяется под локальный Bot API / прокси (и под тесты гейта).
@@ -64,12 +71,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --surface)        SURFACE="$2"; shift 2 ;;
     --name)           NAME="$2"; shift 2 ;;
-    --token)          TOKEN="$2"; shift 2 ;;
+    --token)          TOKEN="$2"; TOKEN_FROM="argv"; shift 2 ;;
+    --token-file)     TOKEN_FILE="$2"; shift 2 ;;
     --users)          USERS="$2"; shift 2 ;;
     --brain)          BRAIN_REPO="$2"; shift 2 ;;
     --project-slug)   PROJECT_SLUG="$2"; shift 2 ;;
     --brand)          BRAND="$2"; shift 2 ;;
-    --cc-token)       CC_TOKEN="$2"; shift 2 ;;
+    --cc-token)       CC_TOKEN="$2"; CC_FROM="argv"; shift 2 ;;
+    --cc-token-file)  CC_TOKEN_FILE="$2"; shift 2 ;;
     --default-model)  DEFAULT_MODEL="$2"; shift 2 ;;
     --role)           ROLE="$2"; shift 2 ;;
     --audience)       AUDIENCE="$2"; shift 2 ;;
@@ -91,6 +100,34 @@ if [ "$RUN_USER" = "root" ]; then
   echo "✗ run-user = root — bypassPermissions под root запрещён Claude CLI (бот молчал бы)." >&2
   echo "  Заведи непривилегированного юзера и передай TG_RUN_USER=<user> (или sudo из-под него)." >&2
   exit 3
+fi
+
+# ── секреты из файла (Р5/SEC-4) — до любой валидации значений ────────────────
+# Аргумент `sudo` виден в `ps` и остаётся в /var/log/auth.log НАВСЕГДА. Файл читаем один раз,
+# значение дальше живёт только в памяти процесса и уходит в .env через printf (не через argv).
+read_secret_file() {  # read_secret_file <путь> <как называется флаг> → значение в stdout
+  local f="$1" flag="$2" mode val
+  [ -f "$f" ] || { echo "$flag: файла нет: $f" >&2; exit 2; }
+  [ -r "$f" ] || { echo "$flag: файл не читается: $f" >&2; exit 2; }
+  mode="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null || echo '')"
+  mode="$(printf '%03d' "${mode:-0}" 2>/dev/null || printf '%s' "$mode")"
+  case "$mode" in
+    ?00) : ;;
+    *) echo "$flag: файл '$f' должен быть 600 (сейчас $mode) — иначе секрет читает кто угодно
+  и «файл вместо argv» ничего не защитил:  chmod 600 '$f'" >&2; exit 2 ;;
+  esac
+  val="$(head -1 "$f" | tr -d '\r\n')"
+  [ -n "$val" ] || { echo "$flag: файл '$f' пуст" >&2; exit 2; }
+  printf '%s' "$val"
+}
+
+if [ -n "$TOKEN_FILE" ]; then
+  [ "$TOKEN_FROM" != "argv" ] || { echo "--token и --token-file вместе: оставь что-то одно" >&2; exit 2; }
+  TOKEN="$(read_secret_file "$TOKEN_FILE" --token-file)"
+fi
+if [ -n "$CC_TOKEN_FILE" ]; then
+  [ "$CC_FROM" != "argv" ] || { echo "--cc-token и --cc-token-file вместе: оставь что-то одно" >&2; exit 2; }
+  CC_TOKEN="$(read_secret_file "$CC_TOKEN_FILE" --cc-token-file)"
 fi
 
 # ── валидация аргументов (до preflight и любых мутаций) ──────────────────────
@@ -240,6 +277,12 @@ redact() {
 
 brain_is_url() { case "$1" in *://*|git@*:*) return 0 ;; *) return 1 ;; esac; }
 
+# env_value_of <файл> <ключ> → значение (или пусто). Первое живое присваивание, без кавычек.
+env_value_of() {
+  [ -f "$1" ] || return 0
+  grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
 # getMe: 0 — токен живой (GETME_USER=имя бота), 1 — Telegram отверг, 2 — не дозвонились.
 # URL уходит curl'у через --config (stdin), а НЕ через argv: иначе токен видно в `ps` (§8.2).
 GETME_USER="" GETME_ERR=""
@@ -328,13 +371,34 @@ gates() {
   # 4. Имя инстанса уникально: имя ↔ бот держим 1:1. Повторный деплой ТОГО ЖЕ бота — норма
   #    (идемпотентность), а вот занять чужое имя другим токеном = потерять привязку и логи.
   if [ -f "$INST/.env" ]; then
-    local cur
-    cur="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$INST/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
-    if [ -n "$cur" ] && [ "$cur" != "$TOKEN" ]; then
-      gate_fail "имя '$NAME' уже занято ДРУГИМ ботом (в $INST/.env другой токен).
+    local cur cur_mode
+    cur="$(env_value_of "$INST/.env" TELEGRAM_BOT_TOKEN)"
+    # C21: .env БЕЗ строки токена — это обрыв прошлой установки, а не «тот же бот». Раньше
+    # такой файл считался «повторным деплоем»: токен не сохранялся, движок падал на
+    # обязательном поле, а скрипт печатал «готово».
+    [ -n "$cur" ] || gate_fail "в $INST/.env нет строки TELEGRAM_BOT_TOKEN — файл БИТЫЙ
+      (обычно обрыв прошлой установки). Это не «повторный деплой того же бота»: секреты я не
+      перезатираю, значит бот так и не получит токен. Снеси файл осознанно и повтори:
+        rm '$INST/.env'"
+    [ "$cur" = "$TOKEN" ] || gate_fail "имя '$NAME' уже занято ДРУГИМ ботом (в $INST/.env другой токен).
       Возьми другое --name либо снеси инстанс осознанно: systemctl disable --now $UNIT && rm -rf $INST"
+    # C9: контуры не смешиваем и при ПЕРЕДЕПЛОЕ — аргументы про существующий .env не знали,
+    # и один инстанс получал api-ключ и oauth-токен одновременно (§8.1 это запрещает).
+    cur_mode="$(env_value_of "$INST/.env" AUTH_MODE)"
+    if [ -n "$cur_mode" ] && [ "$cur_mode" != "$AUTH_MODE" ]; then
+      gate_fail "инстанс '$NAME' уже живёт в контуре '$cur_mode', а запрошен '$AUTH_MODE'.
+      Один инстанс — один контур (§8.1): смена контура = новый инстанс (другое --name) либо
+      осознанный снос: systemctl disable --now $UNIT && rm -rf $INST"
     fi
-    echo "  ✓ имя '$NAME': это повторный деплой того же бота (идемпотентно)"
+    if [ "$AUTH_MODE" = "api" ] && [ -n "$(env_value_of "$INST/.env" CLAUDE_CODE_OAUTH_TOKEN)" ]; then
+      gate_fail "в $INST/.env уже есть CLAUDE_CODE_OAUTH_TOKEN (подписка), а запрошен контур api.
+      Смешение контуров запрещено (§8.1)."
+    fi
+    if [ "$AUTH_MODE" != "api" ] && [ -n "$(env_value_of "$INST/.env" ANTHROPIC_API_KEY)" ]; then
+      gate_fail "в $INST/.env уже есть ANTHROPIC_API_KEY (контур api), а запрошена подписка.
+      Смешение контуров запрещено (§8.1)."
+    fi
+    echo "  ✓ имя '$NAME': это повторный деплой того же бота (идемпотентно), контур ${cur_mode:-$AUTH_MODE}"
   else
     echo "  ✓ имя '$NAME': свободно"
   fi
@@ -473,16 +537,46 @@ fi
 
 # ── 3. инстанс-каталог + .env (idempotent, chmod 600, секреты через printf) ──
 asuser "mkdir -p '$INST/state/uploads'"
+# put_env: положить подготовленный файл на место .env (600, владелец — run-user).
+put_env() { install -m 600 "$1" "$INST/.env"; [ "$RUN_USER" = "$(id -un)" ] || $SUDO chown "$RUN_USER" "$INST/.env"; }
+
+# sync_env_value: применить НЕ-СЕКРЕТНОЕ значение к существующему .env (C7).
+# Раньше передеплой видел готовый .env и не трогал его вовсе: ученик исправлял опечатку в
+# своём Telegram id, .env оставался прежним, бот молчал, а скрипт печатал «готово».
+# Секреты сюда не попадают — их не перезатираем (§4), а cc-token имеет отдельную ротацию.
+sync_env_value() {  # sync_env_value <ключ> <значение>
+  local k="$1" v="$2" cur tmp
+  cur="$(env_value_of "$INST/.env" "$k")"
+  [ "$cur" != "$v" ] || return 0
+  if [ "$DRY_RUN" = "true" ]; then
+    echo "[dry-run] .env: $k: '$cur' → '$v'"; return 0
+  fi
+  tmp="$(mktemp)"
+  grep -v -E "^$k=" "$INST/.env" > "$tmp" || true
+  printf '%s=%s\n' "$k" "$v" >> "$tmp"
+  put_env "$tmp"; rm -f "$tmp"
+  echo "    .env: $k — применено новое значение ('$cur' → '$v')"
+}
+
 if [ -f "$INST/.env" ]; then
-  echo "    .env уже есть — не трогаю (idempotent)"
+  echo "    .env уже есть — секреты не перезатираю (idempotent), не-секретные значения синхронизирую"
+  sync_env_value ALLOWED_USER_IDS "$USERS"
+  sync_env_value DEFAULT_PROJECT_SLUG "$PROJECT_SLUG"
+  sync_env_value AUDIENCE "$AUDIENCE"
   if [ -n "$CC_TOKEN" ]; then
-    if [ "$DRY_RUN" = "true" ]; then echo "[dry-run] ротировал бы CLAUDE_CODE_OAUTH_TOKEN в $INST/.env"; else
+    if [ "$DRY_RUN" = "true" ]; then echo "[dry-run] ротировал бы CLAUDE_CODE_OAUTH_TOKEN в $INST/.env и рестартовал $UNIT"; else
       TMP_ENV="$(mktemp)"
       grep -v '^CLAUDE_CODE_OAUTH_TOKEN=' "$INST/.env" > "$TMP_ENV" || true
       printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$CC_TOKEN" >> "$TMP_ENV"
-      install -m 600 "$TMP_ENV" "$INST/.env"; rm -f "$TMP_ENV"
-      [ "$RUN_USER" = "$(id -un)" ] || $SUDO chown "$RUN_USER" "$INST/.env"
-      echo "    cc-token ротирован — рестартни: $SUDO $SYSTEMCTL restart $UNIT"
+      put_env "$TMP_ENV"; rm -f "$TMP_ENV"
+      # C8: раньше здесь печаталось «рестартни сам» — и протухший токен продолжал жить в
+      # процессе. Инструкция замыкала цикл: владелец возвращался с тем же «бот молчит».
+      if have_systemctl && $SYSTEMCTL_SUDO "$SYSTEMCTL" restart "$UNIT" 2>/dev/null; then
+        echo "    cc-token ротирован, юнит перезапущен ($UNIT) — новый токен уже в процессе"
+      else
+        echo "    cc-token ротирован. Юнит перезапустить не удалось (нет systemctl/прав):"
+        echo "      $SUDO $SYSTEMCTL restart $UNIT   ← без этого в процессе живёт СТАРЫЙ токен"
+      fi
     fi
   fi
 else
@@ -496,17 +590,21 @@ else
     sed -e "s|{{USERS}}|$USERS|g" -e "s|{{PROJECT_SLUG}}|$PROJECT_SLUG|g" \
         "$HERE/templates/.env.template" > "$TMP_ENV"
     # Контур (§8.1) фиксируем в .env: инстанс живёт в ОДНОМ контуре, и это видно глазами.
-    printf 'AUTH_MODE=%s\n' "$AUTH_MODE" >> "$TMP_ENV"
-    printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN" >> "$TMP_ENV"
-    if [ "$AUTH_MODE" = "api" ]; then
-      printf 'ANTHROPIC_API_KEY=%s\n' "$API_KEY" >> "$TMP_ENV"
-      # Декларация лимитов: энфорс — Фаза 4 (LimitsPolicy), гейт про это предупредил.
-      printf 'LIMIT_REQUESTS_PER_DAY=%s\nLIMIT_TOKENS_PER_DAY=%s\n' "$LIMIT_RPD" "$LIMIT_TPD" >> "$TMP_ENV"
-    elif [ -n "$CC_TOKEN" ]; then
-      printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$CC_TOKEN" >> "$TMP_ENV"
-    fi
-    install -m 600 "$TMP_ENV" "$INST/.env"; rm -f "$TMP_ENV"
-    [ "$RUN_USER" = "$(id -un)" ] || $SUDO chown "$RUN_USER" "$INST/.env"
+    # SEC-7: AUDIENCE обязан быть виден РАНТАЙМУ, а не только деплою — иначе дописка id в
+    # ALLOWED_USER_IDS превращает internal-бота в клиентского в обход гейта §8.1.
+    {
+      printf 'AUTH_MODE=%s\n' "$AUTH_MODE"
+      printf 'AUDIENCE=%s\n' "$AUDIENCE"
+      printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN"
+      if [ "$AUTH_MODE" = "api" ]; then
+        printf 'ANTHROPIC_API_KEY=%s\n' "$API_KEY"
+        # Декларация лимитов: энфорс — Фаза 4 (LimitsPolicy), гейт про это предупредил.
+        printf 'LIMIT_REQUESTS_PER_DAY=%s\nLIMIT_TOKENS_PER_DAY=%s\n' "$LIMIT_RPD" "$LIMIT_TPD"
+      elif [ -n "$CC_TOKEN" ]; then
+        printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$CC_TOKEN"
+      fi
+    } >> "$TMP_ENV"
+    put_env "$TMP_ENV"; rm -f "$TMP_ENV"
     echo "    .env записан (chmod 600, контур $AUTH_MODE, секреты через printf)"
   fi
 fi

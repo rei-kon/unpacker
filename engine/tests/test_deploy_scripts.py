@@ -924,3 +924,29 @@ def test_unit_has_no_empty_venv_assignment(tmp_path, api_base, isolated_runtime)
     unit = (tmp_path / "systemd" / "agent-tg@.service").read_text()
     assert "UV_PROJECT_ENVIRONMENT" not in unit
     assert "REPLACE_WITH" not in unit, "нерендеренных плейсхолдеров в юните быть не должно"
+
+
+# ── C8: после ротации cc-token юнит РЕСТАРТУЕТСЯ, а не «рестартни сам» ──────
+
+
+@pytest.mark.skipif(not UV, reason="нужен uv")
+def test_cc_token_rotation_restarts_unit(tmp_path, api_base, isolated_runtime):
+    """Протухший токен продолжал жить в процессе: .env новый, а бот всё ещё с прежним.
+
+    Инструкция «рестартни руками» замыкала цикл: владелец приходил с «бот молчит» ровно
+    к тому же боту.
+    """
+    log = tmp_path / "systemctl.log"
+    sysctl = stub_bin(tmp_path, "systemctl", SYSTEMCTL_STUB)
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    env["TG_SYSTEMCTL"] = str(sysctl)
+    env["SYSTEMCTL_LOG"] = str(log)
+    args = deploy_args(tmp_path, "rotres")
+    assert run_deploy(*args, "--cc-token", "sk-OLD", env_extra=env).returncode == 0
+    log.unlink(missing_ok=True)
+    r = run_deploy(*args, "--cc-token", "sk-NEW", env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    envf = Path(env["TG_AGENTS_BASE"]) / "rotres" / ".env"
+    assert "CLAUDE_CODE_OAUTH_TOKEN=sk-NEW" in envf.read_text()
+    assert log.exists(), "systemctl не вызывался вообще"
+    assert "restart agent-tg@rotres" in log.read_text(), "после ротации юнит обязан рестартнуть"

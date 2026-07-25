@@ -19,10 +19,12 @@ import pytest
 from engine.tests._tgapi_stub import BAD_TOKEN, DEAD_BASE
 from engine.tests.conftest import (
     GOOD_TOKEN,
+    SYSTEMCTL_STUB,
     deploy_env,
     make_brain,
     out_of,
     run_deploy,
+    stub_bin,
 )
 
 # Фикстуры (api_base, isolated_runtime) и хелперы живут в engine/tests/conftest.py —
@@ -511,3 +513,238 @@ def test_buttons_bridge_does_not_overwrite_existing(tmp_path, api_base, isolated
     kept = (inst / "buttons.yaml").read_text()
     assert "Моя" in kept
     assert "Создать КП" not in kept, "правки владельца не затираются кнопками мозга"
+
+
+# ── C7: передеплой ПРИМЕНЯЕТ не-секретные значения ──────────────────────────
+
+
+def test_redeploy_applies_changed_users(tmp_path, api_base, isolated_runtime):
+    """Ученик исправил опечатку в своём Telegram id → бот обязан начать его слушать.
+
+    Раньше передеплой видел готовый .env и «идемпотентно» не трогал его: id оставался
+    прежним, бот молчал, а скрипт печатал «готово». Тихий обман хуже отказа.
+    """
+    env = _green(tmp_path, api_base, isolated_runtime)
+    r1 = run_deploy(*_real_args(tmp_path, "fixid", "--users", "111"), env_extra=env)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    envf = Path(env["TG_AGENTS_BASE"]) / "fixid" / ".env"
+    with envf.open("a") as f:
+        f.write("CUSTOM_MARKER=keepme\n")
+    r2 = run_deploy(*_real_args(tmp_path, "fixid", "--users", "222,333"), env_extra=env)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    body = envf.read_text()
+    assert "ALLOWED_USER_IDS=222,333" in body, "исправленный список пользователей не применён"
+    assert "ALLOWED_USER_IDS=111" not in body
+    assert f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}" in body, "секрет не должен пострадать"
+    assert "CUSTOM_MARKER=keepme" in body, "правки владельца не затираем"
+    assert oct(envf.stat().st_mode)[-3:] == "600"
+
+
+def test_redeploy_reports_what_it_changed(tmp_path, api_base, isolated_runtime):
+    env = _green(tmp_path, api_base, isolated_runtime)
+    args_first = _real_args(tmp_path, "reportenv", "--users", "111")
+    assert run_deploy(*args_first, env_extra=env).returncode == 0
+    r = run_deploy(*_real_args(tmp_path, "reportenv", "--users", "999"), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ALLOWED_USER_IDS" in r.stdout, "изменение не-секретного значения должно быть видно"
+
+
+# ── SEC-7: контур аудитории виден рантайму, а не только деплою ───────────────
+
+
+def test_env_records_audience(tmp_path, api_base, isolated_runtime):
+    """AUDIENCE не писался в .env: рантайм про контур не знал, и дописка id в ALLOWED_USER_IDS
+    превращала internal-бота в клиентского в обход гейта §8.1."""
+    env = _green(tmp_path, api_base, isolated_runtime)
+    r = run_deploy(*_real_args(tmp_path, "audi"), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    body = (Path(env["TG_AGENTS_BASE"]) / "audi" / ".env").read_text()
+    assert "AUDIENCE=internal" in body
+
+
+# ── C21: .env без строки токена — БИТЫЙ, а не «повторный деплой» ─────────────
+
+
+def test_gate_refuses_env_without_token_line(tmp_path, api_base):
+    inst = tmp_path / "agents" / "brokenenv"
+    inst.mkdir(parents=True)
+    (inst / ".env").write_text("ALLOWED_USER_IDS=111\nDB_PATH=state/state.db\n")
+    r = run_deploy(*_args(tmp_path, "brokenenv"), env_extra=_env(tmp_path, api_base))
+    assert r.returncode == 3, r.stdout + r.stderr
+    text = _out(r)
+    assert "telegram_bot_token" in text and "битый" in text
+    assert "rm " in text, "отказ должен нести готовую команду: файл сносится осознанно"
+    # и деплой не должен «продолжиться как обычно»: инстанс остаётся без нового .env
+    assert not (inst / "state").exists()
+
+
+# ── C9: гейт смешения контуров читает СУЩЕСТВУЮЩИЙ .env, а не только аргументы ─
+
+
+def test_gate_refuses_contour_switch_api_to_subscription(tmp_path, api_base):
+    inst = tmp_path / "agents" / "wasapi"
+    inst.mkdir(parents=True)
+    (inst / ".env").write_text(
+        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\nAUTH_MODE=api\nANTHROPIC_API_KEY=sk-ant-old\n"
+    )
+    r = run_deploy(
+        *_args(tmp_path, "wasapi", GOOD_TOKEN, "--cc-token", "sk-oauth-new"),
+        env_extra=_env(tmp_path, api_base),
+    )
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "контур" in _out(r)
+
+
+def test_gate_refuses_contour_switch_subscription_to_api(tmp_path, api_base):
+    inst = tmp_path / "agents" / "wassub"
+    inst.mkdir(parents=True)
+    (inst / ".env").write_text(
+        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\nAUTH_MODE=subscription\nCLAUDE_CODE_OAUTH_TOKEN=sk-old\n"
+    )
+    r = run_deploy(
+        *_args(
+            tmp_path,
+            "wassub",
+            GOOD_TOKEN,
+            "--auth-mode",
+            "api",
+            "--api-key",
+            "sk-ant-new",
+            "--limit-requests-per-day",
+            "10",
+            "--limit-tokens-per-day",
+            "1000",
+        ),
+        env_extra=_env(tmp_path, api_base),
+    )
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "контур" in _out(r)
+
+
+def test_gate_allows_same_contour_redeploy(tmp_path, api_base):
+    """Тот же контур — норма (идемпотентность), иначе гейт запретил бы обычный передеплой."""
+    inst = tmp_path / "agents" / "samectr"
+    inst.mkdir(parents=True)
+    (inst / ".env").write_text(
+        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\nAUTH_MODE=subscription\nCLAUDE_CODE_OAUTH_TOKEN=sk-old\n"
+    )
+    r = run_deploy(
+        *_args(tmp_path, "samectr", GOOD_TOKEN, "--cc-token", "sk-new"),
+        env_extra=_env(tmp_path, api_base),
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+# ── Р5/SEC-4: секреты приходят ФАЙЛОМ, а не через argv ──────────────────────
+
+
+def _secret_file(tmp_path: Path, name: str, value: str, mode: int = 0o600) -> Path:
+    f = tmp_path / name
+    f.write_text(value + "\n", encoding="utf-8")
+    f.chmod(mode)
+    return f
+
+
+def test_token_file_accepted_and_written_to_env(tmp_path, api_base, isolated_runtime):
+    """Токен в argv навсегда оседает в /var/log/auth.log и в history — читаем его из файла."""
+    env = _green(tmp_path, api_base, isolated_runtime)
+    tf = _secret_file(tmp_path, "bot.token", GOOD_TOKEN)
+    args = [
+        "--surface",
+        "tg",
+        "--name",
+        "tokfile",
+        "--token-file",
+        str(tf),
+        "--users",
+        "111",
+        "--brain",
+        str(_brain(tmp_path)),
+        "--project-slug",
+        "tokfile",
+    ]
+    r = run_deploy(*args, env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    body = (Path(env["TG_AGENTS_BASE"]) / "tokfile" / ".env").read_text()
+    assert f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}" in body
+    assert GOOD_TOKEN not in (r.stdout + r.stderr), "значение секрета не печатаем"
+
+
+def test_cc_token_file_accepted(tmp_path, api_base, isolated_runtime):
+    env = _green(tmp_path, api_base, isolated_runtime)
+    cf = _secret_file(tmp_path, "cc.token", "sk-ant-oat01-fromfile")
+    r = run_deploy(
+        *_real_args(tmp_path, "ccfile", "--cc-token-file", str(cf)),
+        env_extra=env,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    body = (Path(env["TG_AGENTS_BASE"]) / "ccfile" / ".env").read_text()
+    assert "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-fromfile" in body
+    assert "sk-ant-oat01-fromfile" not in (r.stdout + r.stderr)
+
+
+def test_token_file_refused_when_world_readable(tmp_path, api_base):
+    """Файл секрета обязан быть 600: иначе «файл вместо argv» ничего не защитил."""
+    tf = _secret_file(tmp_path, "loose.token", GOOD_TOKEN, mode=0o644)
+    r = run_deploy(
+        *[
+            "--surface",
+            "tg",
+            "--name",
+            "loosetok",
+            "--token-file",
+            str(tf),
+            "--users",
+            "111",
+            "--brain",
+            str(_brain(tmp_path)),
+            "--dry-run",
+        ],
+        env_extra=_env(tmp_path, api_base),
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "600" in (r.stdout + r.stderr)
+
+
+def test_token_and_token_file_together_refused(tmp_path, api_base):
+    tf = _secret_file(tmp_path, "both.token", GOOD_TOKEN)
+    r = run_deploy(
+        *[
+            "--surface",
+            "tg",
+            "--name",
+            "bothtok",
+            "--token",
+            GOOD_TOKEN,
+            "--token-file",
+            str(tf),
+            "--users",
+            "111",
+            "--brain",
+            str(_brain(tmp_path)),
+            "--dry-run",
+        ],
+        env_extra=_env(tmp_path, api_base),
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "--token-file" in (r.stdout + r.stderr)
+
+
+def test_missing_token_file_refused_early(tmp_path, api_base):
+    r = run_deploy(
+        *[
+            "--surface",
+            "tg",
+            "--name",
+            "notokfile",
+            "--token-file",
+            str(tmp_path / "нет-такого"),
+            "--users",
+            "111",
+            "--brain",
+            str(_brain(tmp_path)),
+            "--dry-run",
+        ],
+        env_extra=_env(tmp_path, api_base),
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
