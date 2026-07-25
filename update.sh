@@ -303,19 +303,20 @@ current_release() {
 
 # Отказ git — НЕ «в репо нет тегов» (C16). Раньше `|| true` превращал любую жалобу git
 # (чаще всего dubious ownership на каталоге с чужим владельцем) в бодрое «обновлять не на что».
-git_tags() {
-  local out st=0
-  out="$(git -C "$ENGINE_DIR" tag --sort=-v:refname 2>&1)" || st=$?
+# Читаем теги ОДИН раз и на верхнем уровне: из `$(...)` никакой `exit` скрипт не остановит —
+# он завершил бы только подоболочку, и отказ git снова стал бы «тегов нет».
+TAGS=""
+read_tags() {
+  local st=0
+  TAGS="$(git -C "$ENGINE_DIR" tag --sort=-v:refname 2>&1)" || st=$?
   if [ "$st" -ne 0 ]; then
     echo "✗ git не смог прочитать репо движка в $ENGINE_DIR. Он сказал так:" >&2
-    printf '  %s\n' "$out" >&2
+    printf '  %s\n' "$TAGS" >&2
     echo "  Обычная причина — каталог принадлежит не root'у (git: dubious ownership)." >&2
     echo "  Починка: sudo chown -R root:root $ENGINE_DIR && sudo chmod -R go-w $ENGINE_DIR" >&2
     exit 3
   fi
-  printf '%s' "$out"
 }
-latest_tag() { local all; all="$(git_tags)"; printf '%s' "${all%%$'\n'*}"; }
 
 CURRENT="$(current_release)"
 say "    сейчас: $CURRENT"
@@ -323,6 +324,7 @@ say "    сейчас: $CURRENT"
 if ! run git -C "$ENGINE_DIR" fetch --tags --force; then
   say "  ! не смог получить свежие теги (сеть/доступ к репо) — работаю с тем, что уже скачано"
 fi
+read_tags
 
 if [ "$ROLLBACK" = "true" ]; then
   TARGET=""
@@ -337,7 +339,7 @@ if [ "$ROLLBACK" = "true" ]; then
 elif [ -n "$REF" ]; then
   TARGET="$REF"
 else
-  TARGET="$(latest_tag)"
+  TARGET="${TAGS%%$'\n'*}"
   if [ -z "$TARGET" ]; then
     echo "✗ в репо нет тегов-релизов — обновлять не на что." >&2
     echo "  Релизы движка помечаются тегами; HEAD ветки я не тяну намеренно" >&2
@@ -389,8 +391,10 @@ if ! run "$UV_BIN" sync --frozen --project "$ENGINE_DIR"; then
   echo "  Частая причина — нет сети до pypi. Проверь: curl -I https://pypi.org" >&2
   exit 3
 fi
-run chown -R "$RUN_USER" "$UV_PROJECT_ENVIRONMENT" || \
-  say "  ! не смог отдать venv юзеру $RUN_USER — проверь: chown -R $RUN_USER $UV_PROJECT_ENVIRONMENT"
+if [ -d "$UV_PROJECT_ENVIRONMENT" ]; then
+  run chown -R "$RUN_USER" "$UV_PROJECT_ENVIRONMENT" || \
+    say "  ! не смог отдать venv юзеру $RUN_USER — проверь: chown -R $RUN_USER $UV_PROJECT_ENVIRONMENT"
+fi
 
 # ── рестарт ботов: инициатор ПОСЛЕДНИМ ──────────────────────────────────────
 RESTART_FAILED=0

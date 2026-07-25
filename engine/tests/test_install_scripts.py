@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import os
+import re
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -685,14 +687,18 @@ def _engine_with_tags(tmp_path):
 
     Коммит после тега — это и есть проверяемая ситуация: «плохой пуш владельца» не должен
     приезжать ученикам, update.sh обязан встать на тег, а не на HEAD.
+
+    update.sh КОПИРУЕТСЯ внутрь — ровно как на сервере (/opt/unpacker/update.sh). Каталог
+    движка он берёт из своего расположения, флага --engine-dir больше нет (SEC-1).
     """
     engine = tmp_path / "opt" / "unpacker"
     (engine / "deploy").mkdir(parents=True)
     (engine / "deploy" / "_common.sh").write_text((REPO / "deploy" / "_common.sh").read_text())
     (engine / "engine").mkdir()
-    _git("init", "-q", ".", cwd=str(engine)) if False else subprocess.run(
-        ["git", "init", "-q", str(engine)], check=True, capture_output=True
-    )
+    upd = engine / "update.sh"
+    upd.write_text(UPDATE.read_text())
+    upd.chmod(0o755)
+    subprocess.run(["git", "init", "-q", str(engine)], check=True, capture_output=True)
     (engine / "VERSION").write_text("v0.1.0\n")
     _git("add", "-A", cwd=str(engine))
     _git("commit", "-qm", "v0.1.0", cwd=str(engine))
@@ -705,12 +711,35 @@ def _engine_with_tags(tmp_path):
     return engine
 
 
+def _sqlite_db(path: Path, rows: int = 3) -> None:
+    """НАСТОЯЩАЯ база SQLite: бэкап проверяется чтением, а не сравнением байтов.
+
+    Текстовая «заглушка» тут не годится осознанно: согласованный снимок делает
+    `sqlite3 .backup`/`Connection.backup`, и на не-базе он обязан честно провалиться (ADV-12).
+    """
+    con = sqlite3.connect(path)
+    with con:
+        con.execute("CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY, text TEXT)")
+        con.executemany(
+            "INSERT INTO sessions(text) VALUES(?)", [(f"переписка {i}",) for i in range(rows)]
+        )
+    con.close()
+
+
+def _db_rows(path: Path) -> list[str]:
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return [r[0] for r in con.execute("SELECT text FROM sessions ORDER BY id")]
+    finally:
+        con.close()
+
+
 def _instances(tmp_path, names=("unpacker", "sales")):
     base = tmp_path / "agents"
     for n in names:
         (base / n / "state").mkdir(parents=True)
         (base / n / ".env").write_text("TELEGRAM_BOT_TOKEN=1:x\n")
-        (base / n / "state" / "state.db").write_text("SQLite-заглушка\n")
+        _sqlite_db(base / n / "state" / "state.db")
     return base
 
 
@@ -719,9 +748,17 @@ def _upd_env(tmp_path, engine, **over):
         "STUB_LOG": str(tmp_path / "stub.log"),
         "TG_AGENTS_BASE": str(tmp_path / "agents"),
         "TG_RUN_USER": os.environ.get("USER", "nobody"),
+        # машинный конфиг и venv — вне дерева движка (Р1/Р2); в тестах уводим в tmp
+        "UNPACKER_ETC": str(tmp_path / "etc" / "unpacker"),
+        "UV_PROJECT_ENVIRONMENT": str(tmp_path / "venv"),
     }
     env.update(over)
     return env
+
+
+def run_update_in(engine: Path, *args: str, **kw):
+    """Запуск update.sh ИЗ каталога движка — единственная поддерживаемая форма (SEC-1)."""
+    return _run(engine / "update.sh", *args, **kw)
 
 
 def test_update_script_exists_and_helps():
@@ -730,13 +767,14 @@ def test_update_script_exists_and_helps():
     r = run_update("--help")
     assert r.returncode == 0, r.stderr
     assert "--rollback" in r.stdout and "--dry-run" in r.stdout
+    assert "--restore-db" in r.stdout, "откат КОДА без восстановления ДАННЫХ — половина операции"
 
 
 def test_update_checks_out_latest_tag_not_head(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path)
-    r = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert (engine / "VERSION").read_text().strip() == "v0.2.0", (
@@ -745,15 +783,50 @@ def test_update_checks_out_latest_tag_not_head(tmp_path):
     assert "v0.2.0" in out
 
 
-def test_update_backs_up_state_db_before_switching(tmp_path):
+def test_update_backup_is_consistent_sqlite_snapshot(tmp_path):
+    """Бэкап — читаемая база с теми же строками, а не «копия файла» (ADV-12)."""
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     base = _instances(tmp_path)
-    r = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    before = _db_rows(base / "unpacker" / "state" / "state.db")
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r.returncode == 0, r.stdout + r.stderr
-    backups = list((base / "unpacker" / "state" / "backups").glob("state.db*"))
-    assert backups, "перед миграциями обязан лежать бэкап БД сессий"
-    assert backups[0].read_text() == "SQLite-заглушка\n", "бэкап должен быть копией, а не пустышкой"
+    copies = sorted((base / "unpacker" / "state" / "backups").glob("*/state.db"))
+    assert copies, "перед миграциями обязан лежать бэкап БД сессий"
+    assert _db_rows(copies[0]) == before, "бэкап обязан открываться как база и содержать те же сессии"
+
+
+def test_update_refuses_to_proceed_when_backup_impossible(tmp_path):
+    """Согласованный снимок не сделался → обновления НЕ будет (fail-closed, ADV-12).
+
+    Раньше здесь стоял `cp` живой WAL-базы: копия выходила битой или без последних сессий,
+    а скрипт бодро писал «бэкап (копия)» и шёл дальше.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    (base / "unpacker" / "state" / "state.db").write_text("это вообще не sqlite\n")
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, f"без бэкапа обновляться нельзя:\n{out}"
+    assert "sqlite3" in out, "нужна готовая команда починки"
+    assert (engine / "VERSION").read_text().strip() != "v0.2.0", "код не должен быть переключён"
+
+
+def test_update_backs_up_state_db_before_switching(tmp_path):
+    """M5: «до переключения» проверяется срывом переключения, а не фактом файла.
+
+    Рабочее дерево делаем грязным по VERSION — `git checkout` на тег обязан отказаться.
+    Если бэкап делается ПОСЛЕ checkout, его после этого падения не будет.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    (engine / "VERSION").write_text("правка ученика прямо в /opt\n")
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r.returncode != 0, "checkout поверх незакоммиченной правки обязан провалиться"
+    copies = sorted((base / "unpacker" / "state" / "backups").glob("*/state.db"))
+    assert copies, "бэкап обязан быть сделан РАНЬШЕ переключения кода"
 
 
 def test_update_restarts_initiator_last(tmp_path):
@@ -761,7 +834,7 @@ def test_update_restarts_initiator_last(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path, names=("alpha", "unpacker", "zeta"))
-    r = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r.returncode == 0, r.stdout + r.stderr
     # фильтруем по началу строки: путь tmp_path сам содержит слово restart
     restarts = [
@@ -774,14 +847,42 @@ def test_update_restarts_initiator_last(tmp_path):
     assert "unpacker" not in "\n".join(restarts[:-1])
 
 
+def test_update_does_not_die_midway_when_one_unit_is_missing(tmp_path):
+    """C12: у папки без юнита рестарт падает — остальных это не должно лишать обновления.
+
+    И «готово» в конце не печатается: часть ботов осталась лежать.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "sudo"))
+    sysctl = stub / "systemctl"
+    sysctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "systemctl %s\\n" "$*" >> "$STUB_LOG"\n'
+        'if [ "$*" = "restart agent-tg@alpha" ]; then\n'
+        '  echo "Failed to restart agent-tg@alpha.service: Unit not found." >&2; exit 5\nfi\n'
+        "exit 0\n"
+    )
+    sysctl.chmod(0o755)
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path, names=("alpha", "unpacker", "zeta"))
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    restarts = [
+        ln
+        for ln in (tmp_path / "stub.log").read_text().splitlines()
+        if ln.startswith("systemctl restart")
+    ]
+    assert len(restarts) == 3, f"падение одного юнита не должно рвать обновление:\n{restarts}"
+    assert r.returncode != 0, "часть ботов лежит — это не успех"
+    assert "==> готово" not in out, f"«готово», не сделав дела:\n{out}"
+    assert "journalctl" in out, "нужна команда, чтобы посмотреть причину"
+
+
 def test_update_dry_run_changes_nothing(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     base = _instances(tmp_path)
     before = (engine / "VERSION").read_text()
-    r = run_update(
-        "--engine-dir", str(engine), "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub
-    )
+    r = run_update_in(engine, "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert "[dry-run]" in out
@@ -795,9 +896,9 @@ def test_update_is_idempotent_on_second_run(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path)
-    r1 = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r1 = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r1.returncode == 0, r1.stdout + r1.stderr
-    r2 = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r2 = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     out2 = r2.stdout + r2.stderr
     assert r2.returncode == 0, out2
     assert "уже" in out2, "повторный запуск обязан сказать «уже на последнем релизе», а не чинить"
@@ -812,12 +913,10 @@ def test_update_rollback_returns_previous_tag(tmp_path):
     subprocess.run(
         ["git", "-C", str(engine), "checkout", "--quiet", "v0.1.0"], check=True, capture_output=True
     )
-    r1 = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r1 = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r1.returncode == 0, r1.stdout + r1.stderr
     assert (engine / "VERSION").read_text().strip() == "v0.2.0"
-    r2 = run_update(
-        "--engine-dir", str(engine), "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub
-    )
+    r2 = run_update_in(engine, "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub)
     out2 = r2.stdout + r2.stderr
     assert r2.returncode == 0, out2
     assert (engine / "VERSION").read_text().strip() == "v0.1.0", "откат обязан вернуть прошлый тег"
@@ -828,24 +927,199 @@ def test_update_rollback_without_history_explains(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path)
-    r = run_update(
-        "--engine-dir", str(engine), "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub
-    )
+    r = run_update_in(engine, "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r.returncode != 0
     out = (r.stdout + r.stderr).lower()
     assert "откат" in out or "rollback" in out
     assert "--ref" in out, "должен подсказать, как встать на конкретный релиз руками"
 
 
+def test_update_restores_databases_from_backup(tmp_path):
+    """--restore-db: откат КОДА без возврата ДАННЫХ — половина операции (ADV-12).
+
+    Сценарий ученика: обновился, миграция новой версии переписала базу, откатил код —
+    и остался с базой из будущего. Возврат данных обязан быть отдельной командой.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    db = base / "unpacker" / "state" / "state.db"
+    good = _db_rows(db)
+    r1 = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    # «миграция новой версии» испортила базу и оставила мусорный -wal
+    db.unlink()
+    _sqlite_db(db, rows=1)
+    (base / "unpacker" / "state" / "state.db-wal").write_text("мусор от прерванной миграции")
+    r2 = run_update_in(engine, "--restore-db", env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out2 = r2.stdout + r2.stderr
+    assert r2.returncode == 0, out2
+    assert _db_rows(db) == good, "база обязана вернуться к состоянию до обновления"
+    assert not (base / "unpacker" / "state" / "state.db-wal").exists(), (
+        "оставленный -wal подмешал бы к восстановленной базе чужие страницы"
+    )
+    log = (tmp_path / "stub.log").read_text()
+    assert "systemctl stop agent-tg@unpacker" in log, "бота обязательно остановить перед подменой"
+    assert "systemctl start agent-tg@unpacker" in log, "и поднять обратно"
+
+
+def test_update_restore_db_without_backups_says_so(tmp_path):
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r = run_update_in(engine, "--restore-db", env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "бэкап" in out.lower()
+
+
+def test_update_stops_when_dependencies_fail_and_offers_rollback(tmp_path):
+    """C13: код переключён, uv sync провалился → нельзя молчать и нельзя рестартовать ботов.
+
+    Ровно этот случай приезжает с новым релизом, добавившим зависимость: код новый,
+    библиотеки старые. Ученику нужна одна команда — --rollback.
+    """
+    stub = _stub_bin(tmp_path, ("systemctl", "sudo"))
+    bad_uv = stub / "uv"
+    bad_uv.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "uv %s\\n" "$*" >> "$STUB_LOG"\n'
+        'echo "error: Failed to download pyyaml" >&2\nexit 1\n'
+    )
+    bad_uv.chmod(0o755)
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "--rollback" in out, "ученик обязан узнать, как вернуться, из этого же сообщения"
+    assert "v0.1.0" in out or "v0.2.0" in out, "и на какой релиз он вернётся"
+    log = (tmp_path / "stub.log").read_text()
+    assert "systemctl restart" not in log, "на битых зависимостях ботов не рестартуем"
+    assert "готово" not in out
+
+
+def test_update_reports_git_failure_instead_of_no_tags(tmp_path):
+    """C16: жалоба git ≠ «в репо нет тегов».
+
+    Каталог движка с чужим владельцем даёт `dubious ownership`, а `|| true` превращал это в
+    «обновлять не на что» — ученик искал теги, которых у него полно.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    bad_git = stub / "git"
+    bad_git.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$3" = "tag" ]; then\n'
+        '  echo "fatal: detected dubious ownership in repository at \'/opt/unpacker\'" >&2\n'
+        "  exit 128\nfi\n"
+        'exec /usr/bin/git "$@"\n'
+    )
+    bad_git.chmod(0o755)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0
+    assert "нет тегов" not in out, f"это не «нет тегов», это отказ git:\n{out}"
+    assert "chown" in out and "root" in out, "нужна готовая команда починки владельца"
+
+
+def test_update_refuses_when_run_user_resolves_to_root(tmp_path):
+    """C6/ADV-06: не знаю юзера ботов — не обновляю, а не «готово» вхолостую.
+
+    Так выглядит запуск от root без /etc/unpacker/engine.conf: RUN_USER=root →
+    AGENTS_BASE=/root/agents → ни бэкапов, ни рестартов, и бодрый финал «готово: v1 → v2».
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    env = _upd_env(tmp_path, engine, TG_RUN_USER="root")
+    del env["TG_AGENTS_BASE"]
+    r = run_update_in(engine, env_extra=env, stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "engine.conf" in out, "должен назвать файл, которого не хватает"
+    assert "TG_RUN_USER" in out, "и путь починки руками"
+    assert "готово" not in out
+
+
+def test_update_takes_paths_from_engine_conf(tmp_path):
+    """Р2: единая вселенная путей. Без окружения update.sh обязан прочитать engine.conf.
+
+    Иначе любая точка входа (root вручную, sudo от агента, cron) читает свою вселенную и
+    тихо рапортует успех, не тронув ни одного бота.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    etc = tmp_path / "etc" / "unpacker"
+    etc.mkdir(parents=True)
+    me = os.environ.get("USER", "nobody")
+    (etc / "engine.conf").write_text(
+        f"TG_RUN_USER={me}\nTG_RUNTIME={engine}\nTG_AGENTS_BASE={base}\n"
+        f"TG_BRAINS_BASE={tmp_path}/brains\nTG_UV_BIN={stub}/uv\n"
+    )
+    env = {
+        "STUB_LOG": str(tmp_path / "stub.log"),
+        "UNPACKER_ETC": str(etc),
+        "UV_PROJECT_ENVIRONMENT": str(tmp_path / "venv"),
+    }
+    r = run_update_in(engine, env_extra=env, stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert sorted((base / "unpacker" / "state" / "backups").glob("*/state.db")), (
+        f"инстансы обязаны находиться по конфигу, а не по окружению вызывающего:\n{out}"
+    )
+
+
+def test_update_fails_closed_when_units_exist_but_no_instances(tmp_path):
+    """C6: юниты в системе есть, инстансов в AGENTS_BASE нет → я смотрю не туда.
+
+    «Нечего делать» здесь — ложь: боты остались бы на старом коде без бэкапов, а скрипт
+    напечатал бы «готово».
+    """
+    stub = _stub_bin(tmp_path, ("uv", "sudo"))
+    sysctl = stub / "systemctl"
+    sysctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "systemctl %s\\n" "$*" >> "$STUB_LOG"\n'
+        'case "$*" in *list-units*) echo "  agent-tg@sales.service loaded active running бот" ;; esac\n'
+        "exit 0\n"
+    )
+    sysctl.chmod(0o755)
+    engine = _engine_with_tags(tmp_path)
+    (tmp_path / "agents").mkdir()
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "agent-tg@" in out and "готово" not in out
+    assert (engine / "VERSION").read_text().strip() != "v0.2.0", "код не переключаем вслепую"
+
+
+def test_update_prints_only_whitelisted_command_forms(tmp_path):
+    """M-18: печатаем ровно то, что разрешено sudoers (без `bash` под sudo).
+
+    `sudo bash /opt/unpacker/update.sh` даёт «user is not allowed to execute /bin/bash»:
+    в whitelist'е стоит сам скрипт, а не оболочка.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "sudo bash" not in out, f"под sudo оболочка запрещена whitelist'ом:\n{out}"
+    assert f"sudo {engine}/update.sh --rollback" in out
+
+
 def test_update_refuses_non_repo_dir(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
-    (tmp_path / "notarepo").mkdir()
-    r = run_update(
-        "--engine-dir",
-        str(tmp_path / "notarepo"),
-        env_extra=_upd_env(tmp_path, tmp_path / "notarepo"),
-        stub=stub,
-    )
+    notarepo = tmp_path / "notarepo"
+    notarepo.mkdir()
+    upd = notarepo / "update.sh"
+    upd.write_text(UPDATE.read_text())
+    upd.chmod(0o755)
+    r = _run(upd, env_extra=_upd_env(tmp_path, notarepo), stub=stub)
     assert r.returncode != 0
     out = r.stdout + r.stderr
     assert "install.sh" in out, "если движок не установлен — отправь к install.sh"
@@ -1055,12 +1329,10 @@ def test_update_dry_run_does_not_claim_it_updated(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path)
-    r = run_update(
-        "--engine-dir", str(engine), "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub
-    )
+    r = run_update_in(engine, "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
-    assert "готово" not in out
+    assert "==> готово" not in out
     assert "ничего не изменено" in out
 
 
