@@ -72,7 +72,9 @@ def _stub_bin(tmp_path: Path, names: tuple[str, ...]) -> Path:
     return d
 
 
-def _run(script: Path, *args: str, env_extra: dict[str, str] | None = None, stub: Path | None = None):
+def _run(
+    script: Path, *args: str, env_extra: dict[str, str] | None = None, stub: Path | None = None
+):
     env = {**os.environ}
     if stub is not None:
         env["PATH"] = f"{stub}:{env.get('PATH', '')}"
@@ -255,7 +257,9 @@ def test_install_tolerates_old_system_python_because_uv_brings_its_own(tmp_path)
         stub=stub,
     )
     out = r.stdout + r.stderr
-    assert "3.11" in out and "uv" in out, f"должен объяснить, почему старый python не блокер:\n{out}"
+    assert "3.11" in out and "uv" in out, (
+        f"должен объяснить, почему старый python не блокер:\n{out}"
+    )
     assert r.returncode == 0, out
 
 
@@ -271,8 +275,18 @@ def _base_stub(tmp_path):
     return _stub_bin(
         tmp_path,
         (
-            "uv", "tmux", "claude", "gh", "sudo", "ufw", "systemctl",
-            "useradd", "chown", "apt-get", "git", "tee",
+            "uv",
+            "tmux",
+            "claude",
+            "gh",
+            "sudo",
+            "ufw",
+            "systemctl",
+            "useradd",
+            "chown",
+            "apt-get",
+            "git",
+            "tee",
         ),
     )
 
@@ -313,7 +327,14 @@ def test_install_dry_run_plans_hardening_and_touches_nothing(tmp_path):
     assert "[dry-run]" in out
     # ничего не изменено: read-only пробы версий допустимы, мутации — нет
     log = (tmp_path / "stub.log").read_text() if (tmp_path / "stub.log").exists() else ""
-    for mutating in ("ufw allow", "ufw default", "ufw --force", "useradd", "systemctl", "apt-get install"):
+    for mutating in (
+        "ufw allow",
+        "ufw default",
+        "ufw --force",
+        "useradd",
+        "systemctl",
+        "apt-get install",
+    ):
         assert mutating not in log, f"в dry-run '{mutating}' не должен исполняться:\n{log}"
     assert not (tmp_path / "opt" / "unpacker").exists()
     assert not (tmp_path / "agents").exists()
@@ -346,9 +367,7 @@ def test_install_non_interactive_names_missing_answer(tmp_path):
     stub = _base_stub(tmp_path)
     env = _answers(tmp_path)
     del env["UNPACKER_BOT_TOKEN"]
-    r = run_install(
-        "--dry-run", "--ram-mb", "8192", "--non-interactive", env_extra=env, stub=stub
-    )
+    r = run_install("--dry-run", "--ram-mb", "8192", "--non-interactive", env_extra=env, stub=stub)
     assert r.returncode != 0
     assert "UNPACKER_BOT_TOKEN" in r.stdout + r.stderr
 
@@ -476,7 +495,9 @@ def test_install_bootstraps_unpacker_through_deploy_sh(tmp_path):
     )
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
-    assert argv_log.exists(), f"install.sh обязан ЗВАТЬ deploy.sh, а не дублировать провизию:\n{out}"
+    assert argv_log.exists(), (
+        f"install.sh обязан ЗВАТЬ deploy.sh, а не дублировать провизию:\n{out}"
+    )
     argv = argv_log.read_text().splitlines()
     # детерминированный bootstrap ровно по §10.5
     assert "--surface" in argv and argv[argv.index("--surface") + 1] == "tg"
@@ -652,7 +673,9 @@ def test_install_does_not_lock_out_ssh_when_no_key_present(tmp_path):
 
 def _git(*args, cwd):
     subprocess.run(
-        ["git", "-c", "user.email=t@t.t", "-c", "user.name=t", *args], cwd=cwd, check=True,
+        ["git", "-c", "user.email=t@t.t", "-c", "user.name=t", *args],
+        cwd=cwd,
+        check=True,
         capture_output=True,
     )
 
@@ -826,3 +849,108 @@ def test_update_refuses_non_repo_dir(tmp_path):
     assert r.returncode != 0
     out = r.stdout + r.stderr
     assert "install.sh" in out, "если движок не установлен — отправь к install.sh"
+
+
+# ── шаблон мозга и пример (§4) ───────────────────────────────────────────────
+
+TEMPLATE = REPO / "brains" / "_template"
+EXAMPLE = REPO / "examples" / "assistant"
+
+
+def _parse_buttons(path: Path) -> list[dict[str, str]]:
+    """Мини-парсер корневого списка buttons.
+
+    pyyaml в зависимостях движка нет, а тащить его ради теста — лишняя зависимость в
+    продукте. Нам нужен ровно контракт среза: корневой ключ buttons, элементы с label и
+    prompt (см. `buttons.yaml` инстанса).
+    """
+    items: list[dict[str, str]] = []
+    cur: dict[str, str] | None = None
+    in_buttons = False
+    for raw in path.read_text().splitlines():
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        if not raw.startswith((" ", "\t", "-")):  # корневой ключ
+            in_buttons = raw.split(":", 1)[0].strip() == "buttons"
+            cur = None
+            continue
+        if not in_buttons:
+            continue
+        item = raw.strip()
+        if item.startswith("- "):
+            cur = {}
+            items.append(cur)
+            item = item[2:]
+        if cur is not None and ":" in item:
+            k, v = item.split(":", 1)
+            cur[k.strip()] = v.strip().strip('"').strip("'")
+    return items
+
+
+def test_brain_template_has_commented_claude_md():
+    cm = TEMPLATE / "CLAUDE.md"
+    assert cm.exists(), "brains/_template/CLAUDE.md — обязательный минимум мозга (§4)"
+    text = cm.read_text()
+    # шаблон обязан ОБЪЯСНЯТЬ, что писать, а не быть пустым файлом
+    assert len(text.splitlines()) > 20
+    assert "что тут писать" in text.lower() or "заполни" in text.lower()
+
+
+def test_brain_template_buttons_follow_cross_slice_contract():
+    y = TEMPLATE / ".brain.yaml"
+    assert y.exists(), "паспорт мозга с примером кнопок (§4)"
+    buttons = _parse_buttons(y)
+    assert buttons, "в примере паспорта обязаны быть кнопки — иначе шаблон не показывает формат"
+    for b in buttons:
+        assert "label" in b and "prompt" in b, f"контракт кнопки — label + prompt, получено: {b}"
+
+
+def test_brain_template_has_places_for_knowledge_and_skills():
+    assert (TEMPLATE / "knowledge").is_dir(), "место под знания агента"
+    assert (TEMPLATE / ".claude" / "skills").is_dir(), "место под скиллы агента"
+
+
+def test_example_brain_works_without_edits():
+    """Пример мозга должен разворачиваться как есть: минимум §4 — один CLAUDE.md."""
+    cm = EXAMPLE / "CLAUDE.md"
+    assert cm.exists(), "examples/assistant/CLAUDE.md"
+    text = cm.read_text()
+    assert len(text.splitlines()) > 10
+    # плейсхолдеров быть не должно — иначе «работает без правок» ложь
+    for placeholder in ("<...>", "TODO", "ЗАПОЛНИ", "замени это"):
+        assert placeholder not in text, f"в рабочем примере не должно быть '{placeholder}'"
+    buttons = _parse_buttons(EXAMPLE / ".brain.yaml")
+    assert len(buttons) >= 2
+    for b in buttons:
+        assert b.get("label") and b.get("prompt")
+
+
+# ── README: путь новичка (§11) ───────────────────────────────────────────────
+
+
+def test_readme_covers_all_newbie_path_sections():
+    text = (REPO / "README.md").read_text()
+    low = text.lower()
+    required = {
+        "что это": "что это и зачем",
+        "стоимость": "стоимость владения (VPS + подписка)",
+        "botfather": "пре-флайт: бот в BotFather",
+        "topics in private chats": "включение топиков — шаг, который нельзя сделать скриптом",
+        "install.sh": "быстрый старт одной командой",
+        "папка-мозг": "модель мозга и шаблон",
+        "agentctl": "диагностика для продвинутых",
+        "journalctl": "диагностика для продвинутых",
+        "update.sh": "обновление",
+        "--rollback": "откат",
+        "152-фз": "персональные данные",
+        "фаза 3": "честный статус фаз — веб ещё не сделан",
+    }
+    missing = [why for marker, why in required.items() if marker not in low]
+    assert not missing, f"README не покрывает путь новичка: {missing}"
+
+
+def test_readme_warns_about_subscription_limit_and_client_ban():
+    """Две вещи, которые ученик обязан узнать из README, а не из бана (§8.1)."""
+    low = (REPO / "README.md").read_text().lower()
+    assert "лимит" in low and "подписк" in low, "SDK жжёт лимит подписки — предупредить"
+    assert "клиент" in low, "обслуживать внешних клиентов с подписки нельзя — сказать прямо"
