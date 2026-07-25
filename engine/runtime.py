@@ -19,13 +19,13 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from engine.adapters.telegram.attach import AttachmentIntake
 from engine.adapters.telegram.bot import TelegramBot, make_owner_alert
 from engine.adapters.telegram.router import SessionRouter
-from engine.core.agent import AgentCore, detect_ram_bytes
+from engine.core.agent import AgentCore, OptionsBuilder, detect_ram_bytes
 from engine.core.buttons import ButtonRegistry
 from engine.core.config import Settings
 from engine.core.health import HealthMarker
 from engine.core.pool import ClientPool, compute_pool_ceiling
 from engine.core.security import AllowList
-from engine.core.sendfile import SendFilePolicy
+from engine.core.sendfile import SEND_FILE_INSTRUCTIONS, SendFilePolicy
 from engine.core.store import Store
 from engine.core.uploads import UploadStore
 
@@ -34,7 +34,11 @@ def _make_client(options: Any) -> ClaudeSDKClient:
     return ClaudeSDKClient(options=options)
 
 
-def _options_builder(settings: Settings):
+def _options_builder(settings: Settings) -> OptionsBuilder:
+    # Выключенную фичу не описываем: обещать модели неработающий маркер — та же ложь,
+    # только с другой стороны.
+    send_file_docs = SEND_FILE_INSTRUCTIONS if settings.send_file_enabled else None
+
     def build(*, cwd: str, resume: str | None, model: str | None) -> ClaudeAgentOptions:
         kw: dict[str, Any] = {
             "cwd": cwd,
@@ -50,11 +54,17 @@ def _options_builder(settings: Settings):
             kw["model"] = model
         if settings.max_turns:
             kw["max_turns"] = settings.max_turns
-        if settings.system_prompt_append:
+        # M-04: про маркер `[SEND_FILE:]` модель узнаёт ТОЛЬКО отсюда. Раньше append был
+        # пуст, в шаблонах мозга маркера не было — движок вырезал маркер, которого агент
+        # никогда не писал, и обещание «пришлю файлом» из примеров было ложью. Описание
+        # маркера — часть контракта движка, поэтому дописывает его движок, а не мозг:
+        # мозгов много, маркер один.
+        parts = [p for p in (settings.system_prompt_append, send_file_docs) if p]
+        if parts:
             kw["system_prompt"] = {
                 "type": "preset",
                 "preset": "claude_code",
-                "append": settings.system_prompt_append,
+                "append": "\n\n".join(parts),
             }
         return ClaudeAgentOptions(**kw)
 

@@ -27,7 +27,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from engine.core.errors import Outcome, classify_exception
 from engine.core.events import Event, Final, stream_events
@@ -37,7 +37,15 @@ from engine.core.store import Store
 
 logger = logging.getLogger("unpacker.engine")
 
-OptionsBuilder = Callable[..., Any]
+
+class OptionsBuilder(Protocol):
+    """Сборщик ClaudeAgentOptions. Protocol, а не `Callable[..., Any]`: три ключевых
+    аргумента — контракт между ядром и runtime, и опечатка в имени должна ловиться mypy,
+    а не молчаливым TypeError на живом боте."""
+
+    def __call__(self, *, cwd: str, resume: str | None, model: str | None) -> Any: ...
+
+
 # on_alert и on_event ДОЛЖНЫ быть неблокирующими (fire-and-forget): вызываются синхронно в
 # event loop под session_lock. Тяжёлую отправку (Telegram) адаптер уводит в create_task.
 AlertFn = Callable[[str], Any]

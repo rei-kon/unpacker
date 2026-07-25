@@ -58,6 +58,41 @@ def test_options_builder_omits_empty(tmp_path):
     assert opts.resume is None
 
 
+# ── M-04: контракт [SEND_FILE:] доходит до модели ─────────────────────────────
+
+
+def _append(opts) -> str:
+    sp = opts.system_prompt
+    return sp.get("append", "") if isinstance(sp, dict) else ""
+
+
+def test_system_prompt_teaches_send_file_marker(tmp_path):
+    """Движок вырезает маркер и отправляет файл — но агент про маркер узнать не мог:
+    SYSTEM_PROMPT_APPEND пуст, в шаблонах мозга маркера нет, а примеры обещают
+    «пришлю файлом». Значит описание маркера дописывает сам движок."""
+    opts = _options_builder(_settings(tmp_path))(cwd="/b", resume=None, model=None)
+    append = _append(opts)
+    assert "[SEND_FILE:" in append
+    assert "claude_code" == (opts.system_prompt or {}).get("preset")
+
+
+def test_send_file_instructions_not_promised_when_feature_off(tmp_path):
+    """SEND_FILE_ENABLED=false → маркер не описываем: обещать неработающее нельзя."""
+    opts = _options_builder(_settings(tmp_path, send_file_enabled=False))(
+        cwd="/b", resume=None, model=None
+    )
+    assert "[SEND_FILE:" not in _append(opts)
+
+
+def test_owner_persona_append_survives_marker_docs(tmp_path):
+    """SYSTEM_PROMPT_APPEND владельца не должен быть вытеснен описанием маркера."""
+    opts = _options_builder(_settings(tmp_path, system_prompt_append="Ты Карусельщик."))(
+        cwd="/b", resume=None, model=None
+    )
+    append = _append(opts)
+    assert "Ты Карусельщик." in append and "[SEND_FILE:" in append
+
+
 # ── проводка косметики Фазы 1b (§6.1) ────────────────────────────────────────
 
 
