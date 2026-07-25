@@ -49,6 +49,9 @@ BUTTONS_YAML = dump_buttons_yaml(BUTTONS)
 class FakeBot:
     """Дублёр aiogram.Bot: пишет в списки вместо сети."""
 
+    # aiogram логирует `bot.id` после каждого feed_update — дублёру нужен и он
+    id = 4242
+
     def __init__(self, payload: bytes = b"FILE"):
         self.messages: list[dict] = []
         self.documents: list[dict] = []

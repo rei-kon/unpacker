@@ -80,6 +80,12 @@ _HELP = (
     # Кнопки видно под ответом, а вот про файлы догадаться нельзя — говорим прямо (§9).
     "Ещё можно прислать файл — документ или фото, разберу. Кнопки под ответом — быстрые задачи."
 )
+# Ответ на тип сообщения, которого движок не умеет (C18/K11). Говорим ЧТО не приняли и
+# что делать вместо этого: «не понял» без альтернативы — тупик для новичка.
+_UNSUPPORTED = (
+    "Такой тип сообщений я пока не принимаю (голос, видео, аудио, стикеры).\n"
+    "Пришли текст, документ или фото — их разберу."
+)
 _REAPER_INTERVAL = 60.0
 
 
@@ -170,6 +176,11 @@ class TelegramBot:
         self._dp.message(F.document)(self._on_attachment)
         self._dp.message(F.photo)(self._on_attachment)
         self._dp.message(F.text)(self._on_text)
+        # Финальный хендлер — ПОСЛЕДНИМ и без фильтра (C18/K11). До него доходят голос,
+        # видео, аудио, стикеры, локации: раньше хендлера не было вовсе, и бот на них
+        # молчал. Для ученика молчание неотличимо от «бот умер», особенно когда /help
+        # обещает приём файлов. Честный отказ дешевле паники и письма автору.
+        self._dp.message()(self._on_unsupported)
         self._dp.callback_query()(self._on_callback)
 
     def _guard(self, message: Message) -> bool:
@@ -326,6 +337,16 @@ class TelegramBot:
         await self._handle_prompt(
             chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
         )
+
+    async def _on_unsupported(self, message: Message) -> None:
+        """Тип сообщения, который движок пока не умеет (голос, видео, стикер, локация).
+
+        Гейт первым и здесь: чужому не отвечаем даже «не принимаю» — сам факт ответа
+        подтверждает, что бот живой и чей-то (fail-closed §8.2).
+        """
+        if not self._guard(message):
+            return
+        await self._reply(message, _UNSUPPORTED)
 
     async def _on_callback(self, callback: CallbackQuery) -> None:
         """Нажатие кнопки-вкладки (§9).
