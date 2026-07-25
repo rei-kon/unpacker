@@ -23,13 +23,16 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import assert_never
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
+    InaccessibleMessage,
     InlineKeyboardMarkup,
     Message,
     ReactionTypeEmoji,
@@ -39,14 +42,15 @@ from engine.adapters.telegram.attach import AttachmentIntake, attachment_from_me
 from engine.adapters.telegram.draft import DraftStreamer
 from engine.adapters.telegram.keyboard import (
     SystemAction,
-    TriggerPress,
+    SystemActionName,
     build_keyboard,
+    button_digest,
     parse_callback,
 )
 from engine.adapters.telegram.render import render_result, render_tool_status
 from engine.adapters.telegram.router import NoProjectError, SessionRouter
 from engine.core.buttons import ButtonRegistry
-from engine.core.events import TextDelta, TextStart, ToolStarted
+from engine.core.events import Event, TextDelta, TextStart, ToolStarted
 from engine.core.formatting import to_telegram_markdown
 from engine.core.pool import ClientPool
 from engine.core.security import AllowList
@@ -77,6 +81,25 @@ _HELP = (
     "Ещё можно прислать файл — документ или фото, разберу. Кнопки под ответом — быстрые задачи."
 )
 _REAPER_INTERVAL = 60.0
+
+
+@dataclass(frozen=True)
+class OutText:
+    """Кусок текстового ответа в очереди доставки."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class OutDocument:
+    """Файл в очереди доставки (маркер `[SEND_FILE:]` прошёл проверку путей)."""
+
+    path: Path
+
+
+# Очередь доставки — union, а не (kind, payload) со строковым тегом: тип полезной нагрузки
+# теперь проверяет mypy, а не комментарий (K2).
+Outgoing = OutText | OutDocument
 
 
 def make_owner_alert(bot: Bot, owner_id: int) -> Callable[[str], None]:
@@ -123,6 +146,8 @@ class TelegramBot:
         self._buttons = buttons
         self._intake = intake
         self._send_file = send_file
+        # Окна (chat:thread), в которых прямо сейчас идёт генерация — см. _is_busy (ADV-13)
+        self._busy: set[str] = set()
         self._register()
 
     @property
@@ -155,17 +180,32 @@ class TelegramBot:
         return ok
 
     def _guard_callback(self, callback: CallbackQuery) -> bool:
-        """Тот же гейт для нажатий. Нет сообщения (слишком старое) → отказ (fail-closed)."""
-        uid = callback.from_user.id if callback.from_user else None
-        chat = getattr(callback.message, "chat", None)
-        ok = self._allow.should_handle(uid, chat.type if chat else None)
+        """Тот же гейт для нажатий. Нет сообщения (слишком старое) → отказ (fail-closed).
+
+        `callback.message` — это `Message | InaccessibleMessage | None`, и у всех трёх
+        вариантов чат читается по-разному только в None-случае: getattr здесь был лишним
+        (K4), тип уже всё говорит.
+        """
+        uid = callback.from_user.id
+        source = callback.message
+        ok = self._allow.should_handle(uid, source.chat.type if source is not None else None)
         if not ok:
             logger.warning("BLOCKED callback user=%s", uid)
         return ok
 
     @staticmethod
     def _coords(message: Message) -> tuple[int, int | None, int]:
-        return message.chat.id, message.message_thread_id, message.from_user.id  # type: ignore[union-attr]
+        """Координаты окна: чат, топик, автор.
+
+        `from_user` тут уже не None — сообщение без автора отвергает `_guard`
+        (`should_handle(None, ...)` = False). Явное исключение вместо `type: ignore`:
+        если инвариант когда-нибудь сломается, мы увидим причину в логе, а не молча
+        уроним хендлер на None (K4, K19).
+        """
+        user = message.from_user
+        if user is None:
+            raise ValueError("сообщение без from_user не должно доходить до хендлера")
+        return message.chat.id, message.message_thread_id, user.id
 
     async def _on_start(self, message: Message) -> None:
         if not self._guard(message):
@@ -302,13 +342,16 @@ class TelegramBot:
             await self._answer_callback(callback)
             return
 
-        # Гейт уже отверг callback без сообщения, но проверяем повторно вместо `assert`:
-        # координаты чата — вход в сессию, и «по идее не None» тут слишком дорогая ставка.
         source = callback.message
-        if source is None:
+        if source is None or isinstance(source, InaccessibleMessage):
+            # Явная ветка вместо getattr (K8): у InaccessibleMessage нет message_thread_id,
+            # и getattr тихо отдавал None — ответ уходил в General вместо топика, где
+            # человек нажал кнопку. Честный отказ лучше ответа не туда.
+            await self._answer_callback(callback, "Сообщение слишком старое — напиши заново.")
             return
         chat_id = source.chat.id
-        thread_id = getattr(source, "message_thread_id", None)
+        thread_id = source.message_thread_id
+        # автор — тот, кто НАЖАЛ, а не автор сообщения с кнопкой
         user_id = callback.from_user.id
 
         if isinstance(action, SystemAction):
@@ -316,19 +359,33 @@ class TelegramBot:
             await self._run_system_action(action.action, chat_id, thread_id)
             return
 
-        assert isinstance(action, TriggerPress)
         button = self._buttons.resolve(action.index) if self._buttons is not None else None
-        if button is None:
-            # кнопка с прошлого сообщения, а buttons.yaml уже переписан
+        # ADV-13: индекс сходится, а кнопка уже другая — `buttons.yaml` переписали, пока
+        # старое сообщение висело в истории. Выполнить «промпт с этого места» = выполнить
+        # ЧУЖУЮ инструкцию под старой подписью, поэтому отпечаток обязателен.
+        if button is None or button_digest(button) != action.digest:
             await self._answer_callback(callback, "Кнопка устарела — обновлю ряд под ответом.")
+            return
+        if self._is_busy(chat_id, thread_id):
+            # ADV-13: второе нажатие = второй полный прогон агента и второй расход квоты
+            # подписки. Тост дешевле и честнее, чем удвоенный счёт.
+            await self._answer_callback(callback, "Уже работаю над этим — секунду.")
             return
         await self._answer_callback(callback, button.label)
         await self._handle_prompt(
             chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=button.prompt
         )
 
-    async def _run_system_action(self, action: str, chat_id: int, thread_id: int | None) -> None:
-        """Системные кнопки = уже существующие команды движка (§5.5), без обращения к LLM."""
+    async def _run_system_action(
+        self, action: SystemActionName, chat_id: int, thread_id: int | None
+    ) -> None:
+        """Системные кнопки = уже существующие команды движка (§5.5), без обращения к LLM.
+
+        Принимает готовый Literal из parse_callback (K3): раньше был `action: str` с
+        цепочкой `elif` и молчаливым «ничего не делаем» в конце — новое системное действие
+        добавлялось бы в keyboard.py и тихо не работало. Теперь `assert_never` заставит
+        mypy показать пропущенную ветку.
+        """
         if action == "projects":
             await self._send(chat_id, thread_id, self._router.list_projects_text())
         elif action == "status":
@@ -336,6 +393,8 @@ class TelegramBot:
         elif action == "stop":
             await self._router.stop(chat_id, thread_id)
             await self._send(chat_id, thread_id, "⏹ Прервал.")
+        else:
+            assert_never(action)
 
     @staticmethod
     async def _answer_callback(callback: CallbackQuery, text: str | None = None) -> None:
@@ -352,7 +411,31 @@ class TelegramBot:
 
         Ровно один путь важен принципиально (§9, паттерн action_buttons): кнопка не должна
         получить «особую» обработку, иначе стриминг/ошибки/косметика начнут расходиться.
+
+        Тут же отмечается «окно занято» — по этому признаку `_on_callback` отказывает
+        повторному нажатию (ADV-13). Снимается в finally: упавший прогон не должен запирать
+        окно навсегда.
         """
+        busy_key = self._router.surface_key(chat_id, thread_id)
+        self._busy.add(busy_key)
+        try:
+            await self._run_prompt(
+                chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
+            )
+        finally:
+            self._busy.discard(busy_key)
+
+    def _is_busy(self, chat_id: int, thread_id: int | None) -> bool:
+        """Идёт ли прямо сейчас генерация в этом окне (chat:thread).
+
+        Замок именно на окно, а не на бота: топики Telegram — независимые окна (§5.2), и
+        занятость одного не должна глушить остальные.
+        """
+        return self._router.surface_key(chat_id, thread_id) in self._busy
+
+    async def _run_prompt(
+        self, *, chat_id: int, thread_id: int | None, user_id: int, prompt: str
+    ) -> None:
         try:
             await self._bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
         except Exception:  # noqa: BLE001 — typing косметический, не должен рвать обработку
@@ -361,7 +444,7 @@ class TelegramBot:
         status = self._make_status_handler(chat_id, thread_id)
         draft = DraftStreamer(self._bot, chat_id=chat_id, thread_id=thread_id)
 
-        def on_event(event) -> None:
+        def on_event(event: Event) -> None:
             # Велс-трюк §9: текст «печатается» черновиком; статусы тулов — как раньше.
             # Осознанная косметика: при двух параллельных сообщениях одного топика черновик
             # второго может появиться раньше финала первого (session_lock отпускается до
@@ -398,20 +481,23 @@ class TelegramBot:
             text, paths = extract_send_files(text)
         files, notes = self._resolve_send_files(chat_id, thread_id, paths)
 
-        items: list[tuple[str, object]] = [("text", c) for c in split_message(text) if c.strip()]
-        items += [("doc", p) for p in files]
-        items += [("text", n) for n in notes]
+        # Очередь типизирована union'ом, а не парой (str, object) с `type: ignore` (K2):
+        # раньше «doc» и «text» различались строкой, и mypy не мог проверить, что в
+        # send_document уходит Path, а в send_message — str.
+        items: list[Outgoing] = [OutText(c) for c in split_message(text) if c.strip()]
+        items += [OutDocument(p) for p in files]
+        items += [OutText(n) for n in notes]
         if not items:  # ответ состоял из одного маркера, и тот не прошёл
-            items = [("text", "…")]
+            items = [OutText("…")]
 
         markup = self._keyboard()
         last = len(items) - 1
-        for i, (kind, payload) in enumerate(items):
+        for i, item in enumerate(items):
             reply_markup = markup if i == last else None
-            if kind == "doc":
-                await self._send_document(chat_id, thread_id, payload, reply_markup)  # type: ignore[arg-type]
+            if isinstance(item, OutDocument):
+                await self._send_document(chat_id, thread_id, item.path, reply_markup)
             else:
-                await self._send(chat_id, thread_id, str(payload), reply_markup)
+                await self._send(chat_id, thread_id, item.text, reply_markup)
 
     def _resolve_send_files(
         self, chat_id: int, thread_id: int | None, paths: list[str]

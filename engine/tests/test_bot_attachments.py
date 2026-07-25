@@ -13,6 +13,7 @@ aiogram-объекты подменяются дублёрами (как FakeCor
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ import pytest
 
 from engine.adapters.telegram.attach import AttachmentIntake
 from engine.adapters.telegram.bot import TelegramBot
+from engine.adapters.telegram.keyboard import button_digest, encode_trigger
 from engine.adapters.telegram.router import SessionRouter
 from engine.core.agent import AskResult
 from engine.core.brain import ButtonSpec, dump_buttons_yaml
@@ -34,12 +36,11 @@ from engine.core.uploads import UploadStore
 OWNER = 111
 STRANGER = 999
 
-BUTTONS_YAML = dump_buttons_yaml(
-    [
-        ButtonSpec(label="Создать КП", prompt="Собери КП по данным клиента"),
-        ButtonSpec(label="Отчёт", prompt="Сделай отчёт за неделю"),
-    ]
-)
+BUTTONS = [
+    ButtonSpec(label="Создать КП", prompt="Собери КП по данным клиента"),
+    ButtonSpec(label="Отчёт", prompt="Сделай отчёт за неделю"),
+]
+BUTTONS_YAML = dump_buttons_yaml(BUTTONS)
 
 
 # ── дублёры ──────────────────────────────────────────────────────────────────
@@ -102,6 +103,29 @@ class FakeCore:
     @property
     def prompts(self) -> list[str]:
         return [p for _, p in self.asks]
+
+
+class SlowCore(FakeCore):
+    """Ядро, которое «думает», пока тест не отпустит: так проверяется двойное нажатие."""
+
+    def __init__(self, reply: str = "ответ"):
+        super().__init__(reply)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def ask(self, session_id, prompt, on_event=None):
+        self.asks.append((session_id, prompt))
+        self.started.set()
+        await self.release.wait()
+        return AskResult(text=self.reply, outcome=Outcome("ok", ""))
+
+
+class BoomCore(FakeCore):
+    """Ядро, которое падает: проверяем, что замок окна снимается в finally."""
+
+    async def ask(self, session_id, prompt, on_event=None):
+        self.asks.append((session_id, prompt))
+        raise RuntimeError("ядро упало")
 
 
 def _message(*, text=None, caption=None, document=None, photo=None, user_id=OWNER, chat="private"):
@@ -200,13 +224,13 @@ async def test_trigger_button_sends_its_prompt_to_session(stand):
     """Главный критерий §9: нажатие «Создать КП» = её prompt ушёл в сессию тем же путём,
     что обычное сообщение."""
     s = _build(stand)
-    await s.tg._on_callback(_callback("btn:0"))
+    await s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0])))
     assert s.core.prompts == ["Собери КП по данным клиента"]
 
 
 async def test_second_trigger_button_sends_its_own_prompt(stand):
     s = _build(stand)
-    await s.tg._on_callback(_callback("btn:1"))
+    await s.tg._on_callback(_callback(encode_trigger(1, BUTTONS[1])))
     assert s.core.prompts == ["Сделай отчёт за неделю"]
 
 
@@ -214,24 +238,19 @@ async def test_trigger_press_lands_in_same_session_as_typing(stand):
     """Кнопка и обычное сообщение — одна сессия окна (§5.2), а не две параллельные."""
     s = _build(stand)
     await s.tg._on_text(_message(text="привет"))
-    await s.tg._on_callback(_callback("btn:0"))
+    await s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0])))
     assert len({sid for sid, _ in s.core.asks}) == 1
 
 
 async def test_new_button_in_file_works_without_restart(stand):
     """«Наращивать штуки» (§9): дописал строку в yaml — кнопка живая, рестарт не нужен."""
     s = _build(stand)
+    third = ButtonSpec(label="Третья", prompt="третий промпт")
     (stand.inst / "buttons.yaml").write_text(
-        dump_buttons_yaml(
-            [
-                ButtonSpec(label="Создать КП", prompt="Собери КП по данным клиента"),
-                ButtonSpec(label="Отчёт", prompt="Сделай отчёт за неделю"),
-                ButtonSpec(label="Третья", prompt="третий промпт"),
-            ]
-        ),
+        dump_buttons_yaml([*BUTTONS, third]),
         encoding="utf-8",
     )
-    await s.tg._on_callback(_callback("btn:2"))
+    await s.tg._on_callback(_callback(encode_trigger(2, third)))
     assert s.core.prompts == ["третий промпт"]
 
 
@@ -253,29 +272,119 @@ async def test_callback_with_unknown_system_action_does_nothing(stand):
 
 async def test_stale_button_index_answers_instead_of_crashing(stand):
     s = _build(stand)
-    cb = _callback("btn:99")
+    cb = _callback(f"btn:99:{button_digest(BUTTONS[0])}")
     await s.tg._on_callback(cb)
     assert s.core.asks == []
     assert cb.answers and any("устарел" in (a or "").lower() for a in cb.answers)
 
 
+# ── ADV-13: кнопка из старого сообщения не выполняет ЧУЖОЙ промпт ─────────────
+
+
+async def test_button_from_old_message_does_not_run_someone_elses_prompt(stand):
+    """Сценарий ревью: ученик переписал buttons.yaml, а в истории висит старая кнопка.
+    Раньше callback несёл только индекс — нажатие выполняло промпт НОВОЙ кнопки под
+    старой подписью."""
+    s = _build(stand)
+    stale = _callback(encode_trigger(0, BUTTONS[0]))  # отпечаток «Создать КП»
+    (stand.inst / "buttons.yaml").write_text(
+        dump_buttons_yaml([ButtonSpec(label="Удалить всё", prompt="снеси мозг подчистую")]),
+        encoding="utf-8",
+    )
+    await s.tg._on_callback(stale)
+    assert s.core.asks == [], "промпт другой кнопки не должен уехать в сессию"
+    assert stale.answers and any("устарел" in (a or "").lower() for a in stale.answers)
+
+
+async def test_button_still_works_when_file_untouched(stand):
+    """Отпечаток не должен ломать штатную работу: файл не менялся — кнопка живая."""
+    s = _build(stand)
+    await s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0])))
+    assert s.core.prompts == ["Собери КП по данным клиента"]
+
+
+async def test_button_survives_edit_of_a_different_button(stand):
+    """Правка ДРУГОЙ кнопки не обесценивает эту: отпечаток считается по своей паре."""
+    s = _build(stand)
+    (stand.inst / "buttons.yaml").write_text(
+        dump_buttons_yaml([BUTTONS[0], ButtonSpec(label="Иное", prompt="иной промпт")]),
+        encoding="utf-8",
+    )
+    await s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0])))
+    assert s.core.prompts == ["Собери КП по данным клиента"]
+
+
+# ── ADV-13: двойное нажатие не жжёт квоту подписки дважды ─────────────────────
+
+
+async def test_double_press_during_generation_runs_agent_once(stand):
+    """Два полных прогона агента на одно нажатие = двойной расход квоты подписки.
+    Второе нажатие при активной генерации получает тост, а не второй прогон."""
+    s = _build(stand, core=SlowCore())
+    first = asyncio.create_task(s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0]))))
+    await s.core.started.wait()
+    second = _callback(encode_trigger(0, BUTTONS[0]))
+    # wait_for, а не голый await: без замка второе нажатие уходит в ядро и повисает на
+    # release — тест обязан упасть внятно, а не зависнуть навсегда
+    await asyncio.wait_for(s.tg._on_callback(second), timeout=2.0)
+    s.core.release.set()
+    await first
+
+    assert len(s.core.asks) == 1, "агент должен быть запущен один раз"
+    assert second.answers and any("работа" in (a or "").lower() for a in second.answers)
+
+
+async def test_press_works_again_after_generation_finished(stand):
+    """Замок снимается: после ответа кнопка снова живая (иначе бот залипнет навсегда)."""
+    s = _build(stand)
+    await s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0])))
+    await s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0])))
+    assert len(s.core.asks) == 2
+
+
+async def test_lock_is_released_even_when_generation_fails(stand):
+    """Замок в finally: упавший прогон не должен запирать окно навсегда."""
+    s = _build(stand, core=BoomCore())
+    with pytest.raises(RuntimeError):
+        await s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0])))
+    s2 = _build(stand, core=FakeCore())
+    s2.tg._busy = s.tg._busy  # тот же набор занятых окон
+    await s2.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0])))
+    assert s2.core.asks, "после сбоя окно должно снова принимать нажатия"
+
+
+async def test_busy_window_does_not_block_another_topic(stand):
+    """Замок — на окно (chat:thread), а не на весь бот: второй топик работает."""
+    s = _build(stand, core=SlowCore())
+    first = asyncio.create_task(s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0]))))
+    await s.core.started.wait()
+    other = _callback(encode_trigger(0, BUTTONS[0]))
+    other.message.message_thread_id = 42
+    second = asyncio.create_task(s.tg._on_callback(other))
+    await asyncio.sleep(0)  # дать второму прогону дойти до ядра
+    s.core.release.set()
+    await first
+    await second
+    assert len(s.core.asks) == 2
+
+
 async def test_callback_from_stranger_is_blocked(stand):
     s = _build(stand)
-    await s.tg._on_callback(_callback("btn:0", user_id=STRANGER))
+    await s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0]), user_id=STRANGER))
     assert s.core.asks == []
 
 
 async def test_callback_from_group_chat_is_blocked(stand):
     # гейт тот же, что у сообщений: только личка разрешённого пользователя
     s = _build(stand)
-    await s.tg._on_callback(_callback("btn:0", chat="supergroup"))
+    await s.tg._on_callback(_callback(encode_trigger(0, BUTTONS[0]), chat="supergroup"))
     assert s.core.asks == []
 
 
 async def test_callback_without_message_is_blocked(stand):
     # слишком старое сообщение → aiogram не даёт chat: fail-closed
     s = _build(stand)
-    cb = _callback("btn:0")
+    cb = _callback(encode_trigger(0, BUTTONS[0]))
     cb.message = None
     await s.tg._on_callback(cb)
     assert s.core.asks == []
