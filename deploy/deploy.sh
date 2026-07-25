@@ -109,8 +109,10 @@ read_secret_file() {  # read_secret_file <путь> <как называется
   local f="$1" flag="$2" mode val
   [ -f "$f" ] || { echo "$flag: файла нет: $f" >&2; exit 2; }
   [ -r "$f" ] || { echo "$flag: файл не читается: $f" >&2; exit 2; }
-  mode="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null || echo '')"
-  mode="$(printf '%03d' "${mode:-0}" 2>/dev/null || printf '%s' "$mode")"
+  mode="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null || true)"
+  # Не смогли узнать права — отказ, а не «сойдёт»: это проверка безопасности, fail-closed.
+  [ -n "$mode" ] || { echo "$flag: не смог прочитать права файла '$f' (нет stat?)" >&2; exit 2; }
+  mode="$(printf '%03d' "$mode" 2>/dev/null || printf '%s' "$mode")"
   case "$mode" in
     ?00) : ;;
     *) echo "$flag: файл '$f' должен быть 600 (сейчас $mode) — иначе секрет читает кто угодно
