@@ -11,15 +11,41 @@
 #   * ALL и любых оболочек (sh, bash, env, su, sudoedit) — с ними whitelist бессмыслен;
 #   * wildcard в путях скриптов — под маску можно подложить свой файл и выполнить от root;
 #   * systemctl daemon-reload / enable / disable — юниты ставит deploy.sh, уже будучи root;
-#   * самого install-sudoers.sh — иначе агент смог бы расширить себе права.
+#   * самого install-sudoers.sh — иначе агент смог бы расширить себе права;
+#   * тега SETENV — с ним агент протаскивал бы в root-вызов своё окружение.
 #
-# УСЛОВИЕ БЕЗОПАСНОСТИ: перечисленные скрипты не должны быть перезаписываемы run-user'ом
-# (на VPS движок лежит в /opt и принадлежит root). Иначе агент подменит содержимое и получит
-# root даром. install-sudoers.sh это проверяет и отказывается ставить права на writable-скрипт.
+# УСЛОВИЕ БЕЗОПАСНОСТИ: перечисленные скрипты И ИХ КАТАЛОГИ не должны быть перезаписываемы
+# run-user'ом — иначе агент подменит содержимое (или сам файл переименованием) и получит root
+# даром. На VPS движок лежит в /opt и принадлежит root:root с go-w, а venv движка живёт
+# СНАРУЖИ дерева (UV_PROJECT_ENVIRONMENT=/var/lib/unpacker/venv) и принадлежит run-user'у.
+# install-sudoers.sh это проверяет и ОТКАЗЫВАЕТСЯ ставить права на дерево run-user'а.
 
-Cmnd_Alias UNPACKER_DEPLOY   = REPLACE_WITH_RUNTIME_PATH/deploy/deploy.sh
-Cmnd_Alias UNPACKER_UPDATE   = REPLACE_WITH_RUNTIME_PATH/update.sh
-Cmnd_Alias UNPACKER_AGENTCTL = REPLACE_WITH_RUNTIME_PATH/deploy/agentctl.sh
+# Окружение root-вызова задаём мы, а не вызывающий: env_reset выбрасывает переменные агента
+# (в том числе PATH, LD_*, UNPACKER_DEV_OWNER_OK), !setenv запрещает `sudo VAR=... script`.
+Defaults:REPLACE_WITH_LINUX_USER env_reset, !setenv
+
+# Аргументы deploy.sh динамические (имя, токен, мозг, контур) — перечислить их нельзя, и
+# именно поэтому deploy.sh валидирует КАЖДЫЙ флаг сам и держит гейты §7.3 в коде.
+Cmnd_Alias UNPACKER_DEPLOY = REPLACE_WITH_RUNTIME_PATH/deploy/deploy.sh
+
+# А у update.sh и agentctl.sh формы вызова конечны — перечисляем их явно. Команда БЕЗ
+# аргументов в sudoers означает «с ЛЮБЫМИ аргументами»: именно так `update.sh --engine-dir
+# <свой путь>` превращался в root (SEC-1), ведь update.sh сорсит _common.sh из этого каталога.
+# Ни одной формы с --engine-dir здесь нет.
+Cmnd_Alias UNPACKER_UPDATE = \
+  REPLACE_WITH_RUNTIME_PATH/update.sh "",                    \
+  REPLACE_WITH_RUNTIME_PATH/update.sh --dry-run,             \
+  REPLACE_WITH_RUNTIME_PATH/update.sh --rollback,            \
+  REPLACE_WITH_RUNTIME_PATH/update.sh --ref [a-zA-Z0-9._-]*, \
+  REPLACE_WITH_RUNTIME_PATH/update.sh --dry-run --ref [a-zA-Z0-9._-]*
+
+# agentctl только НАБЛЮДАЕТ (list/status/logs/health/doctor) — мутирующих команд у него нет.
+Cmnd_Alias UNPACKER_AGENTCTL = \
+  REPLACE_WITH_RUNTIME_PATH/deploy/agentctl.sh list,     \
+  REPLACE_WITH_RUNTIME_PATH/deploy/agentctl.sh status *, \
+  REPLACE_WITH_RUNTIME_PATH/deploy/agentctl.sh logs *,   \
+  REPLACE_WITH_RUNTIME_PATH/deploy/agentctl.sh health *, \
+  REPLACE_WITH_RUNTIME_PATH/deploy/agentctl.sh doctor *
 
 # Только боты движка (agent-tg@<name>) и только четыре глагола. Оба пути до systemctl
 # перечислены осознанно: sudo сверяет ровно тот путь, которым команду позвали, а на части

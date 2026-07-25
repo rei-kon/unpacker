@@ -125,12 +125,49 @@ def _fake_runtime(tmp_path: Path, *, mode: int = 0o555, with_update: bool = True
     return rt
 
 
-def _inst_env(tmp_path: Path, rt: Path) -> dict[str, str]:
+# Р1/SEC-2: боевое дерево движка принадлежит root, а не run-user'у. На Маке/в CI мы root'ом
+# не владеем, поэтому «root-owned» имитируем ЧУЖИМ run-user'ом: владелец файлов (тест-юзер)
+# ≠ RUN_USER — ровно то отношение, которое проверяет install-sudoers.sh.
+FOREIGN_USER = "unpacker"
+
+
+def _inst_env(tmp_path: Path, rt: Path, run_user: str = FOREIGN_USER) -> dict[str, str]:
     return {
-        "TG_RUN_USER": ME,
+        "TG_RUN_USER": run_user,
         "TG_RUNTIME": str(rt),
         "UNPACKER_SUDOERS_DIR": str(tmp_path / "sudoers.d"),
+        "UNPACKER_ENGINE_CONF": str(tmp_path / "no-such-engine.conf"),
+        "UNPACKER_DEV_OWNER_OK": "",
     }
+
+
+def _sudoers_fields(rule: str) -> tuple[str, str, str, str]:
+    """Разобрать строку правила sudoers на 4 поля: кто, откуда, от кого, что.
+
+    H4: линт не проверял ПОЛЕ ЮЗЕРА — правило `ALL ALL=(root) NOPASSWD: …` (полный
+    passwordless на весь whitelist для ВСЕХ юзеров машины) проходило все тесты.
+    """
+    who, rest = rule.split(None, 1)
+    host, rest = rest.split("=", 1)
+    runas = ""
+    rest = rest.strip()
+    if rest.startswith("("):
+        runas, rest = rest[1:].split(")", 1)
+    return who.strip(), host.strip(), runas.strip(), rest.strip()
+
+
+def _user_rules(body: str) -> list[str]:
+    """Строки-правила (не Defaults/Cmnd_Alias/комментарии) с продолжениями, склеенными в одну."""
+    joined = re.sub(r"\\\s*\n\s*", " ", body)
+    out = []
+    for ln in joined.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if ln.startswith(("Defaults", "Cmnd_Alias", "User_Alias", "Runas_Alias", "Host_Alias")):
+            continue
+        out.append(ln)
+    return out
 
 
 def test_installer_dry_run_writes_nothing(tmp_path):
@@ -150,7 +187,7 @@ def test_installer_renders_and_sets_0440(tmp_path):
     assert oct(target.stat().st_mode)[-3:] == "440", "sudoers-файл обязан быть 0440"
     body = target.read_text()
     assert "REPLACE_WITH" not in body, "плейсхолдеры должны быть подставлены"
-    assert ME in body and str(rt) in body
+    assert FOREIGN_USER in body and str(rt) in body
     assert "visudo" in (r.stdout + r.stderr).lower(), "синтаксис обязан проверяться визудо"
 
 
@@ -169,10 +206,18 @@ def test_installer_is_idempotent(tmp_path):
 def test_installer_refuses_when_script_writable_by_run_user(tmp_path):
     """Права на скрипт, который агент может перезаписать = root-дыра, а не whitelist."""
     rt = _fake_runtime(tmp_path, mode=0o755)
-    r = run_installer(env_extra=_inst_env(tmp_path, rt))
+    r = run_installer(env_extra=_inst_env(tmp_path, rt, run_user=ME))
     assert r.returncode != 0
     text = (r.stdout + r.stderr).lower()
     assert "запис" in text or "writable" in text
+    assert not (tmp_path / "sudoers.d" / "unpacker").exists()
+
+
+def test_installer_refuses_when_script_world_writable(tmp_path):
+    """Даже чужой (root-owned) скрипт с o+w перезапишет кто угодно, включая агента."""
+    rt = _fake_runtime(tmp_path, mode=0o557)
+    r = run_installer(env_extra=_inst_env(tmp_path, rt))
+    assert r.returncode == 3, r.stdout + r.stderr
     assert not (tmp_path / "sudoers.d" / "unpacker").exists()
 
 
@@ -202,14 +247,6 @@ def test_installer_refuses_without_visudo(tmp_path):
     assert r.returncode != 0
     assert "visudo" in (r.stdout + r.stderr).lower()
     assert not (tmp_path / "sudoers.d" / "unpacker").exists()
-
-
-def test_installer_warns_when_update_sh_absent(tmp_path):
-    """update.sh появится в С4 — это предупреждение, а не блокер установки прав."""
-    rt = _fake_runtime(tmp_path, with_update=False)
-    r = run_installer(env_extra=_inst_env(tmp_path, rt))
-    assert r.returncode == 0, r.stderr + r.stdout
-    assert "update.sh" in (r.stdout + r.stderr)
 
 
 # ── systemd: drop-in Распаковщика vs обычный агент ──────────────────────────
@@ -284,3 +321,197 @@ def test_deploy_role_agent_gets_no_rights_steps(tmp_path, brain, api_base):
     r = run_deploy(*_deploy_args(brain, "plain"), env_extra=_deploy_env(tmp_path, api_base))
     assert r.returncode == 0, r.stderr + r.stdout
     assert "sudoers" not in r.stdout.lower()
+
+
+# ── SEC-2/Р1: whitelist ставится только на дерево, которое агент не перепишет ─
+
+
+def test_installer_refuses_when_runtime_owned_by_run_user(tmp_path):
+    """Владелец скрипта == run-user → ОТКАЗ, а не «продолжаю (dev-режим)».
+
+    SEC-2: право записи владелец возвращает себе одним chmod'ом, значит NOPASSWD на такой
+    скрипт = полный root в одну строку. Раньше здесь было предупреждение — и продукт из
+    коробки жил именно в этом состоянии (install.sh делал chown -R run-user на движок).
+    """
+    rt = _fake_runtime(tmp_path)  # владелец = тест-юзер
+    r = run_installer(env_extra=_inst_env(tmp_path, rt, run_user=ME))
+    assert r.returncode == 3, r.stdout + r.stderr
+    text = (r.stdout + r.stderr).lower()
+    assert "root" in text and "chown" in text, "отказ должен нести готовую команду починки"
+    assert not (tmp_path / "sudoers.d" / "unpacker").exists()
+
+
+def test_installer_dev_mode_requires_explicit_flag(tmp_path):
+    """Тот же расклад + явный --dev-owner-ok → установка проходит и честно названа dev-режимом."""
+    rt = _fake_runtime(tmp_path)
+    r = run_installer("--dev-owner-ok", env_extra=_inst_env(tmp_path, rt, run_user=ME))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "dev" in (r.stdout + r.stderr).lower()
+    assert (tmp_path / "sudoers.d" / "unpacker").exists()
+
+
+def test_installer_refuses_when_runtime_dir_is_group_writable(tmp_path):
+    """Каталог с правом записи = подмена скрипта переименованием, даже если сам файл 0555."""
+    rt = _fake_runtime(tmp_path)
+    (rt / "deploy").chmod(0o775)
+    r = run_installer(env_extra=_inst_env(tmp_path, rt))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "катал" in (r.stdout + r.stderr).lower()
+    assert not (tmp_path / "sudoers.d" / "unpacker").exists()
+
+
+def test_installer_refuses_when_runtime_dir_owned_by_run_user(tmp_path):
+    rt = _fake_runtime(tmp_path)
+    r = run_installer(env_extra=_inst_env(tmp_path, rt, run_user=ME))
+    assert r.returncode == 3, r.stdout + r.stderr
+
+
+# ── SEC-3: NOPASSWD не выдаётся на несуществующий файл ──────────────────────
+
+
+def test_installer_refuses_when_update_sh_absent(tmp_path):
+    """Перевёрнутый тест: раньше отсутствие update.sh закреплялось как «предупреждение».
+
+    NOPASSWD на путь, которого ещё нет, — это разрешение на файл, который кто-то создаст
+    позже. После зоны shell update.sh существует всегда, значит его отсутствие = битое дерево.
+    """
+    rt = _fake_runtime(tmp_path, with_update=False)
+    r = run_installer(env_extra=_inst_env(tmp_path, rt))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "update.sh" in (r.stdout + r.stderr)
+    assert not (tmp_path / "sudoers.d" / "unpacker").exists()
+
+
+# ── H4: правило разбирается на поля, права выданы ИМЕННО run-user'у ──────────
+
+
+def test_sudoers_field_parser_rejects_all_users_mutant():
+    """Мутант-контроль самого парсера: правило «всем юзерам машины» обязано ловиться."""
+    who, host, runas, cmds = _sudoers_fields("ALL ALL=(root) NOPASSWD: UNPACKER_DEPLOY")
+    assert who == "ALL" and runas == "root"
+    assert host == "ALL"
+    assert "UNPACKER_DEPLOY" in cmds
+
+
+def test_sudoers_template_rule_targets_single_user(tmp_path):
+    rules = _user_rules(SUDOERS_TPL.read_text())
+    assert len(rules) == 1, f"ожидалось одно правило, а не {len(rules)}: {rules}"
+    who, host, runas, cmds = _sudoers_fields(rules[0])
+    assert who == "REPLACE_WITH_LINUX_USER", (
+        f"права выданы '{who}', а должны — только run-user'у Распаковщика (H4)"
+    )
+    assert who != "ALL" and not who.startswith("%"), "ни ALL, ни группа"
+    assert runas == "root", f"runas должен быть root, а не '{runas}'"
+    assert "NOPASSWD:" in cmds
+    assert "SETENV" not in cmds, "тег SETENV дал бы агенту протаскивать окружение в root-вызов"
+
+
+def test_installed_sudoers_grants_rights_to_run_user_only(tmp_path):
+    """H4: `ME in body` выполнялось случайно — имя юзера входит в путь runtime.
+
+    Проверяем ПОЛЕ, а не подстроку: в установленном файле права выданы ровно run-user'у.
+    """
+    rt = _fake_runtime(tmp_path)
+    r = run_installer(env_extra=_inst_env(tmp_path, rt))
+    assert r.returncode == 0, r.stdout + r.stderr
+    rules = _user_rules((tmp_path / "sudoers.d" / "unpacker").read_text())
+    assert len(rules) == 1
+    who, host, runas, _ = _sudoers_fields(rules[0])
+    assert who == FOREIGN_USER, f"права выданы '{who}', ожидался run-user '{FOREIGN_USER}'"
+    assert host == "ALL" and runas == "root"
+
+
+# ── SEC-3: Defaults и перечисленные формы вызова ─────────────────────────────
+
+
+def test_sudoers_defaults_reset_env_and_forbid_setenv():
+    body = SUDOERS_TPL.read_text()
+    defaults = [ln.strip() for ln in body.splitlines() if ln.strip().startswith("Defaults")]
+    assert defaults, "нужен блок Defaults: окружение root-вызова задаём мы, а не агент"
+    joined = " ".join(defaults)
+    assert "env_reset" in joined, "env_reset: переменные вызывающего в root-вызов не текут"
+    assert "!setenv" in joined, "!setenv: агент не должен подставлять переменные окружения"
+
+
+def test_sudoers_enumerates_call_forms_for_update_and_agentctl():
+    """Команда без аргументов в sudoers = «с ЛЮБЫМИ аргументами» (корень SEC-1).
+
+    Для update.sh и agentctl.sh формы вызова перечислены; --engine-dir среди них нет —
+    именно им подменяли `_common.sh` и получали root.
+    """
+    body = re.sub(r"\\\s*\n\s*", " ", SUDOERS_TPL.read_text())
+    body = body.replace("REPLACE_WITH_RUNTIME_PATH", "/opt/unpacker")
+    for alias, script in (
+        ("UNPACKER_UPDATE", "/opt/unpacker/update.sh"),
+        ("UNPACKER_AGENTCTL", "/opt/unpacker/deploy/agentctl.sh"),
+    ):
+        line = next(
+            (ln for ln in body.splitlines() if ln.strip().startswith(f"Cmnd_Alias {alias}")), ""
+        )
+        assert line, f"нет алиаса {alias}"
+        forms = [f.strip() for f in line.split("=", 1)[1].split(",") if f.strip()]
+        assert forms, f"{alias}: пусто"
+        for f in forms:
+            assert f.startswith(script), f"{alias}: посторонняя команда {f}"
+            args = f[len(script) :].strip()
+            assert args, (
+                f"{alias}: '{f}' без аргументов = разрешение на ЛЮБЫЕ аргументы (SEC-1/SEC-3)"
+            )
+        assert "--engine-dir" not in line, "--engine-dir подменяет _common.sh → root (SEC-1)"
+
+
+# ── H5: гейт visudo — самый дорогой fail-closed, у него должен быть тест ─────
+
+_VISUDO_REJECT = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "${VISUDO_LOG:-/dev/null}"
+echo "syntax error near line 1" >&2
+exit 1
+"""
+
+_VISUDO_LOGGING = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "${VISUDO_LOG:-/dev/null}"
+# копируем проверяемый рендер, чтобы тест увидел, ЧТО именно валидировали
+for a in "$@"; do [ -f "$a" ] && cp "$a" "${VISUDO_SEEN:?}"; done
+exit 0
+"""
+
+
+def test_installer_refuses_when_visudo_rejects_render(tmp_path):
+    """Битый /etc/sudoers.d ломает sudo целиком — значит рендер ставим только после visudo."""
+    rt = _fake_runtime(tmp_path)
+    env = _inst_env(tmp_path, rt)
+    log = tmp_path / "visudo.log"
+    env["UNPACKER_VISUDO"] = str(_stub(tmp_path, "visudo-reject", _VISUDO_REJECT))
+    env["VISUDO_LOG"] = str(log)
+    r = run_installer(env_extra=env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "visudo" in (r.stdout + r.stderr).lower()
+    assert not (tmp_path / "sudoers.d" / "unpacker").exists(), "непроверенный файл ставить нельзя"
+    assert log.exists() and "-cf" in log.read_text(), "visudo обязан вызываться с -cf"
+
+
+def test_installer_validates_exactly_the_rendered_file(tmp_path):
+    """visudo должен проверять ТОТ рендер, который поедет в /etc/sudoers.d, а не шаблон."""
+    rt = _fake_runtime(tmp_path)
+    env = _inst_env(tmp_path, rt)
+    seen = tmp_path / "seen.sudoers"
+    env["UNPACKER_VISUDO"] = str(_stub(tmp_path, "visudo-log", _VISUDO_LOGGING))
+    env["VISUDO_LOG"] = str(tmp_path / "visudo2.log")
+    env["VISUDO_SEEN"] = str(seen)
+    r = run_installer(env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert seen.exists(), "visudo не получил файла на проверку"
+    validated = seen.read_text()
+    assert "REPLACE_WITH" not in validated, "проверяли шаблон вместо рендера"
+    assert validated == (tmp_path / "sudoers.d" / "unpacker").read_text(), (
+        "установлено НЕ то, что проверял visudo"
+    )
+
+
+def _stub(tmp_path: Path, name: str, body: str) -> Path:
+    d = tmp_path / "bin"
+    d.mkdir(exist_ok=True)
+    p = d / name
+    p.write_text(body, encoding="utf-8")
+    p.chmod(0o755)
+    return p
