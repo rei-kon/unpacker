@@ -28,6 +28,7 @@ from pathlib import Path
 # иначе тест зелёный на файле, который движок у ученика отвергнет. Фикстуры api_base и
 # isolated_runtime приходят из engine/tests/conftest.py — импортировать их больше не нужно.
 from engine.core.brain import load_passport
+from engine.tests.conftest import deploy_env
 
 REPO = Path(__file__).resolve().parents[2]
 BRAIN = REPO / "brains" / "unpacker"
@@ -330,14 +331,13 @@ def test_brain_calls_scripts_by_absolute_path():
 
 
 def test_real_unpacker_brain_deploys_and_keeps_skills(tmp_path, api_base, isolated_runtime):
-    env = {
-        "TG_RUN_USER": os.environ.get("USER", ""),
-        "TG_AGENTS_BASE": str(tmp_path / "agents"),
-        "TG_BRAINS_BASE": str(tmp_path / "brains"),
-        "TG_RUNTIME": isolated_runtime,
-        "TG_API_BASE": api_base,
-        "UNPACKER_SUDOERS_DIR": str(tmp_path / "sudoers.d"),
-    }
+    # Окружение берём из общего deploy_env, а не собираем руками: своя копия отставала от
+    # него на все переключатели изоляции сразу — заглушку claude (Р4/ADV-16: без CLI деплой
+    # обязан ОТКАЗАТЬ, и на CI никакого claude нет), заглушку systemctl и каталоги юнитов в
+    # tmp. Гейт claude при этом остаётся проверенным: за «нет CLI → отказ» отвечают
+    # test_preflight_blocks_when_claude_missing_for_run_user и
+    # test_doctor_does_not_say_healthy_without_claude — там TG_CLAUDE_BIN уводят в никуда.
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
     r = subprocess.run(
         [
             "bash",

@@ -175,6 +175,15 @@ def deploy_env(
         "TG_API_BASE": api,
         "TG_UNIT_DIR": str(tmp_path / "systemd"),
         "TG_DROPIN_DIR": str(tmp_path / "systemd"),
+        # H6: без заглушки на Linux (где systemctl настоящий) deploy.sh доходил до
+        # `sudo systemctl daemon-reload` и `enable --now` и дёргал СИСТЕМНЫЙ systemd — а юнит
+        # при этом лежит в TG_UNIT_DIR (tmp), так что systemd честно отвечал «Unit file
+        # agent-tg@… does not exist» и деплой падал. На macOS этого не видно: systemctl'а нет,
+        # и весь шаг молча пропускался. Отсюда 22 «зелёных локально» теста, красных на CI.
+        "TG_SYSTEMCTL": str(stub_bin(tmp_path, "systemctl", SYSTEMCTL_STUB)),
+        # Журнал вызовов заглушки: позволяет проверять ФАКТ работы с юнитом, а не наличие
+        # слова «systemctl» в выводе (такой ассерт на Маке держался на строке-пропуске).
+        "SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
         "UNPACKER_SUDOERS_DIR": str(tmp_path / "sudoers.d"),
         # engine.conf хоста в тестах не читаем: у машины разработчика он может существовать
         "UNPACKER_ENGINE_CONF": str(tmp_path / "no-such-engine.conf"),

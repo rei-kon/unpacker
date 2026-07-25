@@ -165,14 +165,11 @@ def test_deploy_dry_run_makes_no_instance_dir(tmp_path, api_base):
         "--brain",
         str(brain),
         "--dry-run",
-        env_extra={
-            "TG_RUN_USER": ME,
-            "TG_AGENTS_BASE": str(agents),
-            "TG_BRAINS_BASE": str(tmp_path / "brains"),
-            "TG_RUNTIME": str(REPO),
-            "TG_UV_BIN": UV,
-            "TG_API_BASE": api_base,
-        },
+        # Свою копию окружения этот тест держал ради нестандартной базы агентов — она и
+        # осталась поверх общего deploy_env. Остальное берём из него: без TG_CLAUDE_BIN
+        # деплой на Linux упирается в гейт Р4/ADV-16 (claude у run-user нет), а на Маке
+        # тест был зелёным лишь потому, что claude стоит на машине разработчика.
+        env_extra=deploy_env(tmp_path, api_base, runtime=str(REPO), TG_AGENTS_BASE=str(agents)),
     )
     assert r.returncode == 0, r.stderr
     assert "[dry-run]" in r.stdout
@@ -231,8 +228,16 @@ def test_deploy_green_provisions_instance(tmp_path, isolated_runtime, api_base):
     c = sqlite3.connect(str(db))
     assert c.execute("SELECT count(*) FROM projects WHERE slug='greeny'").fetchone()[0] == 1
     c.close()
-    # на Маке нет systemctl → шаг юнита пропущен явно, не тихо
-    assert "systemctl" in (r.stdout + r.stderr).lower()
+    # Шаг юнита обязан РЕАЛЬНО состояться. Раньше здесь проверялось только слово «systemctl»
+    # в выводе, и на Маке ассерт держался на строке-ПРОПУСКЕ («systemctl не найден — пропускаю»),
+    # то есть зелёным был именно НЕсделанный шаг. С заглушкой systemctl (conftest) шаг идёт
+    # одинаково на Маке и на Linux, поэтому проверяем факт: юнит лёг в свой каталог и включён.
+    assert (Path(env["TG_UNIT_DIR"]) / "agent-tg@.service").exists(), (
+        "шаблон юнита должен быть установлен в TG_UNIT_DIR"
+    )
+    calls = Path(env["SYSTEMCTL_LOG"]).read_text()
+    assert "daemon-reload" in calls, "новый юнит без daemon-reload systemd не увидит"
+    assert "enable --now agent-tg@greeny" in calls, "юнит обязан быть включён и запущен"
 
 
 @pytest.mark.skipif(not UV, reason="нужен uv для seed-шага")
@@ -606,9 +611,15 @@ def _engine_conf(tmp_path: Path, **keys: str) -> Path:
     return conf
 
 
-def _clean_env(conf: Path) -> dict[str, str]:
-    """Окружение БЕЗ TG_*: единственный источник путей — engine.conf (как у cron/ручного root)."""
-    return {
+def _clean_env(conf: Path, tmp_path: Path | None = None) -> dict[str, str]:
+    """Окружение БЕЗ TG_*-ПУТЕЙ: путям источник только engine.conf (как у cron/ручного root).
+
+    Стираются ровно те переменные, чей резолвинг и проверяется, — личность, базы, runtime, uv.
+    claude сюда не относится: он не путь из engine.conf, а внешний CLI. Если тест доходит до
+    настоящего деплоя, ему нужна заглушка claude (`tmp_path`), иначе на Linux он упрётся в
+    гейт Р4/ADV-16, а на Маке будет зелёным только потому, что claude есть у разработчика.
+    """
+    env = {
         "UNPACKER_ENGINE_CONF": str(conf),
         "TG_RUN_USER": "",
         "TG_AGENTS_BASE": "",
@@ -616,6 +627,9 @@ def _clean_env(conf: Path) -> dict[str, str]:
         "TG_RUNTIME": "",
         "TG_UV_BIN": "",
     }
+    if tmp_path is not None:
+        env["TG_CLAUDE_BIN"] = str(stub_bin(tmp_path, "claude", CLAUDE_STUB))
+    return env
 
 
 def test_doctor_finds_live_bot_through_engine_conf(tmp_path):
@@ -727,7 +741,8 @@ def test_deploy_takes_uv_from_engine_conf(tmp_path, api_base):
         TG_RUNTIME=str(REPO),
         TG_UV_BIN=str(fake_uv),
     )
-    env = _clean_env(conf)
+    # tmp_path → заглушка claude: тест проверяет резолвинг uv, а не наличие CLI на машине.
+    env = _clean_env(conf, tmp_path)
     env["TG_API_BASE"] = api_base
     r = run_deploy(
         "--surface",
