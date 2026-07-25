@@ -94,6 +94,38 @@ def test_reserve_dedupes_same_name(tmp_path):
     assert second.suffix == ".pdf"  # расширение сохранено — агент поймёт формат
 
 
+# ── ADV-14: reserve атомарен ──────────────────────────────────────────────────
+
+
+def test_reserve_is_atomic_two_calls_never_collide(tmp_path):
+    """Ровно та тихая потеря данных, которую docstring обещал предотвратить.
+
+    Раньше reserve только ПРОВЕРЯЛ exists(), а файл создавался позже, в download. Два
+    скриншота с одним `photo.jpg` получали один и тот же путь, и второй затирал первый
+    вместе со ссылкой, уже отданной агенту.
+    """
+    store = UploadStore(tmp_path / "uploads")
+    first = store.reserve(SID, "photo.jpg")
+    second = store.reserve(SID, "photo.jpg")
+    assert first != second
+
+
+def test_reserve_creates_the_file_as_a_marker(tmp_path):
+    """Резерв — это факт на диске (O_CREAT|O_EXCL), а не намерение."""
+    store = UploadStore(tmp_path / "uploads")
+    path = store.reserve(SID, "photo.jpg")
+    assert path.is_file() and path.stat().st_size == 0
+
+
+def test_reserve_survives_a_thousand_same_names(tmp_path):
+    """Потолок дедупликации: 1000-й файл с тем же именем — понятная ошибка, не тишина."""
+    store = UploadStore(tmp_path / "uploads")
+    for _ in range(1000):
+        store.reserve(SID, "photo.jpg")
+    with pytest.raises(ValueError, match="слишком много"):
+        store.reserve(SID, "photo.jpg")
+
+
 def test_reserve_rejects_hostile_session_id(tmp_path):
     store = UploadStore(tmp_path / "uploads")
     for bad in ["../../../etc", "a/b", "..", "", "s" * 100, "sid;rm -rf"]:

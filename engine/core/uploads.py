@@ -22,12 +22,14 @@
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from pathlib import Path
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # предел Bot API на getFile/download
 FILENAME_MAX = 128
+_DEDUP_LIMIT = 1000  # «photo-999.jpg» — дальше честная ошибка, а не бесконечный цикл
 _FALLBACK_NAME = "file.bin"
 # `:` и `|` — метасимволы ФС/шелла; их держим подальше от имён, даже если пишем через API
 _UNSAFE_CHARS = re.compile(r'[<>:"|?*\\]')
@@ -90,29 +92,43 @@ class UploadStore:
         return path
 
     def reserve(self, session_id: str, filename: str | None) -> Path:
-        """Свободный путь под запись. Существующее имя не перетираем — дописываем «-N».
+        """ЗАНЯТЬ путь под запись атомарно. Существующее имя не перетираем — дописываем «-N».
 
-        Перезапись была бы тихой потерей данных: два скриншота из Telegram приходят с одним
-        именем `photo.jpg`, и второй затёр бы первый вместе со ссылкой, уже отданной агенту.
+        Резерв создаёт пустой файл через `O_CREAT|O_EXCL` — то есть это факт на диске, а не
+        намерение. Раньше здесь была проверка `exists()`, а файл появлялся позже, в
+        `download`: два скриншота из Telegram приходят с одним `photo.jpg`, оба резерва
+        отдавали ОДИН путь, и второй затирал первый вместе со ссылкой, уже отданной агенту —
+        ровно та тихая потеря данных, которую этот метод обещал предотвратить (ADV-14).
         """
         directory = self.dir_for(session_id)
         name = safe_filename(filename)
-        candidate = directory / name
-        if not candidate.exists():
-            return self._verified(candidate, directory)
         stem, suffix = Path(name).stem, Path(name).suffix
-        for n in range(1, 1000):
-            candidate = directory / f"{stem}-{n}{suffix}"
-            if not candidate.exists():
-                return self._verified(candidate, directory)
+        for n in range(_DEDUP_LIMIT):
+            candidate = directory / (name if n == 0 else f"{stem}-{n}{suffix}")
+            self._verify_inside(candidate, directory)
+            if _claim(candidate):
+                return candidate
         raise ValueError(f"слишком много файлов с именем {name!r} в сессии")
 
     @staticmethod
-    def _verified(candidate: Path, directory: Path) -> Path:
+    def _verify_inside(candidate: Path, directory: Path) -> None:
         """Ремень поверх подтяжек: итоговый путь обязан лежать в каталоге сессии."""
         if candidate.parent.resolve() != directory.resolve():
             raise ValueError(f"путь вышел за каталог сессии: {candidate}")
-        return candidate
+
+
+def _claim(candidate: Path) -> bool:
+    """Занять имя атомарно. True — заняли мы, False — уже занято кем-то.
+
+    `O_CREAT|O_EXCL` — единственный способ сделать это без окна между «проверил» и
+    «создал»: ядро ФС само решает, кто первый. `FileExistsError` тут не ошибка, а штатный
+    ответ «имя чужое, беру следующее».
+    """
+    try:
+        os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return False
+    return True
 
 
 def too_large_message(*, size: int | None, limit: int = MAX_UPLOAD_BYTES) -> str:
