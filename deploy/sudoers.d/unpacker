@@ -1,0 +1,33 @@
+# Права мета-агента «Распаковщик» — шаблон (§7.5 конституции).
+# Ставит его deploy/install-sudoers.sh: подставляет плейсхолдеры, проверяет синтаксис через
+# visudo -cf и кладёт файл с правами 0440 (при других правах sudo молча игнорирует файл).
+#
+# МОДЕЛЬ: никакого полного passwordless sudo. Агенту-LLM разрешено запускать от root ровно
+# наши скрипты — они сами валидируют аргументы и держат гейты §7.3 — и перезапускать юниты
+# своих ботов. Даже удачная промпт-инъекция (через чужой .brain.yaml или присланный файл) не
+# даёт произвольного кода от root: она может лишь вызвать скрипт, который защищает себя сам.
+#
+# Чего здесь СОЗНАТЕЛЬНО нет:
+#   * ALL и любых оболочек (sh, bash, env, su, sudoedit) — с ними whitelist бессмыслен;
+#   * wildcard в путях скриптов — под маску можно подложить свой файл и выполнить от root;
+#   * systemctl daemon-reload / enable / disable — юниты ставит deploy.sh, уже будучи root;
+#   * самого install-sudoers.sh — иначе агент смог бы расширить себе права.
+#
+# УСЛОВИЕ БЕЗОПАСНОСТИ: перечисленные скрипты не должны быть перезаписываемы run-user'ом
+# (на VPS движок лежит в /opt и принадлежит root). Иначе агент подменит содержимое и получит
+# root даром. install-sudoers.sh это проверяет и отказывается ставить права на writable-скрипт.
+
+Cmnd_Alias UNPACKER_DEPLOY   = REPLACE_WITH_RUNTIME_PATH/deploy/deploy.sh
+Cmnd_Alias UNPACKER_UPDATE   = REPLACE_WITH_RUNTIME_PATH/update.sh
+Cmnd_Alias UNPACKER_AGENTCTL = REPLACE_WITH_RUNTIME_PATH/deploy/agentctl.sh
+
+# Только боты движка (agent-tg@<name>) и только четыре глагола. Оба пути до systemctl
+# перечислены осознанно: sudo сверяет ровно тот путь, которым команду позвали, а на части
+# систем /bin — симлинк в /usr/bin.
+Cmnd_Alias UNPACKER_SVC = \
+  /usr/bin/systemctl start agent-tg@*,   /usr/bin/systemctl stop agent-tg@*,   \
+  /usr/bin/systemctl restart agent-tg@*, /usr/bin/systemctl status agent-tg@*, \
+  /bin/systemctl start agent-tg@*,       /bin/systemctl stop agent-tg@*,       \
+  /bin/systemctl restart agent-tg@*,     /bin/systemctl status agent-tg@*
+
+REPLACE_WITH_LINUX_USER ALL=(root) NOPASSWD: UNPACKER_DEPLOY, UNPACKER_UPDATE, UNPACKER_AGENTCTL, UNPACKER_SVC

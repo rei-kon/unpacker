@@ -466,6 +466,36 @@ else
   asuser_argv "${seed_args[@]}"
 fi
 
+# ── 4b. модель прав мета-агента (§7.5) — только --role unpacker ──────────────
+# Обычному агенту sudo не нужен и он его НЕ получает: послабления живут в drop-in'е
+# конкретного инстанса, базовый agent-tg@.service остаётся под NoNewPrivileges=true.
+if [ "$ROLE" = "unpacker" ]; then
+  echo "==> Распаковщик: модель прав §7.5 (drop-in юнита + sudoers-whitelist)"
+  if command -v systemctl >/dev/null 2>&1; then
+    DROPIN_DIR="/etc/systemd/system/agent-tg@$NAME.service.d"
+    if [ "$DRY_RUN" = "true" ]; then
+      echo "[dry-run] поставил бы drop-in $DROPIN_DIR/10-unpacker.conf (NoNewPrivileges=no, остальной hardening)"
+    else
+      $SUDO mkdir -p "$DROPIN_DIR"
+      # daemon-reload не зову: шаг 5 ниже всё равно его делает перед enable --now
+      $SUDO install -m 644 "$HERE/templates/unpacker-dropin.conf" "$DROPIN_DIR/10-unpacker.conf"
+      echo "    drop-in установлен: $DROPIN_DIR/10-unpacker.conf"
+    fi
+  else
+    echo "warn: нет systemctl — drop-in Распаковщика не поставлен (dev-хост). На VPS шаг сработает."
+  fi
+  # Права ставит отдельный идемпотентный скрипт. Его провал НЕ роняет деплой: бот уже живой,
+  # а права доставляются одной командой — её и печатаем, чтобы человек не гадал.
+  if [ "$DRY_RUN" = "true" ]; then
+    "$HERE/install-sudoers.sh" --dry-run || echo "warn: sudoers-whitelist в этих условиях не встанет (см. ✗ выше)"
+  else
+    "$HERE/install-sudoers.sh" || {
+      echo "warn: sudoers-whitelist не установлен — Распаковщик не сможет разворачивать ботов."
+      echo "      Поставь вручную (нужен root):  sudo TG_RUN_USER=$RUN_USER TG_RUNTIME=$RUNTIME $HERE/install-sudoers.sh"
+    }
+  fi
+fi
+
 # ── 5. systemd templated unit + autostart ───────────────────────────────────
 if ! command -v systemctl >/dev/null 2>&1; then
   echo "warn: systemctl не найден — пропускаю установку юнита (dev-хост, напр. macOS)."
