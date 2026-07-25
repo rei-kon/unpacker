@@ -12,8 +12,12 @@
 from __future__ import annotations
 
 import os
+import re
+import sqlite3
 import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 INSTALL = REPO / "install.sh"
@@ -37,6 +41,14 @@ printf '%s %s\\n' claude "$*" >> "$STUB_LOG"
 echo "1.0.0 (Claude Code)"
 """
 
+# sshd -T печатает эффективный конфиг. Именно оттуда установщик обязан узнать реальный порт
+# ssh: `ufw allow OpenSSH` открывает только 22 и на нестандартном порту теряет сервер (ADV-15).
+_STUB_SSHD = """#!/usr/bin/env bash
+printf '%s %s\\n' sshd "$*" >> "$STUB_LOG"
+if [ "$1" = "-T" ]; then printf 'port 22\\naddressfamily any\\n'; fi
+exit 0
+"""
+
 # deploy.sh-заглушка: дословно пишет argv в $DEPLOY_ARGV (по строке на аргумент —
 # токен с пробелами не размылся бы) и создаёт .env инстанса, как настоящий скрипт.
 _STUB_DEPLOY = """#!/usr/bin/env bash
@@ -47,6 +59,20 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --name) name="$2"; shift 2 ;;
     --token) token="$2"; shift 2 ;;
+    # секреты приходят файлом (Р5): фиксируем содержимое и права — argv их не увидит
+    --token-file)
+      token="$(cat "$2")"
+      if [ -n "${TOKEN_FILE_REPORT:-}" ]; then
+        { printf 'path=%s\\n' "$2"; printf 'content=%s\\n' "$token"
+          printf 'mode=%s\\n' "$(ls -l "$2" | cut -c1-10)"; } > "$TOKEN_FILE_REPORT"
+      fi
+      shift 2 ;;
+    --cc-token-file)
+      if [ -n "${CC_TOKEN_FILE_REPORT:-}" ]; then
+        { printf 'path=%s\\n' "$2"; printf 'content=%s\\n' "$(cat "$2")"
+          printf 'mode=%s\\n' "$(ls -l "$2" | cut -c1-10)"; } > "$CC_TOKEN_FILE_REPORT"
+      fi
+      shift 2 ;;
     *) shift ;;
   esac
 done
@@ -65,7 +91,8 @@ def _stub_bin(tmp_path: Path, names: tuple[str, ...]) -> Path:
     d = tmp_path / "stubbin"
     d.mkdir(exist_ok=True)
     for n in names:
-        body = {"sudo": _STUB_SUDO, "claude": _STUB_CLAUDE}.get(n, _STUB_GENERIC)
+        special = {"sudo": _STUB_SUDO, "claude": _STUB_CLAUDE, "sshd": _STUB_SSHD}
+        body = special.get(n, _STUB_GENERIC)
         p = d / n
         p.write_text(body)
         p.chmod(0o755)
@@ -87,6 +114,16 @@ def _run(
 
 def run_install(*args: str, **kw):
     return _run(INSTALL, *args, **kw)
+
+
+def _secret_report(path: Path) -> dict[str, str]:
+    """Что заглушка deploy.sh увидела в файле секрета: путь, содержимое, права."""
+    assert path.exists(), "deploy.sh не получил секрет файлом (--token-file/--cc-token-file)"
+    return dict(
+        line.split("=", 1)
+        for line in path.read_text().splitlines()
+        if "=" in line  # noqa: C416
+    )
 
 
 def run_update(*args: str, **kw):
@@ -137,34 +174,54 @@ def test_install_refuses_too_small_ram_with_instruction(tmp_path):
     assert "4" in out and ("ГБ" in out or "GB" in out), "должен сказать, какой VPS брать"
 
 
-def test_install_prints_pool_ceiling_from_ram(tmp_path):
-    # 8ГБ → (8 − 1.5)/1 = 6 живых агентов; формула та же, что в engine/core/pool.py
-    stub = _stub_bin(tmp_path, ("uv", "tmux", "claude", "gh", "sudo", "git"))
+@pytest.mark.parametrize("ram_mb", [4096, 8192, 16384])
+def test_install_prints_pool_ceiling_from_ram(tmp_path, ram_mb):
+    """Потолок пула печатается ЧИСЛОМ из engine/core/pool.py, а не второй копией формулы.
+
+    Ассерт по строке потолка, а не «цифра встречается в выводе»: прошлый вариант
+    (`assert "6" in out`) выполнялся из-за «chmod 600» в том же выводе — сломать потолок
+    можно было любым способом, тест держался (H7).
+    """
+    from engine.core.pool import compute_pool_ceiling
+
+    stub = _stub_bin(tmp_path, ("uv", "tmux", "claude", "gh", "sudo", "git", "sshd"))
     r = run_install(
         "--dry-run",
         "--ram-mb",
-        "8192",
+        str(ram_mb),
         "--non-interactive",
         env_extra={
             "STUB_LOG": str(tmp_path / "log"),
             "UNPACKER_BOT_TOKEN": "123456:AAbb",
             "UNPACKER_ALLOWED_USERS": "111",
             "UNPACKER_AUTH_MODE": "subscription",
+            "UNPACKER_ETC": str(tmp_path / "etc" / "unpacker"),
         },
         stub=stub,
     )
     out = r.stdout + r.stderr
-    assert "6" in out, f"потолок пула из 8ГБ = 6; вывод:\n{out}"
+    expected = compute_pool_ceiling(ram_mb * 1024**2)
+    m = re.search(r"потолок тёплого пула:\s*(\d+)", out)
+    assert m, f"строки с потолком пула нет в выводе:\n{out}"
+    assert int(m.group(1)) == expected, (
+        f"{ram_mb} МБ → движок поднимет {expected} агент(ов), а установщик обещает "
+        f"{m.group(1)}: расхождение формул = ложное обещание"
+    )
 
 
-def test_install_ram_ceiling_matches_engine_formula():
-    # единственный источник правды по формуле — engine/core/pool.py; install.sh обязан
-    # называть ученику то же число, иначе обещание «столько агентов» лживо
-    from engine.core.pool import compute_pool_ceiling
+def test_install_pool_ceiling_has_single_source_of_truth():
+    """M-11: формулы в bash быть не должно — install.sh обязан спрашивать питон.
 
-    assert compute_pool_ceiling(8 * 1024**3) == 6
-    assert compute_pool_ceiling(4 * 1024**3) == 2
-    assert compute_pool_ceiling(2 * 1024**3) == 1  # ниже гейта install.sh (он такой VPS отвергнет)
+    Две копии формулы (bash `max(1,…)` против блокера, README — третье) уже разошлись
+    по семантике; чинится это не сверкой чисел, а удалением второй копии.
+    """
+    text = INSTALL.read_text()
+    assert "compute_pool_ceiling" in text, "потолок обязан считать engine/core/pool.py"
+    code = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    for ln in code:
+        assert "1536" not in ln and "POOL_RESERVE_MB" not in ln, (
+            f"константы формулы пула скопированы в bash — это вторая копия правды: {ln}"
+        )
 
 
 def test_install_refuses_too_small_disk_with_instruction(tmp_path):
@@ -281,12 +338,16 @@ def _base_stub(tmp_path):
             "gh",
             "sudo",
             "ufw",
+            "sshd",
             "systemctl",
             "useradd",
             "chown",
             "apt-get",
             "git",
             "tee",
+            # curl заглушен намеренно: без него любой промах в логике «ставить ли uv/claude»
+            # уходил бы в сеть и писал в /usr/local/bin прямо с прогона тестов.
+            "curl",
         ),
     )
 
@@ -299,9 +360,27 @@ def _answers(tmp_path, **over):
         "UNPACKER_BRAINS_DIR": str(tmp_path / "brains"),
         "UNPACKER_AUTH_MODE": "subscription",
         "TG_AGENTS_BASE": str(tmp_path / "agents"),
+        # /etc/unpacker и venv движка — вне дерева кода (Р1/Р2); в тестах уводим в tmp
+        "UNPACKER_ETC": str(tmp_path / "etc" / "unpacker"),
+        "UV_PROJECT_ENVIRONMENT": str(tmp_path / "venv"),
     }
     env.update(over)
     return env
+
+
+def _engine_conf(tmp_path) -> dict[str, str]:
+    """Разобранный /etc/unpacker/engine.conf — машинный конфиг путей (Р2)."""
+    path = tmp_path / "etc" / "unpacker" / "engine.conf"
+    assert path.exists(), (
+        "install.sh обязан оставить машинный конфиг: без него любая точка входа "
+        "(root вручную, sudo от агента, cron) читает свою вселенную путей"
+    )
+    out: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        if line.strip() and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            out[k] = v
+    return out
 
 
 def test_install_dry_run_plans_hardening_and_touches_nothing(tmp_path):
@@ -424,8 +503,8 @@ def test_install_refuses_api_contour_with_honest_explanation(tmp_path):
     assert "фаза" in out or "пока" in out
 
 
-def test_install_interactive_asks_four_answers_and_does_not_echo_token(tmp_path):
-    """Интерактивный путь: 4 ответа со stdin, токен не появляется в выводе."""
+def test_install_interactive_asks_answers_and_does_not_echo_token(tmp_path):
+    """Интерактивный путь: ответы со stdin, токен не появляется ни в выводе, ни в argv."""
     stub = _base_stub(tmp_path)
     engine = _fake_engine_repo(tmp_path)
     secret = "999999:SUPERSECRETTOKEN"
@@ -433,6 +512,7 @@ def test_install_interactive_asks_four_answers_and_does_not_echo_token(tmp_path)
     for k in ("UNPACKER_BOT_TOKEN", "UNPACKER_ALLOWED_USERS", "UNPACKER_AUTH_MODE"):
         env.pop(k, None)
     env["DEPLOY_ARGV"] = str(tmp_path / "argv.txt")
+    env["TOKEN_FILE_REPORT"] = str(tmp_path / "token.report")
     proc = subprocess.run(
         [
             "bash",
@@ -445,7 +525,7 @@ def test_install_interactive_asks_four_answers_and_does_not_echo_token(tmp_path)
             "--run-user",
             os.environ.get("USER", "nobody"),
         ],
-        input=f"{secret}\n111,222\n{tmp_path / 'brains'}\n1\n",
+        input=f"{secret}\n111,222\n{tmp_path / 'brains'}\n",
         capture_output=True,
         text=True,
         env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}", **env},
@@ -455,7 +535,10 @@ def test_install_interactive_asks_four_answers_and_does_not_echo_token(tmp_path)
     assert proc.returncode == 0, out
     assert secret not in out, "токен не должен появляться в выводе установщика"
     argv = (tmp_path / "argv.txt").read_text().splitlines()
-    assert secret in argv, "токен обязан дойти до deploy.sh"
+    assert secret not in argv, "токен в argv sudo/deploy.sh = токен навсегда в /var/log/auth.log"
+    assert _secret_report(tmp_path / "token.report")["content"] == secret, (
+        "токен обязан дойти до deploy.sh — файлом"
+    )
 
 
 # ── install.sh: bootstrap Распаковщика через deploy.sh (§10.5) ──────────────
@@ -504,7 +587,11 @@ def test_install_bootstraps_unpacker_through_deploy_sh(tmp_path):
     assert "--name" in argv and argv[argv.index("--name") + 1] == "unpacker"
     assert argv[argv.index("--brain") + 1] == str(engine / "brains" / "unpacker")
     assert argv[argv.index("--users") + 1] == "111,222"
-    assert argv[argv.index("--token") + 1] == "123456:AAbbCC-dd_ee"
+    # C3/H1: без --role unpacker мета-агент разворачивается БЕЗ прав (нет drop-in, нет
+    # sudoers) — и не может развернуть ни одного бота. Главное обещание README мертво.
+    assert "--role" in argv and argv[argv.index("--role") + 1] == "unpacker", (
+        f"install.sh обязан просить у deploy.sh роль мета-агента:\n{argv}"
+    )
     # финал: что делать дальше — одной строкой
     assert "/start" in out
 
@@ -550,14 +637,19 @@ def test_install_never_leaks_token_to_output_or_conf(tmp_path):
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert secret not in out, "токен не должен светиться в выводе/логе установки"
-    conf = engine / ".install.conf"
+    # Ответы живут ВНЕ дерева движка: сам движок root:root и go-w (Р1), а конфиг с ответами
+    # ученика — в /etc/unpacker, где ему и место.
+    assert not (engine / ".install.conf").exists(), (
+        "конфиг ответов внутри каталога движка делает дерево кода изменяемым (SEC-2)"
+    )
+    conf = tmp_path / "etc" / "unpacker" / "install.conf"
     assert conf.exists(), "не-секретные ответы запоминаются для идемпотентного повтора"
     assert oct(conf.stat().st_mode)[-3:] == "600"
     assert secret not in conf.read_text(), "секрет живёт только в .env инстанса (600)"
 
 
 def test_install_second_run_reuses_answers_and_existing_token(tmp_path):
-    """Повторный запуск = обновление: ответы из .install.conf, токен — из .env инстанса."""
+    """Повторный запуск = обновление: ответы из install.conf, токен — из .env инстанса."""
     stub = _base_stub(tmp_path)
     engine = _fake_engine_repo(tmp_path)
     argv_log = tmp_path / "argv.txt"
@@ -578,13 +670,16 @@ def test_install_second_run_reuses_answers_and_existing_token(tmp_path):
         "STUB_LOG": str(tmp_path / "stub.log"),
         "TG_AGENTS_BASE": str(tmp_path / "agents"),
         "DEPLOY_ARGV": str(argv_log),
+        "UNPACKER_ETC": str(tmp_path / "etc" / "unpacker"),
+        "UV_PROJECT_ENVIRONMENT": str(tmp_path / "venv"),
+        "TOKEN_FILE_REPORT": str(tmp_path / "token.report"),
     }
     r2 = run_install(*args, env_extra=env2, stub=stub)
     out2 = r2.stdout + r2.stderr
     assert r2.returncode == 0, out2
     argv = argv_log.read_text().splitlines()
     assert argv[argv.index("--users") + 1] == "111,222", "ответы должны переиспользоваться"
-    assert argv[argv.index("--token") + 1] == "123456:AAbbCC-dd_ee", (
+    assert _secret_report(tmp_path / "token.report")["content"] == "123456:AAbbCC-dd_ee", (
         "токен берётся из .env инстанса — второй раз его не спрашивают"
     )
 
@@ -665,6 +760,576 @@ def test_install_does_not_lock_out_ssh_when_no_key_present(tmp_path):
     assert "sshd_config" not in out, "конфиг ssh трогать нельзя, пока ключа нет"
 
 
+# ── install.sh: запуск от root, uv, claude, apt, ufw, права (§10) ───────────
+#
+# Все эти находки лежат в зоне, которая ни разу не бежала живьём: install.sh запускают
+# ОТ ROOT на свежем VPS, а ни один тест этого не делал. `id` — заглушка: она рисует root'а,
+# не требуя root'а от прогона тестов.
+
+_STUB_ID_ROOT = """#!/usr/bin/env bash
+case "${1:-}" in
+  -u) echo 0 ;;
+  -un) printf '%s\\n' root ;;
+  *) exec /usr/bin/id "$@" ;;
+esac
+"""
+
+
+def _root_stub(tmp_path):
+    """Полный набор заглушек + `id`, отвечающий «я root» (как на свежем VPS)."""
+    stub = _base_stub(tmp_path)
+    p = stub / "id"
+    p.write_text(_STUB_ID_ROOT)
+    p.chmod(0o755)
+    return stub
+
+
+def test_install_survives_being_launched_from_root(tmp_path):
+    """C1: документированный путь — `ssh root@IP` → `bash install.sh`. Он обязан работать.
+
+    От root `SUDO` пуст, и конструкция `$SUDO -u <юзер> …` разворачивалась в `-u`, то есть в
+    команду `-u`: `-u: command not found`, а `set -e` убивал установку. Ровно на этом
+    спотыкался бы каждый ученик, делающий всё по инструкции.
+    """
+    stub = _root_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        "unpackerghost",
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert "command not found" not in out, f"это и есть C1:\n{out}"
+    assert r.returncode == 0, out
+    assert (tmp_path / "argv.txt").exists(), "деплой Распаковщика обязан состояться"
+
+
+def test_install_prints_setup_token_command_that_works_from_root(tmp_path):
+    """Та же грабля в печатаемой инструкции: `-u unpacker -H claude setup-token` — не команда."""
+    stub = _root_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        "unpackerghost",
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "sudo -u unpackerghost -H claude setup-token" in out, (
+        f"печатать надо команду, которую можно скопировать и запустить:\n{out}"
+    )
+
+
+def test_install_puts_uv_where_run_user_can_reach_it(tmp_path):
+    """ADV-01/C4: uv, поставленный от root, лежит в /root/.local/bin (700).
+
+    Юнит бежит под run-user'ом и до /root не достаёт → preflight деплоя ПРОВАЛ на шаге 5,
+    когда ученик уже ввёл все ответы и применил hardening. Ставим системно.
+    """
+    stub = _stub_bin(tmp_path, ("tmux", "claude", "gh", "sudo", "git", "sshd", "curl"))
+    # PATH минимальный: uv не должен находиться «случайно» из окружения разработчика
+    r = _run(
+        INSTALL,
+        "--dry-run",
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        env_extra={**_answers(tmp_path), "PATH": f"{stub}:/usr/bin:/bin"},
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "UV_INSTALL_DIR=/usr/local/bin" in out, (
+        f"uv обязан ставиться системно, а не в домашний каталог root'а:\n{out}"
+    )
+
+
+def test_install_reinstalls_uv_that_run_user_cannot_execute(tmp_path):
+    """Ученик уже ставил uv от root руками — install.sh обязан заметить и поставить системно.
+
+    Проверка «есть ли uv» обязана идти В КОНТЕКСТЕ юзера движка: uv в /root/.local/bin
+    прекрасно виден root'у и недостижим для run-user'а (mode 700) — юнит падал бы 203/EXEC
+    уже на preflight деплоя, после того как ученик ввёл все ответы (ADV-01/C4).
+    """
+    stub = _stub_bin(tmp_path, ("tmux", "claude", "gh", "git", "sshd", "curl"))
+    roothome = tmp_path / "roothome" / ".local" / "bin"
+    roothome.mkdir(parents=True)
+    (roothome / "uv").write_text("#!/usr/bin/env bash\necho 'uv 0.5.0'\n")
+    (roothome / "uv").chmod(0o755)
+    # sudo, который «не пускает» юзера движка именно к этому uv — так и ведёт себя реальный
+    # /root с правами 700. Всё остальное под этим юзером работает.
+    (stub / "sudo").write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "-u" ]; then\n'
+        '  case "$*" in *roothome*) exit 1 ;; esac\n'
+        "fi\n" + _STUB_SUDO.split("\n", 1)[1]
+    )
+    (stub / "sudo").chmod(0o755)
+    r = _run(
+        INSTALL,
+        "--dry-run",
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--run-user",
+        "unpackerghost",
+        env_extra={**_answers(tmp_path), "PATH": f"{roothome}:{stub}:/usr/bin:/bin"},
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "UV_INSTALL_DIR=/usr/local/bin" in out, (
+        f"uv, до которого не достаёт юзер движка, надо переставить системно:\n{out}"
+    )
+
+
+def test_install_records_paths_in_machine_config(tmp_path):
+    """Р2: /etc/unpacker/engine.conf — единая вселенная путей для всех точек входа.
+
+    Без него `TG_BRAINS_BASE` жил только в процессе установщика и стирался env_reset при
+    sudo: первый мозг лёг в один каталог, все следующие Распаковщик кладёт в другой (ADV-09).
+    """
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    conf = _engine_conf(tmp_path)
+    assert conf["TG_RUN_USER"] == os.environ.get("USER", "nobody")
+    assert conf["TG_RUNTIME"] == str(engine)
+    assert conf["TG_BRAINS_BASE"] == str(tmp_path / "brains")
+    assert conf["TG_AGENTS_BASE"], "инстансы обязаны быть в карте путей"
+    assert conf["TG_UV_BIN"], "uv обязан быть в карте путей: юнит зовёт его абсолютным путём"
+    assert not conf["TG_UV_BIN"].startswith("/root/"), (
+        "uv из /root недостижим для юзера движка (mode 700) — это и есть C4"
+    )
+    path = tmp_path / "etc" / "unpacker" / "engine.conf"
+    assert oct(path.stat().st_mode)[-3:] == "644", "карту путей читают все точки входа"
+
+
+def test_install_blocks_when_claude_is_missing_for_run_user(tmp_path):
+    """ADV-16: `claude`, поставленный от root, проходит проверку в оболочке root.
+
+    Под run-user'ом CLI нет → бот поднимется и будет молчать на каждое сообщение, а doctor
+    скажет HEALTHY. Проверять надо ИМЕННО в контексте run-user, и отсутствие — блокер.
+    """
+    stub = _base_stub(tmp_path)
+    # sudo, под которым у юзера движка нет claude: любая команда с claude от его имени
+    # проваливается. Ровно так выглядит «claude поставлен от root» — CLI есть в оболочке
+    # root'а и отсутствует у того, кто реально бежит бота.
+    (stub / "sudo").write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "-u" ]; then\n'
+        '  case "$*" in *claude*) echo "bash: claude: command not found" >&2; exit 127 ;; esac\n'
+        "fi\n" + _STUB_SUDO.split("\n", 1)[1]
+    )
+    (stub / "sudo").chmod(0o755)
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        "unpackerghost",
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, f"без claude у юзера движка бот будет молчать — это блокер:\n{out}"
+    # ассерт на ГОТОВУЮ команду починки: «слово claude встретилось в выводе» выполнялось бы
+    # случайно — install.sh печатает «✓ claude уже стоит» ровно про оболочку root'а
+    assert "claude.ai/install.sh" in out, f"нужна команда, которой ученик это починит:\n{out}"
+    assert "unpackerghost" in out, "и имя юзера, под которым CLI должен появиться"
+    assert "установка остановлена" in out, "это блокер, а не warn"
+    assert not (tmp_path / "argv.txt").exists(), "деплой такого бота запускать нельзя"
+
+
+def test_install_opens_real_ssh_port_in_firewall(tmp_path):
+    """ADV-15: `ufw allow OpenSSH` открывает ровно 22/tcp.
+
+    Если sshd слушает другой порт, текущая сессия выживает (ESTABLISHED), а следующий вход
+    невозможен — потеря сервера. Порт берём из `sshd -T`.
+    """
+    stub = _base_stub(tmp_path)
+    (stub / "sshd").write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "sshd %s\\n" "$*" >> "$STUB_LOG"\n'
+        'if [ "$1" = "-T" ]; then printf "port 2222\\nport 22\\n"; fi\nexit 0\n'
+    )
+    (stub / "sshd").chmod(0o755)
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        "--ssh-keys",
+        str(tmp_path / "нет-ключа"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    log = (tmp_path / "stub.log").read_text()
+    assert "ufw allow 2222/tcp" in log, f"настоящий порт ssh обязан быть открыт:\n{log}"
+    assert "ufw allow 22/tcp" in log, "второй порт из конфига тоже открываем"
+    assert "allow OpenSSH" not in log, "профиль OpenSSH — это только 22, он теряет сервер"
+
+
+def test_install_does_not_enable_firewall_when_ssh_port_unknown(tmp_path):
+    """Не смог определить порт ssh — файрвол не включаем и говорим почему.
+
+    `ufw --force enable` с политикой deny и без правила на реальный порт = сервер потерян.
+    Fail-closed здесь означает «не трогать файрвол», а не «включить наугад».
+    """
+    stub = _base_stub(tmp_path)
+    (stub / "sshd").write_text("#!/usr/bin/env bash\nexit 1\n")  # sshd не отвечает
+    (stub / "sshd").chmod(0o755)
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        "--ssh-keys",
+        str(tmp_path / "нет-ключа"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    log = (tmp_path / "stub.log").read_text()
+    assert "ufw --force enable" not in log, f"вслепую файрвол включать нельзя:\n{log}"
+    assert "порт" in out.lower() and "ufw" in out.lower(), "ученик обязан узнать, что и почему"
+
+
+def test_install_updates_apt_indexes_before_installing(tmp_path):
+    """C15: без `apt-get update` установка падает сырой ошибкой apt на любом залежавшемся VPS."""
+    stub = _base_stub(tmp_path)
+    (stub / "tmux").write_text("#!/usr/bin/env bash\nexit 127\n")  # инструмента нет — поставь
+    (stub / "tmux").chmod(0o755)
+    engine = _fake_engine_repo(tmp_path)
+    run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    log = (tmp_path / "stub.log").read_text()
+    upd = log.find("apt-get update")
+    ins = log.find("apt-get install")
+    assert upd >= 0, f"apt-get update обязателен перед установкой пакетов:\n{log}"
+    assert ins > upd, f"индексы обновляются ДО установки:\n{log}"
+
+
+def test_install_blocks_with_instruction_when_apt_install_fails(tmp_path):
+    """C15: отказ apt — это инструкция «сделай вот это», а не сырой стек apt."""
+    stub = _base_stub(tmp_path)
+    (stub / "tmux").write_text("#!/usr/bin/env bash\nexit 127\n")
+    (stub / "tmux").chmod(0o755)
+    (stub / "apt-get").write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "apt-get %s\\n" "$*" >> "$STUB_LOG"\n'
+        'case "$1" in install) echo "E: Unable to locate package tmux" >&2; exit 100 ;; esac\n'
+        "exit 0\n"
+    )
+    (stub / "apt-get").chmod(0o755)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(tmp_path / "opt" / "unpacker"),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "tmux" in out and "apt-get install" in out, "нужна готовая команда"
+    assert not (tmp_path / "argv.txt").exists(), "с неполной средой деплой не запускаем"
+
+
+def test_install_waits_for_dpkg_lock_and_explains_on_timeout(tmp_path):
+    """ADV-04: свежий VPS занят cloud-init'ом, dpkg-lock держится минуту-другую.
+
+    Без ожидания установка падает сырой ошибкой «Could not get lock» на первой же минуте
+    жизни сервера. Ждём, а если так и не отпустил — объясняем, что происходит.
+    """
+    stub = _base_stub(tmp_path)
+    (stub / "tmux").write_text("#!/usr/bin/env bash\nexit 127\n")
+    (stub / "tmux").chmod(0o755)
+    (stub / "fuser").write_text("#!/usr/bin/env bash\nexit 0\n")  # лок держат всегда
+    (stub / "fuser").chmod(0o755)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(tmp_path / "opt" / "unpacker"),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt"), APT_LOCK_WAIT_SEC="2"),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert "жду" in out.lower(), f"ожидание лока обязано быть видимым:\n{out}"
+    assert r.returncode != 0
+    assert "cloud-init" in out or "dpkg" in out, "ученик обязан понять, кто держит лок"
+
+
+def test_install_leaves_engine_tree_root_owned_and_read_only(tmp_path):
+    """Р1/SEC-2/C16: каталог движка — root:root и go-w.
+
+    Иначе агент с bypassPermissions перепишет любой скрипт, на который выдан NOPASSWD
+    (и заодно git-вызовы от root упрутся в safe.directory: «в репо нет тегов» на репо с тегами).
+    """
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    me = os.environ.get("USER", "nobody")
+    # Входное состояние — испорченные права: так выглядит и «починка руками» (chmod 777),
+    # и прежнее поведение установщика, отдававшего дерево движка юзеру движка.
+    for p in (engine, engine / "deploy", engine / "deploy" / "deploy.sh"):
+        p.chmod(0o777)
+    (engine / "deploy" / "_common.sh").chmod(0o666)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        me,
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    log = (tmp_path / "stub.log").read_text()
+    assert f"chown -R root:root {engine}" in log, f"движок обязан принадлежать root:\n{log}"
+    assert f"chown -R {me} {engine}" not in log, (
+        "отдать дерево движка run-user'у = отдать ему все whitelisted-скрипты (SEC-2)"
+    )
+    # Пост-условие, а не запись в логе: НИ ОДИН файл движка не писуем никем, кроме владельца.
+    # Это и есть условие безопасности из sudoers-шаблона.
+    writable = [
+        p
+        for p in [
+            engine,
+            engine / "deploy",
+            engine / "deploy" / "deploy.sh",
+            engine / "deploy" / "_common.sh",
+        ]
+        if p.stat().st_mode & 0o022
+    ]
+    assert not writable, f"писуемо группой/миром: {writable} — агент перепишет whitelisted-скрипт"
+
+
+def test_install_gives_run_user_write_only_on_venv_outside_engine(tmp_path):
+    """Р1: venv выносится ИЗ дерева движка и принадлежит run-user'у.
+
+    Иначе требования взаимоисключающие: `uv sync` хочет писать в дерево, а sudoers-whitelist
+    требует, чтобы дерево было неизменяемым.
+    """
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    me = os.environ.get("USER", "nobody")
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        me,
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    venv = tmp_path / "venv"
+    log = (tmp_path / "stub.log").read_text()
+    assert f"chown -R {me} {venv}" in log, f"venv обязан принадлежать юзеру движка:\n{log}"
+    assert str(engine) not in str(venv), "venv не может лежать внутри дерева движка"
+
+
+def test_install_passes_secrets_to_deploy_as_files_not_argv(tmp_path):
+    """Р5/SEC-4: секрет в argv `sudo` — это секрет навсегда в /var/log/auth.log.
+
+    Файл 600 читается один раз и удаляется. Через argv токен подписки утекал ещё и в
+    history root'а, и в ~/.claude/projects/*.jsonl, которые агент читает сам.
+    """
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    bot = "555555:BOTSECRET-xyz"
+    cc = "sk-ant-oat01-CCSECRET"
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(
+            tmp_path,
+            UNPACKER_BOT_TOKEN=bot,
+            UNPACKER_CC_TOKEN=cc,
+            DEPLOY_ARGV=str(tmp_path / "argv.txt"),
+            TOKEN_FILE_REPORT=str(tmp_path / "token.report"),
+            CC_TOKEN_FILE_REPORT=str(tmp_path / "cc.report"),
+        ),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    argv = (tmp_path / "argv.txt").read_text()
+    assert bot not in argv and cc not in argv, f"секреты не должны попадать в argv:\n{argv}"
+    assert "--token-file" in argv and "--cc-token-file" in argv
+    tok = _secret_report(tmp_path / "token.report")
+    assert tok["content"] == bot
+    assert tok["mode"] == "-rw-------", f"файл секрета — только владельцу: {tok}"
+    assert _secret_report(tmp_path / "cc.report")["content"] == cc
+    # файл-носитель живёт ровно на время деплоя
+    assert not Path(tok["path"]).exists(), "файл секрета обязан удаляться после деплоя"
+
+
+def test_install_tells_how_to_pass_cc_token_by_file(tmp_path):
+    """Р5: то, что печатается ученику, тоже не должно учить светить секрет в argv."""
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "UNPACKER_CC_TOKEN_FILE" in out, (
+        f"ученику надо показать путь через файл, а не «UNPACKER_CC_TOKEN=<токен> bash …»:\n{out}"
+    )
+    assert "UNPACKER_CC_TOKEN=<" not in out, "это учит вписать секрет в командную строку"
+
+
+def test_install_prints_only_whitelisted_command_forms(tmp_path):
+    """M-18: `sudo bash update.sh` даёт «user is not allowed to execute /bin/bash».
+
+    В sudoers-whitelist'е стоят сами скрипты; оболочек там нет сознательно.
+    """
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "sudo bash" not in out, f"под sudo оболочка запрещена whitelist'ом:\n{out}"
+    assert f"sudo {engine}/update.sh" in out, "обновление печатаем в разрешённой форме"
+    assert f"sudo {engine}/deploy/agentctl.sh doctor" in out, "и диагностику тоже"
+
+
+def test_install_refuses_api_contour_before_asking_anything(tmp_path):
+    """M-12: четвёртый вопрос — тупик: выбор «API-ключ» гарантированно обрывал установку.
+
+    Причём уже ПОСЛЕ ввода токена и остальных ответов. Отказ обязан случиться раньше, чем
+    ученик что-то введёт, — иначе это просто издевательство.
+    """
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    env = _answers(tmp_path, UNPACKER_AUTH_MODE="api", DEPLOY_ARGV=str(tmp_path / "argv.txt"))
+    for k in ("UNPACKER_BOT_TOKEN", "UNPACKER_ALLOWED_USERS"):
+        env.pop(k, None)
+    proc = subprocess.run(
+        [
+            "bash",
+            str(INSTALL),
+            "--ram-mb",
+            "8192",
+            "--no-hardening",
+            "--engine-dir",
+            str(engine),
+            "--run-user",
+            os.environ.get("USER", "nobody"),
+        ],
+        input="",  # ученик ещё ничего не ввёл
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}", **env},
+        timeout=180,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "подписк" in out.lower()
+    assert "токен" not in out.lower().split("контур")[0], (
+        f"про токен спрашивать раньше отказа нельзя:\n{out}"
+    )
+
+
+def test_install_does_not_offer_unsupported_auth_choice(tmp_path):
+    """M-12 (вторая половина): не предлагай выбор, который гарантированно провалится."""
+    text = INSTALL.read_text()
+    assert "2 — API-ключ" not in text, (
+        "вариант «API-ключ» в диалоге — это кнопка «оборвать установку»: контур появится в Фазе 4"
+    )
+
+
 # ── update.sh: релизы по тегам, бэкапы, откат (§10) ─────────────────────────
 #
 # Здесь git НАСТОЯЩИЙ: смысл update.sh — логика тегов, заглушка её бы стёрла.
@@ -685,14 +1350,18 @@ def _engine_with_tags(tmp_path):
 
     Коммит после тега — это и есть проверяемая ситуация: «плохой пуш владельца» не должен
     приезжать ученикам, update.sh обязан встать на тег, а не на HEAD.
+
+    update.sh КОПИРУЕТСЯ внутрь — ровно как на сервере (/opt/unpacker/update.sh). Каталог
+    движка он берёт из своего расположения, флага --engine-dir больше нет (SEC-1).
     """
     engine = tmp_path / "opt" / "unpacker"
     (engine / "deploy").mkdir(parents=True)
     (engine / "deploy" / "_common.sh").write_text((REPO / "deploy" / "_common.sh").read_text())
     (engine / "engine").mkdir()
-    _git("init", "-q", ".", cwd=str(engine)) if False else subprocess.run(
-        ["git", "init", "-q", str(engine)], check=True, capture_output=True
-    )
+    upd = engine / "update.sh"
+    upd.write_text(UPDATE.read_text())
+    upd.chmod(0o755)
+    subprocess.run(["git", "init", "-q", str(engine)], check=True, capture_output=True)
     (engine / "VERSION").write_text("v0.1.0\n")
     _git("add", "-A", cwd=str(engine))
     _git("commit", "-qm", "v0.1.0", cwd=str(engine))
@@ -705,12 +1374,35 @@ def _engine_with_tags(tmp_path):
     return engine
 
 
+def _sqlite_db(path: Path, rows: int = 3) -> None:
+    """НАСТОЯЩАЯ база SQLite: бэкап проверяется чтением, а не сравнением байтов.
+
+    Текстовая «заглушка» тут не годится осознанно: согласованный снимок делает
+    `sqlite3 .backup`/`Connection.backup`, и на не-базе он обязан честно провалиться (ADV-12).
+    """
+    con = sqlite3.connect(path)
+    with con:
+        con.execute("CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY, text TEXT)")
+        con.executemany(
+            "INSERT INTO sessions(text) VALUES(?)", [(f"переписка {i}",) for i in range(rows)]
+        )
+    con.close()
+
+
+def _db_rows(path: Path) -> list[str]:
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return [r[0] for r in con.execute("SELECT text FROM sessions ORDER BY id")]
+    finally:
+        con.close()
+
+
 def _instances(tmp_path, names=("unpacker", "sales")):
     base = tmp_path / "agents"
     for n in names:
         (base / n / "state").mkdir(parents=True)
         (base / n / ".env").write_text("TELEGRAM_BOT_TOKEN=1:x\n")
-        (base / n / "state" / "state.db").write_text("SQLite-заглушка\n")
+        _sqlite_db(base / n / "state" / "state.db")
     return base
 
 
@@ -719,9 +1411,17 @@ def _upd_env(tmp_path, engine, **over):
         "STUB_LOG": str(tmp_path / "stub.log"),
         "TG_AGENTS_BASE": str(tmp_path / "agents"),
         "TG_RUN_USER": os.environ.get("USER", "nobody"),
+        # машинный конфиг и venv — вне дерева движка (Р1/Р2); в тестах уводим в tmp
+        "UNPACKER_ETC": str(tmp_path / "etc" / "unpacker"),
+        "UV_PROJECT_ENVIRONMENT": str(tmp_path / "venv"),
     }
     env.update(over)
     return env
+
+
+def run_update_in(engine: Path, *args: str, **kw):
+    """Запуск update.sh ИЗ каталога движка — единственная поддерживаемая форма (SEC-1)."""
+    return _run(engine / "update.sh", *args, **kw)
 
 
 def test_update_script_exists_and_helps():
@@ -730,13 +1430,14 @@ def test_update_script_exists_and_helps():
     r = run_update("--help")
     assert r.returncode == 0, r.stderr
     assert "--rollback" in r.stdout and "--dry-run" in r.stdout
+    assert "--restore-db" in r.stdout, "откат КОДА без восстановления ДАННЫХ — половина операции"
 
 
 def test_update_checks_out_latest_tag_not_head(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path)
-    r = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert (engine / "VERSION").read_text().strip() == "v0.2.0", (
@@ -745,15 +1446,52 @@ def test_update_checks_out_latest_tag_not_head(tmp_path):
     assert "v0.2.0" in out
 
 
-def test_update_backs_up_state_db_before_switching(tmp_path):
+def test_update_backup_is_consistent_sqlite_snapshot(tmp_path):
+    """Бэкап — читаемая база с теми же строками, а не «копия файла» (ADV-12)."""
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     base = _instances(tmp_path)
-    r = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    before = _db_rows(base / "unpacker" / "state" / "state.db")
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r.returncode == 0, r.stdout + r.stderr
-    backups = list((base / "unpacker" / "state" / "backups").glob("state.db*"))
-    assert backups, "перед миграциями обязан лежать бэкап БД сессий"
-    assert backups[0].read_text() == "SQLite-заглушка\n", "бэкап должен быть копией, а не пустышкой"
+    copies = sorted((base / "unpacker" / "state" / "backups").glob("*/state.db"))
+    assert copies, "перед миграциями обязан лежать бэкап БД сессий"
+    assert _db_rows(copies[0]) == before, (
+        "бэкап обязан открываться как база и содержать те же сессии"
+    )
+
+
+def test_update_refuses_to_proceed_when_backup_impossible(tmp_path):
+    """Согласованный снимок не сделался → обновления НЕ будет (fail-closed, ADV-12).
+
+    Раньше здесь стоял `cp` живой WAL-базы: копия выходила битой или без последних сессий,
+    а скрипт бодро писал «бэкап (копия)» и шёл дальше.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    (base / "unpacker" / "state" / "state.db").write_text("это вообще не sqlite\n")
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, f"без бэкапа обновляться нельзя:\n{out}"
+    assert "sqlite3" in out, "нужна готовая команда починки"
+    assert (engine / "VERSION").read_text().strip() != "v0.2.0", "код не должен быть переключён"
+
+
+def test_update_backs_up_state_db_before_switching(tmp_path):
+    """M5: «до переключения» проверяется срывом переключения, а не фактом файла.
+
+    Рабочее дерево делаем грязным по VERSION — `git checkout` на тег обязан отказаться.
+    Если бэкап делается ПОСЛЕ checkout, его после этого падения не будет.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    (engine / "VERSION").write_text("правка ученика прямо в /opt\n")
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r.returncode != 0, "checkout поверх незакоммиченной правки обязан провалиться"
+    copies = sorted((base / "unpacker" / "state" / "backups").glob("*/state.db"))
+    assert copies, "бэкап обязан быть сделан РАНЬШЕ переключения кода"
 
 
 def test_update_restarts_initiator_last(tmp_path):
@@ -761,7 +1499,7 @@ def test_update_restarts_initiator_last(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path, names=("alpha", "unpacker", "zeta"))
-    r = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r.returncode == 0, r.stdout + r.stderr
     # фильтруем по началу строки: путь tmp_path сам содержит слово restart
     restarts = [
@@ -774,14 +1512,42 @@ def test_update_restarts_initiator_last(tmp_path):
     assert "unpacker" not in "\n".join(restarts[:-1])
 
 
+def test_update_does_not_die_midway_when_one_unit_is_missing(tmp_path):
+    """C12: у папки без юнита рестарт падает — остальных это не должно лишать обновления.
+
+    И «готово» в конце не печатается: часть ботов осталась лежать.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "sudo"))
+    sysctl = stub / "systemctl"
+    sysctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "systemctl %s\\n" "$*" >> "$STUB_LOG"\n'
+        'if [ "$*" = "restart agent-tg@alpha" ]; then\n'
+        '  echo "Failed to restart agent-tg@alpha.service: Unit not found." >&2; exit 5\nfi\n'
+        "exit 0\n"
+    )
+    sysctl.chmod(0o755)
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path, names=("alpha", "unpacker", "zeta"))
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    restarts = [
+        ln
+        for ln in (tmp_path / "stub.log").read_text().splitlines()
+        if ln.startswith("systemctl restart")
+    ]
+    assert len(restarts) == 3, f"падение одного юнита не должно рвать обновление:\n{restarts}"
+    assert r.returncode != 0, "часть ботов лежит — это не успех"
+    assert "==> готово" not in out, f"«готово», не сделав дела:\n{out}"
+    assert "journalctl" in out, "нужна команда, чтобы посмотреть причину"
+
+
 def test_update_dry_run_changes_nothing(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     base = _instances(tmp_path)
     before = (engine / "VERSION").read_text()
-    r = run_update(
-        "--engine-dir", str(engine), "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub
-    )
+    r = run_update_in(engine, "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert "[dry-run]" in out
@@ -795,9 +1561,9 @@ def test_update_is_idempotent_on_second_run(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path)
-    r1 = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r1 = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r1.returncode == 0, r1.stdout + r1.stderr
-    r2 = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r2 = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     out2 = r2.stdout + r2.stderr
     assert r2.returncode == 0, out2
     assert "уже" in out2, "повторный запуск обязан сказать «уже на последнем релизе», а не чинить"
@@ -812,12 +1578,10 @@ def test_update_rollback_returns_previous_tag(tmp_path):
     subprocess.run(
         ["git", "-C", str(engine), "checkout", "--quiet", "v0.1.0"], check=True, capture_output=True
     )
-    r1 = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    r1 = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r1.returncode == 0, r1.stdout + r1.stderr
     assert (engine / "VERSION").read_text().strip() == "v0.2.0"
-    r2 = run_update(
-        "--engine-dir", str(engine), "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub
-    )
+    r2 = run_update_in(engine, "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub)
     out2 = r2.stdout + r2.stderr
     assert r2.returncode == 0, out2
     assert (engine / "VERSION").read_text().strip() == "v0.1.0", "откат обязан вернуть прошлый тег"
@@ -828,24 +1592,200 @@ def test_update_rollback_without_history_explains(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path)
-    r = run_update(
-        "--engine-dir", str(engine), "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub
-    )
+    r = run_update_in(engine, "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub)
     assert r.returncode != 0
     out = (r.stdout + r.stderr).lower()
     assert "откат" in out or "rollback" in out
     assert "--ref" in out, "должен подсказать, как встать на конкретный релиз руками"
 
 
+def test_update_restores_databases_from_backup(tmp_path):
+    """--restore-db: откат КОДА без возврата ДАННЫХ — половина операции (ADV-12).
+
+    Сценарий ученика: обновился, миграция новой версии переписала базу, откатил код —
+    и остался с базой из будущего. Возврат данных обязан быть отдельной командой.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    db = base / "unpacker" / "state" / "state.db"
+    good = _db_rows(db)
+    r1 = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    # «миграция новой версии» испортила базу и оставила мусорный -wal
+    db.unlink()
+    _sqlite_db(db, rows=1)
+    (base / "unpacker" / "state" / "state.db-wal").write_text("мусор от прерванной миграции")
+    r2 = run_update_in(engine, "--restore-db", env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out2 = r2.stdout + r2.stderr
+    assert r2.returncode == 0, out2
+    assert _db_rows(db) == good, "база обязана вернуться к состоянию до обновления"
+    assert not (base / "unpacker" / "state" / "state.db-wal").exists(), (
+        "оставленный -wal подмешал бы к восстановленной базе чужие страницы"
+    )
+    log = (tmp_path / "stub.log").read_text()
+    assert "systemctl stop agent-tg@unpacker" in log, "бота обязательно остановить перед подменой"
+    assert "systemctl start agent-tg@unpacker" in log, "и поднять обратно"
+
+
+def test_update_restore_db_without_backups_says_so(tmp_path):
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r = run_update_in(engine, "--restore-db", env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "бэкап" in out.lower()
+
+
+def test_update_stops_when_dependencies_fail_and_offers_rollback(tmp_path):
+    """C13: код переключён, uv sync провалился → нельзя молчать и нельзя рестартовать ботов.
+
+    Ровно этот случай приезжает с новым релизом, добавившим зависимость: код новый,
+    библиотеки старые. Ученику нужна одна команда — --rollback.
+    """
+    stub = _stub_bin(tmp_path, ("systemctl", "sudo"))
+    bad_uv = stub / "uv"
+    bad_uv.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "uv %s\\n" "$*" >> "$STUB_LOG"\n'
+        'echo "error: Failed to download pyyaml" >&2\nexit 1\n'
+    )
+    bad_uv.chmod(0o755)
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "--rollback" in out, "ученик обязан узнать, как вернуться, из этого же сообщения"
+    assert "v0.1.0" in out or "v0.2.0" in out, "и на какой релиз он вернётся"
+    log = (tmp_path / "stub.log").read_text()
+    assert "systemctl restart" not in log, "на битых зависимостях ботов не рестартуем"
+    assert "готово" not in out
+
+
+def test_update_reports_git_failure_instead_of_no_tags(tmp_path):
+    """C16: жалоба git ≠ «в репо нет тегов».
+
+    Каталог движка с чужим владельцем даёт `dubious ownership`, а `|| true` превращал это в
+    «обновлять не на что» — ученик искал теги, которых у него полно.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    bad_git = stub / "git"
+    bad_git.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$3" = "tag" ]; then\n'
+        "  echo \"fatal: detected dubious ownership in repository at '/opt/unpacker'\" >&2\n"
+        "  exit 128\nfi\n"
+        'exec /usr/bin/git "$@"\n'
+    )
+    bad_git.chmod(0o755)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0
+    assert "нет тегов" not in out, f"это не «нет тегов», это отказ git:\n{out}"
+    assert "chown" in out and "root" in out, "нужна готовая команда починки владельца"
+
+
+def test_update_refuses_when_run_user_resolves_to_root(tmp_path):
+    """C6/ADV-06: не знаю юзера ботов — не обновляю, а не «готово» вхолостую.
+
+    Так выглядит запуск от root без /etc/unpacker/engine.conf: RUN_USER=root →
+    AGENTS_BASE=/root/agents → ни бэкапов, ни рестартов, и бодрый финал «готово: v1 → v2».
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    env = _upd_env(tmp_path, engine, TG_RUN_USER="root")
+    del env["TG_AGENTS_BASE"]
+    r = run_update_in(engine, env_extra=env, stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "engine.conf" in out, "должен назвать файл, которого не хватает"
+    assert "TG_RUN_USER" in out, "и путь починки руками"
+    assert "готово" not in out
+
+
+def test_update_takes_paths_from_engine_conf(tmp_path):
+    """Р2: единая вселенная путей. Без окружения update.sh обязан прочитать engine.conf.
+
+    Иначе любая точка входа (root вручную, sudo от агента, cron) читает свою вселенную и
+    тихо рапортует успех, не тронув ни одного бота.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    etc = tmp_path / "etc" / "unpacker"
+    etc.mkdir(parents=True)
+    me = os.environ.get("USER", "nobody")
+    (etc / "engine.conf").write_text(
+        f"TG_RUN_USER={me}\nTG_RUNTIME={engine}\nTG_AGENTS_BASE={base}\n"
+        f"TG_BRAINS_BASE={tmp_path}/brains\nTG_UV_BIN={stub}/uv\n"
+    )
+    env = {
+        "STUB_LOG": str(tmp_path / "stub.log"),
+        "UNPACKER_ETC": str(etc),
+        "UV_PROJECT_ENVIRONMENT": str(tmp_path / "venv"),
+    }
+    r = run_update_in(engine, env_extra=env, stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert sorted((base / "unpacker" / "state" / "backups").glob("*/state.db")), (
+        f"инстансы обязаны находиться по конфигу, а не по окружению вызывающего:\n{out}"
+    )
+
+
+def test_update_fails_closed_when_units_exist_but_no_instances(tmp_path):
+    """C6: юниты в системе есть, инстансов в AGENTS_BASE нет → я смотрю не туда.
+
+    «Нечего делать» здесь — ложь: боты остались бы на старом коде без бэкапов, а скрипт
+    напечатал бы «готово».
+    """
+    stub = _stub_bin(tmp_path, ("uv", "sudo"))
+    sysctl = stub / "systemctl"
+    sysctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "systemctl %s\\n" "$*" >> "$STUB_LOG"\n'
+        'case "$*" in *list-units*)\n'
+        '  echo "  agent-tg@sales.service loaded active running бот" ;; esac\n'
+        "exit 0\n"
+    )
+    sysctl.chmod(0o755)
+    engine = _engine_with_tags(tmp_path)
+    (tmp_path / "agents").mkdir()
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "agent-tg@" in out and "готово" not in out
+    assert (engine / "VERSION").read_text().strip() != "v0.2.0", "код не переключаем вслепую"
+
+
+def test_update_prints_only_whitelisted_command_forms(tmp_path):
+    """M-18: печатаем ровно то, что разрешено sudoers (без `bash` под sudo).
+
+    `sudo bash /opt/unpacker/update.sh` даёт «user is not allowed to execute /bin/bash»:
+    в whitelist'е стоит сам скрипт, а не оболочка.
+    """
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r = run_update_in(engine, env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "sudo bash" not in out, f"под sudo оболочка запрещена whitelist'ом:\n{out}"
+    assert f"sudo {engine}/update.sh --rollback" in out
+
+
 def test_update_refuses_non_repo_dir(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
-    (tmp_path / "notarepo").mkdir()
-    r = run_update(
-        "--engine-dir",
-        str(tmp_path / "notarepo"),
-        env_extra=_upd_env(tmp_path, tmp_path / "notarepo"),
-        stub=stub,
-    )
+    notarepo = tmp_path / "notarepo"
+    notarepo.mkdir()
+    upd = notarepo / "update.sh"
+    upd.write_text(UPDATE.read_text())
+    upd.chmod(0o755)
+    r = _run(upd, env_extra=_upd_env(tmp_path, notarepo), stub=stub)
     assert r.returncode != 0
     out = r.stdout + r.stderr
     assert "install.sh" in out, "если движок не установлен — отправь к install.sh"
@@ -1009,7 +1949,8 @@ def test_install_new_env_answers_win_over_saved_ones(tmp_path):
     assert r2.returncode == 0, r2.stdout + r2.stderr
     argv = argv_log.read_text().splitlines()
     assert argv[argv.index("--users") + 1] == "333", "новый ответ должен побеждать запомненный"
-    assert "UNPACKER_ALLOWED_USERS=333" in (engine / ".install.conf").read_text()
+    conf = (tmp_path / "etc" / "unpacker" / "install.conf").read_text()
+    assert "UNPACKER_ALLOWED_USERS=333" in conf
 
 
 def test_install_survives_distro_where_ssh_unit_is_named_differently(tmp_path):
@@ -1055,12 +1996,10 @@ def test_update_dry_run_does_not_claim_it_updated(tmp_path):
     stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
     engine = _engine_with_tags(tmp_path)
     _instances(tmp_path)
-    r = run_update(
-        "--engine-dir", str(engine), "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub
-    )
+    r = run_update_in(engine, "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
-    assert "готово" not in out
+    assert "==> готово" not in out
     assert "ничего не изменено" in out
 
 
