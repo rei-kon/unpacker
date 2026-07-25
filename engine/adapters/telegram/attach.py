@@ -41,10 +41,27 @@ class Attachment:
 
 @dataclass(frozen=True)
 class IntakeResult:
-    """Либо путь к принятому файлу, либо человеческое сообщение об отказе. Никогда оба."""
+    """Либо путь к принятому файлу, либо человеческое сообщение об отказе. Никогда оба.
+
+    Инвариант держит `__post_init__`, а не комментарий (K12): смешанный результат хендлер
+    прочитал бы как успех (он смотрит только на `path`) и молча потерял бы объяснение
+    отказа, а пустой — ответил бы «Файл не принят» без причины.
+    """
 
     path: Path | None
     error: str | None
+
+    def __post_init__(self) -> None:
+        if (self.path is None) == (self.error is None):
+            raise ValueError("IntakeResult: ровно одно из path/error, не оба и не ничего")
+
+    @classmethod
+    def ok(cls, path: Path) -> IntakeResult:
+        return cls(path=path, error=None)
+
+    @classmethod
+    def failed(cls, error: str) -> IntakeResult:
+        return cls(path=None, error=error)
 
 
 def attachment_from_message(message: Any) -> Attachment | None:
@@ -79,8 +96,8 @@ class AttachmentIntake:
     async def take(self, *, session_id: str, attachment: Attachment) -> IntakeResult:
         """Скачать вложение в `state/uploads/<session_id>/`. Отказ — текстом, не исключением."""
         if attachment.size is not None and attachment.size > self._max_bytes:
-            return IntakeResult(
-                None, too_large_message(size=attachment.size, limit=self._max_bytes)
+            return IntakeResult.failed(
+                too_large_message(size=attachment.size, limit=self._max_bytes)
             )
 
         # Имени может не быть вовсе. Расширение здесь не косметика: по нему агент решает,
@@ -92,18 +109,17 @@ class AttachmentIntake:
         except Exception as exc:  # noqa: BLE001 — сеть/Bot API: сообщаем, а не роняем чат
             logger.warning("не скачал вложение %s: %s", attachment.file_id, exc)
             _unlink(path)
-            return IntakeResult(
-                None,
+            return IntakeResult.failed(
                 "Не смог забрать файл из Telegram. Если он больше "
                 f"{self._max_bytes // (1024 * 1024)} МБ — Bot API его не отдаёт; "
-                "иначе пришли ещё раз.",
+                "иначе пришли ещё раз."
             )
 
         actual = path.stat().st_size if path.exists() else 0
         if actual > self._max_bytes:
             _unlink(path)  # соврали в file_size — файл на диске не оставляем
-            return IntakeResult(None, too_large_message(size=actual, limit=self._max_bytes))
-        return IntakeResult(path, None)
+            return IntakeResult.failed(too_large_message(size=actual, limit=self._max_bytes))
+        return IntakeResult.ok(path)
 
 
 def _unlink(path: Path) -> None:

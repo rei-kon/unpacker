@@ -17,6 +17,7 @@ import pytest
 from engine.adapters.telegram.attach import (
     Attachment,
     AttachmentIntake,
+    IntakeResult,
     attachment_from_message,
 )
 from engine.core.uploads import MAX_UPLOAD_BYTES, UploadStore
@@ -167,3 +168,27 @@ def test_from_message_picks_largest_photo():
 
 def test_from_message_none_for_plain_text():
     assert attachment_from_message(SimpleNamespace(document=None, photo=None)) is None
+
+
+# ── K12: инвариант IntakeResult «никогда оба» держится кодом, а не комментарием ─
+
+
+def test_intake_result_cannot_hold_both_path_and_error(tmp_path):
+    """Docstring обещал «либо путь, либо сообщение об отказе. Никогда оба» — и всё.
+
+    Смешанный результат хендлер обработал бы как успех (проверяется только `path`), молча
+    потеряв объяснение отказа. Инвариант должен ломаться в конструкторе.
+    """
+    with pytest.raises(ValueError):
+        IntakeResult(path=tmp_path / "f.bin", error="и то и другое")
+
+
+def test_intake_result_cannot_be_empty():
+    """Пустой результат — тоже не состояние: хендлер ответил бы «Файл не принят» без причины."""
+    with pytest.raises(ValueError):
+        IntakeResult(path=None, error=None)
+
+
+def test_intake_result_accepts_each_side_alone(tmp_path):
+    assert IntakeResult(path=tmp_path / "f.bin", error=None).error is None
+    assert IntakeResult(path=None, error="не смог").path is None

@@ -153,6 +153,17 @@ def test_too_large_message_names_the_limit():
     assert "50" in msg  # и размер своего файла
 
 
+def test_slightly_oversize_message_is_not_absurd():
+    """K14: округление `:.0f` давало «Файл 20 МБ — можно до 20 МБ».
+
+    20 МБ + 1 байт округлялось в те же 20 — сообщение выглядело как ошибка движка, а не
+    как объяснение отказа. Один знак после запятой снимает абсурд.
+    """
+    msg = too_large_message(size=MAX_UPLOAD_BYTES + 1, limit=MAX_UPLOAD_BYTES)
+    assert "20 МБ — Telegram" not in msg, f"абсурдная формулировка: {msg}"
+    assert "20.0" in msg or "20,0" in msg
+
+
 # ── untrusted-рамка §8.2 ─────────────────────────────────────────────────────
 
 

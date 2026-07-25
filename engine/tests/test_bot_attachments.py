@@ -559,13 +559,33 @@ async def test_missing_file_marker_is_explained(stand):
     assert s.bot.text.strip(), "вместо краша — понятная строка"
 
 
-async def test_send_file_disabled_keeps_marker_visible(stand):
-    # фича выключена флагом → ничего не отправляем и не делаем вид, что отправили
-    s = _build(stand, core=FakeCore("[SEND_FILE:kp.pdf]"), send_file=False)
+async def test_send_file_disabled_does_not_leak_raw_marker(stand):
+    """K21: выключенная фича не должна ронять служебный мусор в чат.
+
+    Раньше маркер уходил человеку как есть — вместе с абсолютным путём внутри
+    (`[SEND_FILE:/home/unpacker/agents/office/state/x.pdf]`). Ученик видит непонятную
+    строку и раскладку каталогов сервера. Маркер вырезаем всегда; файл не отправляем.
+    """
+    s = _build(stand, core=FakeCore("Готово [SEND_FILE:kp.pdf]"), send_file=False)
     await s.tg._on_text(_message(text="дай"))
     assert s.bot.documents == []
     # текст уходит в MarkdownV2, поэтому сравниваем по разэкранированному виду
-    assert "SEND_FILE" in s.bot.text.replace("\\", "")
+    assert "SEND_FILE" not in s.bot.text.replace("\\", "")
+    assert "Готово" in s.bot.text
+
+
+async def test_send_file_disabled_says_so_when_agent_tried(stand):
+    """И объясняем, почему файла нет: иначе агент «обещал файл», а его молча нет."""
+    s = _build(stand, core=FakeCore("Держи [SEND_FILE:kp.pdf]"), send_file=False)
+    await s.tg._on_text(_message(text="дай"))
+    assert "выключен" in s.bot.text.lower()
+
+
+async def test_send_file_disabled_stays_quiet_without_marker(stand):
+    """Обычный ответ при выключенной фиче — без всяких приписок."""
+    s = _build(stand, core=FakeCore("Просто ответ"), send_file=False)
+    await s.tg._on_text(_message(text="привет"))
+    assert "выключен" not in s.bot.text.lower()
 
 
 # ── обнаружимость фич (ученик получает репо без провожатого) ─────────────────

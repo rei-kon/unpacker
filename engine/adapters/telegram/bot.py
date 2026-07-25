@@ -497,10 +497,17 @@ class TelegramBot:
 
     async def _deliver(self, chat_id: int, thread_id: int | None, text: str) -> None:
         """Отправить ответ: текст нарезкой, файлы по маркерам, ряд кнопок под последним."""
-        paths: list[str] = []
-        if self._send_file is not None:
-            text, paths = extract_send_files(text)
-        files, notes = self._resolve_send_files(chat_id, thread_id, paths)
+        # Маркер вырезаем ВСЕГДА, даже при выключенной отдаче (K21): иначе человек получал
+        # в чат служебную строку с абсолютным путём внутри
+        # (`[SEND_FILE:/home/unpacker/agents/office/state/x.pdf]`) — непонятно и вдобавок
+        # показывает раскладку каталогов сервера.
+        text, paths = extract_send_files(text)
+        if self._send_file is None:
+            # но и делать вид, что файл ушёл, нельзя: объясняем словами
+            notes = ["📎 Отдача файлов выключена в настройках движка."] if paths else []
+            files: list[Path] = []
+        else:
+            files, notes = self._resolve_send_files(chat_id, thread_id, paths)
 
         # Очередь типизирована union'ом, а не парой (str, object) с `type: ignore` (K2):
         # раньше «doc» и «text» различались строкой, и mypy не мог проверить, что в
