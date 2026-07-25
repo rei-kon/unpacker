@@ -1048,3 +1048,17 @@ def test_install_survives_distro_where_ssh_unit_is_named_differently(tmp_path):
     assert (tmp_path / "argv.txt").exists(), "деплой должен состояться, несмотря на имя ssh-юнита"
     log = (tmp_path / "stub.log").read_text()
     assert "reload sshd" in log, "должен попробовать второе имя юнита"
+
+
+def test_update_dry_run_does_not_claim_it_updated(tmp_path):
+    """Финал dry-run не должен рапортовать «готово: X → Y» — ничего не переключали."""
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r = run_update(
+        "--engine-dir", str(engine), "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "готово" not in out
+    assert "ничего не изменено" in out
