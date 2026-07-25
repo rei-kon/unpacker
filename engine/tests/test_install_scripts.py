@@ -642,3 +642,187 @@ def test_install_does_not_lock_out_ssh_when_no_key_present(tmp_path):
     assert r.returncode == 0, out
     assert "ssh-copy-id" in out, "должен объяснить, как настроить ключ"
     assert "sshd_config" not in out, "конфиг ssh трогать нельзя, пока ключа нет"
+
+
+# ── update.sh: релизы по тегам, бэкапы, откат (§10) ─────────────────────────
+#
+# Здесь git НАСТОЯЩИЙ: смысл update.sh — логика тегов, заглушка её бы стёрла.
+# Заглушены только uv (не тянуть зависимости) и systemctl/sudo (нет systemd).
+
+
+def _git(*args, cwd):
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.t", "-c", "user.name=t", *args], cwd=cwd, check=True,
+        capture_output=True,
+    )
+
+
+def _engine_with_tags(tmp_path):
+    """Репо движка с двумя релизами и одним коммитом ПОСЛЕ последнего тега.
+
+    Коммит после тега — это и есть проверяемая ситуация: «плохой пуш владельца» не должен
+    приезжать ученикам, update.sh обязан встать на тег, а не на HEAD.
+    """
+    engine = tmp_path / "opt" / "unpacker"
+    (engine / "deploy").mkdir(parents=True)
+    (engine / "deploy" / "_common.sh").write_text((REPO / "deploy" / "_common.sh").read_text())
+    (engine / "engine").mkdir()
+    _git("init", "-q", ".", cwd=str(engine)) if False else subprocess.run(
+        ["git", "init", "-q", str(engine)], check=True, capture_output=True
+    )
+    (engine / "VERSION").write_text("v0.1.0\n")
+    _git("add", "-A", cwd=str(engine))
+    _git("commit", "-qm", "v0.1.0", cwd=str(engine))
+    _git("tag", "v0.1.0", cwd=str(engine))
+    (engine / "VERSION").write_text("v0.2.0\n")
+    _git("commit", "-aqm", "v0.2.0", cwd=str(engine))
+    _git("tag", "v0.2.0", cwd=str(engine))
+    (engine / "VERSION").write_text("сломанный пуш владельца\n")
+    _git("commit", "-aqm", "bad push", cwd=str(engine))
+    return engine
+
+
+def _instances(tmp_path, names=("unpacker", "sales")):
+    base = tmp_path / "agents"
+    for n in names:
+        (base / n / "state").mkdir(parents=True)
+        (base / n / ".env").write_text("TELEGRAM_BOT_TOKEN=1:x\n")
+        (base / n / "state" / "state.db").write_text("SQLite-заглушка\n")
+    return base
+
+
+def _upd_env(tmp_path, engine, **over):
+    env = {
+        "STUB_LOG": str(tmp_path / "stub.log"),
+        "TG_AGENTS_BASE": str(tmp_path / "agents"),
+        "TG_RUN_USER": os.environ.get("USER", "nobody"),
+    }
+    env.update(over)
+    return env
+
+
+def test_update_script_exists_and_helps():
+    assert UPDATE.exists(), "update.sh обязателен: обновление и откат без ssh-магии"
+    assert os.access(UPDATE, os.X_OK)
+    r = run_update("--help")
+    assert r.returncode == 0, r.stderr
+    assert "--rollback" in r.stdout and "--dry-run" in r.stdout
+
+
+def test_update_checks_out_latest_tag_not_head(tmp_path):
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert (engine / "VERSION").read_text().strip() == "v0.2.0", (
+        "должен встать на последний ТЕГ, а не на HEAD ветки (плохой пуш владельца)"
+    )
+    assert "v0.2.0" in out
+
+
+def test_update_backs_up_state_db_before_switching(tmp_path):
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    r = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r.returncode == 0, r.stdout + r.stderr
+    backups = list((base / "unpacker" / "state" / "backups").glob("state.db*"))
+    assert backups, "перед миграциями обязан лежать бэкап БД сессий"
+    assert backups[0].read_text() == "SQLite-заглушка\n", "бэкап должен быть копией, а не пустышкой"
+
+
+def test_update_restarts_initiator_last(tmp_path):
+    """Юнит Распаковщика рестартуется последним: иначе он убьёт себя посреди операции."""
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path, names=("alpha", "unpacker", "zeta"))
+    r = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r.returncode == 0, r.stdout + r.stderr
+    # фильтруем по началу строки: путь tmp_path сам содержит слово restart
+    restarts = [
+        ln
+        for ln in (tmp_path / "stub.log").read_text().splitlines()
+        if ln.startswith("systemctl restart")
+    ]
+    assert len(restarts) == 3, f"должны рестартоваться все три юнита:\n{restarts}"
+    assert "unpacker" in restarts[-1], f"инициатор — последним:\n{restarts}"
+    assert "unpacker" not in "\n".join(restarts[:-1])
+
+
+def test_update_dry_run_changes_nothing(tmp_path):
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    base = _instances(tmp_path)
+    before = (engine / "VERSION").read_text()
+    r = run_update(
+        "--engine-dir", str(engine), "--dry-run", env_extra=_upd_env(tmp_path, engine), stub=stub
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "[dry-run]" in out
+    assert (engine / "VERSION").read_text() == before, "dry-run не переключает код"
+    assert not (base / "unpacker" / "state" / "backups").exists(), "dry-run не делает бэкапов"
+    log = (tmp_path / "stub.log").read_text() if (tmp_path / "stub.log").exists() else ""
+    assert "systemctl restart" not in log, "dry-run не рестартует ботов"
+
+
+def test_update_is_idempotent_on_second_run(tmp_path):
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r1 = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    r2 = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    out2 = r2.stdout + r2.stderr
+    assert r2.returncode == 0, out2
+    assert "уже" in out2, "повторный запуск обязан сказать «уже на последнем релизе», а не чинить"
+    assert (engine / "VERSION").read_text().strip() == "v0.2.0"
+
+
+def test_update_rollback_returns_previous_tag(tmp_path):
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    # встаём на v0.1.0, затем обновляемся до v0.2.0 — чтобы «предыдущий» был осмысленным
+    subprocess.run(
+        ["git", "-C", str(engine), "checkout", "--quiet", "v0.1.0"], check=True, capture_output=True
+    )
+    r1 = run_update("--engine-dir", str(engine), env_extra=_upd_env(tmp_path, engine), stub=stub)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    assert (engine / "VERSION").read_text().strip() == "v0.2.0"
+    r2 = run_update(
+        "--engine-dir", str(engine), "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub
+    )
+    out2 = r2.stdout + r2.stderr
+    assert r2.returncode == 0, out2
+    assert (engine / "VERSION").read_text().strip() == "v0.1.0", "откат обязан вернуть прошлый тег"
+    assert "v0.1.0" in out2
+
+
+def test_update_rollback_without_history_explains(tmp_path):
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    engine = _engine_with_tags(tmp_path)
+    _instances(tmp_path)
+    r = run_update(
+        "--engine-dir", str(engine), "--rollback", env_extra=_upd_env(tmp_path, engine), stub=stub
+    )
+    assert r.returncode != 0
+    out = (r.stdout + r.stderr).lower()
+    assert "откат" in out or "rollback" in out
+    assert "--ref" in out, "должен подсказать, как встать на конкретный релиз руками"
+
+
+def test_update_refuses_non_repo_dir(tmp_path):
+    stub = _stub_bin(tmp_path, ("uv", "systemctl", "sudo"))
+    (tmp_path / "notarepo").mkdir()
+    r = run_update(
+        "--engine-dir",
+        str(tmp_path / "notarepo"),
+        env_extra=_upd_env(tmp_path, tmp_path / "notarepo"),
+        stub=stub,
+    )
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "install.sh" in out, "если движок не установлен — отправь к install.sh"
