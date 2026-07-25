@@ -17,7 +17,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import pytest
+# Фикстура `api_base` живёт в engine/tests/conftest.py — здесь только сам сервер-дублёр
+# (M9/S1: одна фикстура в одном месте, а не импорт-цепочка между тест-модулями).
 
 # Токен, который заглушка ВСЕГДА отвергает (401) — для негативных тестов гейта.
 BAD_TOKEN = "999999:BADtokenBAD"
@@ -57,10 +58,3 @@ def tg_api_stub() -> Iterator[str]:
     finally:
         srv.shutdown()
         srv.server_close()
-
-
-@pytest.fixture(scope="session")
-def api_base() -> Iterator[str]:
-    """URL заглушки Bot API — подставляется в TG_API_BASE."""
-    with tg_api_stub() as base:
-        yield base

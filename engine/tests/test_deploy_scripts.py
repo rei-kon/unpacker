@@ -11,41 +11,20 @@
 
 from __future__ import annotations
 
-import os
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from engine.tests._tgapi_stub import api_base as api_base  # noqa: PLC0414 — фикстура для pytest
-
-REPO = Path(__file__).resolve().parents[2]
-DEPLOY = REPO / "deploy" / "deploy.sh"
-AGENTCTL = REPO / "deploy" / "agentctl.sh"
-UV = (
-    os.environ.get("UV_BIN")
-    or subprocess.run(
-        ["bash", "-lc", "command -v uv"], capture_output=True, text=True
-    ).stdout.strip()
+from engine.tests.conftest import (
+    ME,
+    REPO,
+    UV,
+    deploy_env,
+    make_brain,
+    run_agentctl,
+    run_deploy,
 )
-
-
-def run_deploy(*args, env_extra=None, **kw):
-    env = {**os.environ}
-    if env_extra:
-        env.update(env_extra)
-    return subprocess.run(
-        ["bash", str(DEPLOY), *args], capture_output=True, text=True, env=env, **kw
-    )
-
-
-def run_agentctl(*args, env_extra=None):
-    env = {**os.environ}
-    if env_extra:
-        env.update(env_extra)
-    return subprocess.run(["bash", str(AGENTCTL), *args], capture_output=True, text=True, env=env)
-
 
 # ── репо-гигиена: шаблоны обязаны ехать ученику вместе с репо ────────────────
 
@@ -182,7 +161,7 @@ def test_deploy_dry_run_makes_no_instance_dir(tmp_path, api_base):
         str(brain),
         "--dry-run",
         env_extra={
-            "TG_RUN_USER": os.environ.get("USER", ""),
+            "TG_RUN_USER": ME,
             "TG_AGENTS_BASE": str(agents),
             "TG_BRAINS_BASE": str(tmp_path / "brains"),
             "TG_RUNTIME": str(REPO),
@@ -198,51 +177,12 @@ def test_deploy_dry_run_makes_no_instance_dir(tmp_path, api_base):
 # ── deploy.sh: green-path (реальная провизия, systemd пропущен на Маке) ──────
 
 
-@pytest.fixture(scope="session")
-def isolated_runtime(tmp_path_factory):
-    """Изолированная копия движка как RUNTIME.
-
-    deploy.sh на шаге 1 делает `uv sync --project $RUNTIME`, а seed — `uv run`. Против рабочего
-    репо это выпилило бы dev-зависимости из общего .venv (ruff/mypy/pytest-asyncio). Копируем код
-    в tmp с собственным .venv — тесты не трогают рабочее окружение.
-    """
-    if not UV:
-        pytest.skip("нужен uv")
-    dst = tmp_path_factory.mktemp("runtime") / "unpacker"
-    shutil.copytree(
-        REPO,
-        dst,
-        ignore=shutil.ignore_patterns(
-            ".venv",
-            ".git",
-            "*_cache",
-            ".pytest_cache",
-            ".mypy_cache",
-            ".ruff_cache",
-            "__pycache__",
-        ),
-    )
-    subprocess.run([UV, "sync", "--project", str(dst)], check=True, capture_output=True)
-    return str(dst)
-
-
 def _green_env(tmp_path, runtime, api_base):
-    return {
-        "TG_RUN_USER": os.environ.get("USER", ""),
-        "TG_AGENTS_BASE": str(tmp_path / "agents"),
-        "TG_BRAINS_BASE": str(tmp_path / "brains"),
-        "TG_RUNTIME": runtime,
-        "TG_UV_BIN": UV,
-        # гейт §7.3 «токен валиден» стучится в getMe → в тестах это локальная заглушка
-        "TG_API_BASE": api_base,
-    }
+    """Окружение green-path: всё в tmp (фикстуры и переключатели — в conftest)."""
+    return deploy_env(tmp_path, api_base, runtime=runtime)
 
 
-def _make_brain(tmp_path):
-    brain = tmp_path / "brainsrc"
-    brain.mkdir()
-    (brain / "CLAUDE.md").write_text("# Тест-мозг\nТы тест.\n")
-    return brain
+_make_brain = make_brain
 
 
 @pytest.mark.skipif(not UV, reason="нужен uv для seed-шага")
@@ -399,7 +339,7 @@ def test_agentctl_doctor_not_deployed(tmp_path):
     r = run_agentctl(
         "doctor",
         "ghost",
-        env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": os.environ.get("USER", "")},
+        env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": ME},
     )
     assert r.returncode != 0
     assert "not deployed" in r.stdout.lower() or "не развёрнут" in r.stdout.lower()
@@ -411,7 +351,7 @@ def test_agentctl_health_degraded_marker(tmp_path):
     r = run_agentctl(
         "health",
         "sick",
-        env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": os.environ.get("USER", "")},
+        env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": ME},
     )
     assert r.returncode != 0
     assert "degraded" in r.stdout.lower()
@@ -422,7 +362,7 @@ def test_agentctl_status_reports_env_perms(tmp_path):
     r = run_agentctl(
         "status",
         "okperms",
-        env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": os.environ.get("USER", "")},
+        env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": ME},
     )
     assert r.returncode == 0, r.stderr
     assert "600" in r.stdout
@@ -433,7 +373,7 @@ def test_agentctl_doctor_warns_bad_env_perms(tmp_path):
     r = run_agentctl(
         "doctor",
         "loose",
-        env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": os.environ.get("USER", "")},
+        env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": ME},
     )
     # doctor должен пожаловаться на права .env (не 600)
     assert "644" in r.stdout or "600" in r.stdout
@@ -441,9 +381,7 @@ def test_agentctl_doctor_warns_bad_env_perms(tmp_path):
 
 def test_agentctl_list_shows_instance(tmp_path):
     base = _fixture_instance(tmp_path, "listed", health_status="ok")
-    r = run_agentctl(
-        "list", env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": os.environ.get("USER", "")}
-    )
+    r = run_agentctl("list", env_extra={"TG_AGENTS_BASE": str(base), "TG_RUN_USER": ME})
     assert r.returncode == 0, r.stderr
     assert "listed" in r.stdout
 

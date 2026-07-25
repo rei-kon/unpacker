@@ -18,9 +18,6 @@ import re
 import subprocess
 from pathlib import Path
 
-from engine.tests._tgapi_stub import api_base as api_base  # noqa: PLC0414 — фикстура для pytest
-from engine.tests.test_deploy_scripts import isolated_runtime as isolated_runtime  # noqa: PLC0414
-
 REPO = Path(__file__).resolve().parents[2]
 BRAIN = REPO / "brains" / "unpacker"
 CLAUDE_MD = BRAIN / "CLAUDE.md"

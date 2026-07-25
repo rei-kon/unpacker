@@ -11,49 +11,30 @@ subprocess, а не пересказом в скилле.
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from engine.tests._tgapi_stub import BAD_TOKEN, DEAD_BASE
-from engine.tests._tgapi_stub import api_base as api_base  # noqa: PLC0414 — фикстура для pytest
+from engine.tests.conftest import (
+    GOOD_TOKEN,
+    deploy_env,
+    make_brain,
+    out_of,
+    run_deploy,
+)
 
-# Green-path нужен настоящий RUNTIME (шаг seed делает `uv run`). Переиспользуем session-фикстуру
-# из test_deploy_scripts.py: pytest кеширует её один раз на сессию, второй копии движка и
-# второго `uv sync` не будет.
-from engine.tests.test_deploy_scripts import isolated_runtime as isolated_runtime  # noqa: PLC0414
-
-REPO = Path(__file__).resolve().parents[2]
-DEPLOY = REPO / "deploy" / "deploy.sh"
-GOOD_TOKEN = "123456:AAbbCC-dd_ee"
-
-
-def run_deploy(*args: str, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    env = {**os.environ}
-    if env_extra:
-        env.update(env_extra)
-    return subprocess.run(["bash", str(DEPLOY), *args], capture_output=True, text=True, env=env)
+# Фикстуры (api_base, isolated_runtime) и хелперы живут в engine/tests/conftest.py —
+# pytest подхватывает их сам, импорт-цепочек между тест-модулями больше нет (M9/S1).
 
 
 def _brain(tmp_path: Path) -> Path:
-    b = tmp_path / "brainsrc"
-    b.mkdir(exist_ok=True)  # хелпер зовут дважды за тест (сам мозг + аргументы деплоя)
-    (b / "CLAUDE.md").write_text("# Тест-мозг\n")
-    return b
+    return make_brain(tmp_path)
 
 
 def _env(tmp_path: Path, api: str, **extra: str) -> dict[str, str]:
-    e = {
-        "TG_RUN_USER": os.environ.get("USER", ""),
-        "TG_AGENTS_BASE": str(tmp_path / "agents"),
-        "TG_BRAINS_BASE": str(tmp_path / "brains"),
-        "TG_RUNTIME": str(REPO),
-        "TG_API_BASE": api,
-    }
-    e.update(extra)
-    return e
+    return deploy_env(tmp_path, api, **extra)
 
 
 def _args(tmp_path: Path, name: str = "gated", token: str = GOOD_TOKEN, *rest: str) -> list[str]:
@@ -73,8 +54,7 @@ def _args(tmp_path: Path, name: str = "gated", token: str = GOOD_TOKEN, *rest: s
     ]
 
 
-def _out(r: subprocess.CompletedProcess) -> str:
-    return (r.stdout + r.stderr).lower()
+_out = out_of
 
 
 # ── гейт 1: токен валиден (getMe), в выводе — [REDACTED] ─────────────────────

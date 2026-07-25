@@ -11,21 +11,25 @@
 
 from __future__ import annotations
 
-import os
 import re
-import subprocess
 from pathlib import Path
 
 import pytest
 
-from engine.tests._tgapi_stub import api_base as api_base  # noqa: PLC0414 — фикстура для pytest
+from engine.tests.conftest import (
+    ME,
+    REPO,
+    deploy_args,
+    deploy_env,
+    make_brain,
+    run_deploy,
+    run_installer,
+)
 
-REPO = Path(__file__).resolve().parents[2]
 SUDOERS_TPL = REPO / "deploy" / "sudoers.d" / "unpacker"
 INSTALLER = REPO / "deploy" / "install-sudoers.sh"
 DROPIN = REPO / "deploy" / "templates" / "unpacker-dropin.conf"
 BASE_UNIT = REPO / "deploy" / "templates" / "agent-tg@.service"
-ME = os.environ.get("USER", "")
 
 
 def _lines(p: Path) -> list[str]:
@@ -119,15 +123,6 @@ def _fake_runtime(tmp_path: Path, *, mode: int = 0o555, with_update: bool = True
         u.write_text("#!/usr/bin/env bash\n:\n")
         u.chmod(mode)
     return rt
-
-
-def run_installer(
-    *args: str, env_extra: dict[str, str] | None = None
-) -> subprocess.CompletedProcess:
-    env = {**os.environ}
-    if env_extra:
-        env.update(env_extra)
-    return subprocess.run(["bash", str(INSTALLER), *args], capture_output=True, text=True, env=env)
 
 
 def _inst_env(tmp_path: Path, rt: Path) -> dict[str, str]:
@@ -259,50 +254,17 @@ def test_base_agent_unit_stays_locked_down():
 
 # ── deploy.sh --role unpacker: шаги прав видны в плане ──────────────────────
 
-DEPLOY = REPO / "deploy" / "deploy.sh"
-
-
-def run_deploy(*args: str, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    env = {**os.environ}
-    if env_extra:
-        env.update(env_extra)
-    return subprocess.run(["bash", str(DEPLOY), *args], capture_output=True, text=True, env=env)
-
 
 @pytest.fixture()
 def brain(tmp_path: Path) -> Path:
-    b = tmp_path / "brainsrc"
-    b.mkdir()
-    (b / "CLAUDE.md").write_text("# Мозг\n")
-    return b
+    return make_brain(tmp_path)
 
 
-def _deploy_env(tmp_path: Path, api: str) -> dict[str, str]:
-    return {
-        "TG_RUN_USER": ME,
-        "TG_AGENTS_BASE": str(tmp_path / "agents"),
-        "TG_BRAINS_BASE": str(tmp_path / "brains"),
-        "TG_RUNTIME": str(REPO),
-        "TG_API_BASE": api,
-        "UNPACKER_SUDOERS_DIR": str(tmp_path / "sudoers.d"),
-    }
+_deploy_env = deploy_env
 
 
 def _deploy_args(brain: Path, name: str, *rest: str) -> list[str]:
-    return [
-        "--surface",
-        "tg",
-        "--name",
-        name,
-        "--token",
-        "123456:AAbbCC-dd_ee",
-        "--users",
-        "111",
-        "--brain",
-        str(brain),
-        "--dry-run",
-        *rest,
-    ]
+    return deploy_args(brain.parent, name, "--dry-run", *rest, brain=brain)
 
 
 def test_deploy_role_unpacker_plans_rights_steps(tmp_path, brain, api_base):
