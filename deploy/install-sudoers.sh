@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-RUNTIME="${TG_RUNTIME:-/opt/unpacker}"
+# RUNTIME пришёл из _common.sh (env → /etc/unpacker/engine.conf → /opt/unpacker) — Р2.
 SUDOERS_DIR="${UNPACKER_SUDOERS_DIR:-/etc/sudoers.d}"
 SUDOERS_NAME="${UNPACKER_SUDOERS_NAME:-unpacker}"
 TARGET="$SUDOERS_DIR/$SUDOERS_NAME"
@@ -118,7 +118,7 @@ fi
 if [ "$DRY_RUN" = "true" ]; then
   echo "[dry-run] поставил бы $TARGET (mode 0440, владелец root) со whitelist на:"
   echo "[dry-run]   $RUNTIME/deploy/deploy.sh · $RUNTIME/update.sh · $RUNTIME/deploy/agentctl.sh"
-  echo "[dry-run]   systemctl start|stop|restart|status agent-tg@*"
+  echo "[dry-run]   systemctl start|stop|restart|status $(unit_template | sed 's/\.service$/*/')"
   exit 0
 fi
 

@@ -19,11 +19,14 @@ import pytest
 from engine.tests.conftest import (
     ME,
     REPO,
+    SYSTEMCTL_STUB,
     UV,
+    deploy_args,
     deploy_env,
     make_brain,
     run_agentctl,
     run_deploy,
+    stub_bin,
 )
 
 # ── репо-гигиена: шаблоны обязаны ехать ученику вместе с репо ────────────────
@@ -583,3 +586,211 @@ def test_unit_kill_mode_mixed_and_path_and_entrypoint():
     assert "Environment=PATH=" in service, "иначе SDK не найдёт claude на systemd-PATH"
     assert "python -m engine" in service
     assert "WantedBy=multi-user.target" in "\n".join(sec.get("[Install]", []))
+
+
+# ── Р2: машинный конфиг /etc/unpacker/engine.conf — одна вселенная путей ─────
+# Корень ADV-05/06/09 и C14: личность и базы выводились из окружения ВЫЗЫВАЮЩЕГО
+# (`SUDO_USER` → `id -un`), поэтому «та же» команда, запущенная иначе, читала другую
+# вселенную путей и тихо рапортовала успех (`doctor` → NOT DEPLOYED про живого бота).
+
+
+def _engine_conf(tmp_path: Path, **keys: str) -> Path:
+    conf = tmp_path / "engine.conf"
+    conf.write_text(
+        "# машинный конфиг движка (пишет install.sh)\n"
+        + "".join(f"{k}={v}\n" for k, v in keys.items()),
+        encoding="utf-8",
+    )
+    return conf
+
+
+def _clean_env(conf: Path) -> dict[str, str]:
+    """Окружение БЕЗ TG_*: единственный источник путей — engine.conf (как у cron/ручного root)."""
+    return {
+        "UNPACKER_ENGINE_CONF": str(conf),
+        "TG_RUN_USER": "",
+        "TG_AGENTS_BASE": "",
+        "TG_BRAINS_BASE": "",
+        "TG_RUNTIME": "",
+        "TG_UV_BIN": "",
+    }
+
+
+def test_doctor_finds_live_bot_through_engine_conf(tmp_path):
+    """C14/ADV-05: doctor без TG_*-окружения обязан найти инстанс через engine.conf."""
+    base = _fixture_instance(tmp_path, "alive", health_status="ok")
+    conf = _engine_conf(tmp_path, TG_RUN_USER=ME, TG_AGENTS_BASE=str(base))
+    r = run_agentctl("doctor", "alive", env_extra=_clean_env(conf))
+    out = r.stdout + r.stderr
+    assert "NOT DEPLOYED" not in out, f"живой инстанс объявлен неразвёрнутым:\n{out}"
+    assert str(base) in out, "doctor должен показывать базу из engine.conf"
+
+
+def test_agentctl_list_uses_engine_conf_base(tmp_path):
+    base = _fixture_instance(tmp_path, "confbot", health_status="ok")
+    conf = _engine_conf(tmp_path, TG_RUN_USER=ME, TG_AGENTS_BASE=str(base))
+    r = run_agentctl("list", env_extra=_clean_env(conf))
+    assert r.returncode == 0, r.stderr
+    assert "confbot" in r.stdout
+
+
+def test_engine_conf_is_parsed_not_sourced(tmp_path):
+    """Конфиг ПАРСИТСЯ построчно, а не сорсится: `source` — тот же класс дыр, что SEC-2.
+
+    Файл лежит в root-каталоге, но привычка сорсить конфиги и есть корень SEC-1/SEC-2.
+    """
+    marker = tmp_path / "pwned-conf"
+    base = _fixture_instance(tmp_path, "parsed", health_status="ok")
+    conf = tmp_path / "engine.conf"
+    conf.write_text(
+        f"TG_RUN_USER={ME}\n"
+        f"TG_AGENTS_BASE={base}\n"
+        f"EVIL=$(touch {marker})\n"
+        f"TG_RUNTIME=/opt/unpacker; touch {marker}\n"
+        f'PATH=/nonexistent\nexport EVIL2="$(touch {marker})"\n',
+        encoding="utf-8",
+    )
+    r = run_agentctl("doctor", "parsed", env_extra=_clean_env(conf))
+    out = r.stdout + r.stderr
+    assert not marker.exists(), f"конфиг исполнился как код:\n{out}"
+    assert "NOT DEPLOYED" not in out, out
+
+
+def test_env_wins_over_engine_conf(tmp_path):
+    """Приоритет: env → engine.conf → фолбэк. Иначе TG_AGENTS_BASE в тестах ничего не значит."""
+    real = _fixture_instance(tmp_path, "envwin", health_status="ok")
+    conf = _engine_conf(tmp_path, TG_RUN_USER=ME, TG_AGENTS_BASE=str(tmp_path / "wrong"))
+    env = _clean_env(conf)
+    env["TG_AGENTS_BASE"] = str(real)
+    r = run_agentctl("doctor", "envwin", env_extra=env)
+    assert "NOT DEPLOYED" not in (r.stdout + r.stderr), r.stdout + r.stderr
+    assert str(real) in r.stdout
+
+
+# ── SEC-8/Р3: uv не резолвится через login-шелл и валидируется до подстановки ─
+
+
+def test_common_never_resolves_uv_through_login_shell():
+    """SEC-8: `sudo -u run-user bash -lc 'command -v uv'` — неверная граница доверия.
+
+    Значение из окружения агента подставлялось sed'ом в root-устанавливаемый юнит.
+    uv ставится системно (Р3), путь приходит из engine.conf или фиксированного места.
+    """
+    code = "\n".join(
+        ln
+        for ln in (REPO / "deploy" / "_common.sh").read_text().splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    )
+    assert "-lc" not in code, "login-шелл run-user'а как источник путей запрещён (SEC-8)"
+
+
+def test_deploy_refuses_uv_bin_with_metachars(tmp_path, api_base):
+    """Значение UV_BIN втекает в юнит через sed → метасимволы отвергаются ДО подстановки."""
+    marker = tmp_path / "pwned-uv"
+    env = deploy_env(tmp_path, api_base)
+    env["TG_UV_BIN"] = f"/usr/bin/uv$(touch {marker})"
+    r = run_deploy(
+        "--surface",
+        "tg",
+        "--name",
+        "uvbad",
+        "--token",
+        "123456:AAbbCC-dd_ee",
+        "--users",
+        "111",
+        "--brain",
+        str(make_brain(tmp_path)),
+        "--dry-run",
+        env_extra=env,
+    )
+    # именно 2 (плохие входные данные), а не 3 из preflight: путь обязан быть отвергнут
+    # валидацией ДО того, как его подставят в юнит или запустят
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert not marker.exists()
+    assert "uv" in (r.stdout + r.stderr).lower()
+    assert "символ" in (r.stdout + r.stderr).lower()
+
+
+def test_deploy_takes_uv_from_engine_conf(tmp_path, api_base):
+    """Р2/Р3: путь до uv приходит машинным конфигом, а не догадкой про PATH юзера."""
+    fake_uv = tmp_path / "bin" / "uv"
+    fake_uv.parent.mkdir(parents=True, exist_ok=True)
+    fake_uv.write_text("#!/usr/bin/env bash\necho 'uv 0.0.0-stub'\n", encoding="utf-8")
+    fake_uv.chmod(0o755)
+    conf = _engine_conf(
+        tmp_path,
+        TG_RUN_USER=ME,
+        TG_AGENTS_BASE=str(tmp_path / "agents"),
+        TG_BRAINS_BASE=str(tmp_path / "brains"),
+        TG_RUNTIME=str(REPO),
+        TG_UV_BIN=str(fake_uv),
+    )
+    env = _clean_env(conf)
+    env["TG_API_BASE"] = api_base
+    r = run_deploy(
+        "--surface",
+        "tg",
+        "--name",
+        "uvconf",
+        "--token",
+        "123456:AAbbCC-dd_ee",
+        "--users",
+        "111",
+        "--brain",
+        str(make_brain(tmp_path)),
+        "--dry-run",
+        env_extra=env,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert str(fake_uv) in r.stdout, "в плане должен стоять uv из engine.conf"
+
+
+# ── M-17: имя юнита — один источник (_common.sh), а не шесть литералов ────────
+
+
+def test_unit_name_has_single_source():
+    common = (REPO / "deploy" / "_common.sh").read_text()
+    assert "agent-tg@" in common, "_common.sh обязан отдавать имя юнита (M-17)"
+    for rel in ("deploy/deploy.sh", "deploy/agentctl.sh"):
+        body = (REPO / rel).read_text()
+        code = "\n".join(
+            ln for ln in body.splitlines() if not ln.lstrip().startswith("#") and ln.strip()
+        )
+        assert "agent-tg@" not in code, (
+            f"{rel}: имя юнита зашито литералом — при переименовании разъедется (M-17)"
+        )
+
+
+# ── H6: тесты не мутируют хост — юнит/drop-in/systemctl переопределяемы ──────
+# На объявленном CI (ubuntu-latest, passwordless sudo) деплой-тесты уходили в systemd-ветку
+# и ставили юнит в /etc/systemd/system + `enable --now`. Пути были захардкожены.
+
+
+def test_deploy_installs_unit_into_overridable_dir(tmp_path, api_base, isolated_runtime):
+    """TG_UNIT_DIR/TG_SYSTEMCTL: юнит ложится в тестовый каталог, systemctl — заглушка."""
+    log = tmp_path / "systemctl.log"
+    sysctl = stub_bin(tmp_path, "systemctl", SYSTEMCTL_STUB)
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    env["TG_SYSTEMCTL"] = str(sysctl)
+    env["SYSTEMCTL_LOG"] = str(log)
+    r = run_deploy(*deploy_args(tmp_path, "unitdir"), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    unit = tmp_path / "systemd" / "agent-tg@.service"
+    assert unit.exists(), "юнит должен лечь в TG_UNIT_DIR, а не в /etc/systemd/system"
+    assert log.exists(), "systemctl должен вызываться через TG_SYSTEMCTL (заглушку)"
+    calls = log.read_text()
+    assert "daemon-reload" in calls
+    assert "enable --now agent-tg@unitdir" in calls
+
+
+def test_deploy_dropin_goes_into_overridable_dir(tmp_path, api_base, isolated_runtime):
+    log = tmp_path / "systemctl.log"
+    sysctl = stub_bin(tmp_path, "systemctl", SYSTEMCTL_STUB)
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    env["TG_SYSTEMCTL"] = str(sysctl)
+    env["SYSTEMCTL_LOG"] = str(log)
+    env["UNPACKER_DEV_OWNER_OK"] = "1"  # дерево движка принадлежит тест-юзеру (dev-режим)
+    r = run_deploy(*deploy_args(tmp_path, "dropin", "--role", "unpacker"), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    dropin = tmp_path / "systemd" / "agent-tg@dropin.service.d" / "10-unpacker.conf"
+    assert dropin.exists(), "drop-in должен лечь в TG_DROPIN_DIR"

@@ -134,12 +134,40 @@ for lim in "$LIMIT_RPD" "$LIMIT_TPD"; do
     || { echo "лимит '$lim': нужно целое > 0 (--limit-requests-per-day / --limit-tokens-per-day)" >&2; exit 2; }
 done
 
-RUNTIME="${TG_RUNTIME:-/opt/unpacker}"
+# RUNTIME/AGENTS_BASE/BRAINS_BASE/VENV_PATH уже выставил resolve_run_identity (Р2:
+# env → /etc/unpacker/engine.conf → фолбэк) — здесь их больше не переопределяем.
 RUNTIME_URL="${TG_RUNTIME_URL:-}"
 resolve_uv_bin
+# SEC-8: путь до uv втекает sed'ом в root-устанавливаемый юнит → валидируем ДО подстановки.
+validate_uv_bin || { echo "--> проверь TG_UV_BIN / TG_UV_BIN в /etc/unpacker/engine.conf" >&2; exit 2; }
 INST="$AGENTS_BASE/$NAME"
 BRAIN="$BRAINS_BASE/$NAME"
+UNIT="$(unit_name "$NAME")"            # M-17: имя юнита — из _common.sh, не литералом
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+
+# Куда ставим юнит/drop-in и чем зовём systemctl. Переопределяемо (H6): иначе тесты на
+# Linux с passwordless sudo ставили бы юниты в /etc/systemd/system живой машины и делали
+# `enable --now`. На боевом VPS значения по умолчанию — те самые системные.
+UNIT_BASE="${TG_UNIT_DIR:-/etc/systemd/system}"
+DROPIN_BASE="${TG_DROPIN_DIR:-/etc/systemd/system}"
+SYSTEMCTL="${TG_SYSTEMCTL:-systemctl}"
+
+# systemctl может быть и заглушкой по абсолютному пути (TG_SYSTEMCTL) — тогда `command -v`
+# по имени его не найдёт; проверяем именно то, чем будем звать.
+have_systemctl() { command -v "$SYSTEMCTL" >/dev/null 2>&1; }
+# systemctl подменён (TG_SYSTEMCTL) — это dev/тестовый стенд, sudo там не нужен и в
+# неинтерактивной сессии он бы просто попросил пароль и повесил прогон.
+SYSTEMCTL_SUDO="$SUDO"; [ -z "${TG_SYSTEMCTL:-}" ] || SYSTEMCTL_SUDO=""
+
+# ensure_dir/install_root: каталог юнита и drop-in на VPS принадлежит root, а на стенде
+# (TG_UNIT_DIR в tmp) — нам. sudo зовём только когда без него нельзя.
+ensure_dir()   { [ -d "$1" ] || mkdir -p "$1" 2>/dev/null || $SUDO mkdir -p "$1"; }
+install_root() {  # install_root <mode> <src> <dst>
+  local dir; dir="$(dirname "$3")"
+  ensure_dir "$dir"
+  if [ -w "$dir" ]; then install -m "$1" "$2" "$3"
+  else $SUDO install -m "$1" -o root -g root "$2" "$3"; fi
+}
 
 run()        { if [ "$DRY_RUN" = "true" ]; then echo "[dry-run] $*"; else "$@"; fi; }
 # asuser: команда-СТРОКА как RUN_USER (для фикс-команд с валидированными путями).
@@ -267,7 +295,7 @@ gates() {
     cur="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$INST/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
     if [ -n "$cur" ] && [ "$cur" != "$TOKEN" ]; then
       gate_fail "имя '$NAME' уже занято ДРУГИМ ботом (в $INST/.env другой токен).
-      Возьми другое --name либо снеси инстанс осознанно: systemctl disable --now agent-tg@$NAME && rm -rf $INST"
+      Возьми другое --name либо снеси инстанс осознанно: systemctl disable --now $UNIT && rm -rf $INST"
     fi
     echo "  ✓ имя '$NAME': это повторный деплой того же бота (идемпотентно)"
   else
@@ -340,7 +368,7 @@ preflight() {
     echo "      durable: 'claude setup-token' (Max/Pro) под $RUN_USER, потом --cc-token <TOKEN>."; warns=$((warns+1))
   fi
 
-  if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+  if have_systemctl && [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
     echo "  ! не root и нет passwordless sudo — шаг systemd попросит пароль (похоже на зависание)."; warns=$((warns+1))
   fi
 
@@ -401,7 +429,7 @@ if [ -f "$INST/.env" ]; then
       printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$CC_TOKEN" >> "$TMP_ENV"
       install -m 600 "$TMP_ENV" "$INST/.env"; rm -f "$TMP_ENV"
       [ "$RUN_USER" = "$(id -un)" ] || $SUDO chown "$RUN_USER" "$INST/.env"
-      echo "    cc-token ротирован — рестартни: $SUDO systemctl restart agent-tg@$NAME"
+      echo "    cc-token ротирован — рестартни: $SUDO $SYSTEMCTL restart $UNIT"
     fi
   fi
 else
@@ -471,14 +499,13 @@ fi
 # конкретного инстанса, базовый agent-tg@.service остаётся под NoNewPrivileges=true.
 if [ "$ROLE" = "unpacker" ]; then
   echo "==> Распаковщик: модель прав §7.5 (drop-in юнита + sudoers-whitelist)"
-  if command -v systemctl >/dev/null 2>&1; then
-    DROPIN_DIR="/etc/systemd/system/agent-tg@$NAME.service.d"
+  if have_systemctl; then
+    DROPIN_DIR="$DROPIN_BASE/$UNIT.service.d"
     if [ "$DRY_RUN" = "true" ]; then
       echo "[dry-run] поставил бы drop-in $DROPIN_DIR/10-unpacker.conf (NoNewPrivileges=no, остальной hardening)"
     else
-      $SUDO mkdir -p "$DROPIN_DIR"
       # daemon-reload не зову: шаг 5 ниже всё равно его делает перед enable --now
-      $SUDO install -m 644 "$HERE/templates/unpacker-dropin.conf" "$DROPIN_DIR/10-unpacker.conf"
+      install_root 644 "$HERE/templates/unpacker-dropin.conf" "$DROPIN_DIR/10-unpacker.conf"
       echo "    drop-in установлен: $DROPIN_DIR/10-unpacker.conf"
     fi
   else
@@ -497,12 +524,12 @@ if [ "$ROLE" = "unpacker" ]; then
 fi
 
 # ── 5. systemd templated unit + autostart ───────────────────────────────────
-if ! command -v systemctl >/dev/null 2>&1; then
+if ! have_systemctl; then
   echo "warn: systemctl не найден — пропускаю установку юнита (dev-хост, напр. macOS)."
-  echo "      На VPS этот шаг поставит agent-tg@$NAME.service и enable --now."
+  echo "      На VPS этот шаг поставит $UNIT.service и enable --now."
 else
-  UNIT_SRC="$HERE/templates/agent-tg@.service"
-  UNIT_DST="/etc/systemd/system/agent-tg@.service"
+  UNIT_SRC="$HERE/templates/$(unit_template)"
+  UNIT_DST="$UNIT_BASE/$(unit_template)"
   if [ -f "$UNIT_SRC" ]; then
     TMP_UNIT="$(mktemp)"
     # Истинный шаблон: пер-агентные пути через %i. Подставляем только ХОСТ-глобальные значения.
@@ -514,13 +541,13 @@ else
         -e "s|REPLACE_WITH_RUN_HOME|$RUN_HOME|g" \
         "$UNIT_SRC" > "$TMP_UNIT"
     if [ "$DRY_RUN" = "true" ]; then
-      echo "[dry-run] поставил бы $UNIT_DST и: $SUDO systemctl enable --now agent-tg@$NAME"
+      echo "[dry-run] поставил бы $UNIT_DST и: $SUDO $SYSTEMCTL enable --now $UNIT"
       rm -f "$TMP_UNIT"
     else
-      $SUDO install -m 644 "$TMP_UNIT" "$UNIT_DST"; rm -f "$TMP_UNIT"
-      $SUDO systemctl daemon-reload
-      $SUDO systemctl enable --now "agent-tg@$NAME"
-      echo "    systemd: agent-tg@$NAME enabled + started"
+      install_root 644 "$TMP_UNIT" "$UNIT_DST"; rm -f "$TMP_UNIT"
+      $SYSTEMCTL_SUDO "$SYSTEMCTL" daemon-reload
+      $SYSTEMCTL_SUDO "$SYSTEMCTL" enable --now "$UNIT"
+      echo "    systemd: $UNIT enabled + started"
     fi
   else
     echo "warn: шаблон юнита не найден: $UNIT_SRC"

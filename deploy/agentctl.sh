@@ -22,7 +22,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/_common.sh"
 resolve_run_identity
 
-_unit() { printf 'agent-tg@%s' "$1"; }
+# Имя юнита — из _common.sh (M-17: один источник вместо литерала в шести файлах).
+_unit() { unit_name "$1"; }
 
 # Валидация имени: тот же slug, что в deploy.sh — иначе `status ../../etc` читал бы чужие пути
 # (path-traversal на чтение через stat/grep).
@@ -156,7 +157,7 @@ cmd_doctor() {
   case "$svc" in
     active) echo "  ✓ systemd: active" ;;
     absent) echo "  ✗ systemd юнит absent  → deploy.sh ставит+enable (нужен root/sudo)"; issues=$((issues+1)) ;;
-    *)      echo "  ! systemd: $svc  → $([ "$(id -u)" -ne 0 ] && echo 'sudo ')systemctl status agent-tg@$name"; issues=$((issues+1)) ;;
+    *)      echo "  ! systemd: $svc  → $([ "$(id -u)" -ne 0 ] && echo 'sudo ')systemctl status $(_unit "$name")"; issues=$((issues+1)) ;;
   esac
 
   local resume; resume="$(_resume_db "$name")"
