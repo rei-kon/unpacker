@@ -7,6 +7,8 @@ from typing import Annotated
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from engine.core.uploads import MAX_UPLOAD_BYTES
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -40,10 +42,33 @@ class Settings(BaseSettings):
     # Простой клиента до idle-evict (§5.1) — сек; освобождает RAM в тишине.
     idle_timeout: float = 1800.0
 
+    # Косметика §6.1/§9 — всё включено по умолчанию, выключается флагом в .env.
+    # Пути относительны инстанс-каталогу (WorkingDirectory юнита), как db_path/health_path.
+    buttons_enabled: bool = True
+    buttons_path: str = "buttons.yaml"
+    uploads_enabled: bool = True
+    uploads_dir: str = "state/uploads"
+    # Потолок на приём файла. Больше предела Bot API поднять нельзя (валидатор ниже):
+    # движок обещал бы то, чего Telegram не даст, — тихий отказ вместо честного сообщения.
+    max_upload_bytes: int = MAX_UPLOAD_BYTES
+    send_file_enabled: bool = True
+
     @property
     def owner_user_id(self) -> int | None:
         """Владелец = первый из allow-list (кому шлём health-алерты §5.4)."""
         return self.allowed_user_ids[0] if self.allowed_user_ids else None
+
+    @field_validator("max_upload_bytes", mode="after")
+    @classmethod
+    def _cap_upload_limit(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("MAX_UPLOAD_BYTES должен быть положительным")
+        if v > MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"MAX_UPLOAD_BYTES выше предела Bot API ({MAX_UPLOAD_BYTES} байт ≈ 20 МБ): "
+                "Telegram всё равно не отдаст боту файл больше — обещать нельзя"
+            )
+        return v
 
     @field_validator("allowed_user_ids", mode="before")
     @classmethod

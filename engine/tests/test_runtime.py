@@ -53,3 +53,29 @@ def test_options_builder_omits_empty(tmp_path):
     build = _options_builder(settings)
     opts = build(cwd="/b", resume=None, model=None)
     assert opts.resume is None
+
+
+# ── проводка косметики Фазы 1b (§6.1) ────────────────────────────────────────
+
+
+def test_cosmetics_wired_on_by_default(tmp_path):
+    bot = build_bot(_settings(tmp_path))
+    assert bot._buttons is not None and bot._buttons.enabled
+    assert bot._intake is not None
+    assert bot._send_file_enabled is True
+    assert bot._state_dir is not None, "без state/ песочница SEND_FILE не знает второй корень"
+
+
+def test_flags_switch_cosmetics_off(tmp_path):
+    bot = build_bot(
+        _settings(tmp_path, buttons_enabled=False, uploads_enabled=False, send_file_enabled=False)
+    )
+    assert bot._buttons is not None and not bot._buttons.enabled
+    assert bot._intake is None, "выключенный приём файлов не должен существовать как объект"
+    assert bot._send_file_enabled is False
+
+
+def test_uploads_root_follows_config(tmp_path):
+    bot = build_bot(_settings(tmp_path, uploads_dir=str(tmp_path / "custom" / "up")))
+    assert bot._intake is not None
+    assert bot._intake._uploads.root == tmp_path / "custom" / "up"

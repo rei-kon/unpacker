@@ -47,11 +47,36 @@ class SessionRouter:
         on_event: Any = None,
     ) -> Any:
         """Обработать сообщение: резолвить/создать сессию окна и передать в core.ask."""
+        sid = self.ensure_session(chat_id=chat_id, thread_id=thread_id, user_id=user_id)
+        return await self._core.ask(sid, text, on_event)
+
+    def ensure_session(self, *, chat_id: int, thread_id: int | None, user_id: int) -> str:
+        """Вернуть сессию окна, создав её при необходимости.
+
+        Отдельно от on_message, потому что приём файла (§5.5) должен знать session_id ДО
+        отправки промпта: файл кладётся в `state/uploads/<session_id>/`, и каталог не из чего
+        назвать, пока сессии нет. Бросает NoProjectError — как и on_message, ловит хендлер.
+        """
         sk = self.surface_key(chat_id, thread_id)
         sid = self._store.bindings.resolve(SURFACE, sk)
         if sid is None:
             sid = self._open_session(user_id, sk, self._default_project_slug())
-        return await self._core.ask(sid, text, on_event)
+        return sid
+
+    def brain_path(self, chat_id: int, thread_id: int | None) -> str | None:
+        """Папка-мозг текущей сессии окна — корень песочницы `[SEND_FILE:]` (§8.2).
+
+        Нет сессии/проекта → None: вызывающий останется с пустой песочницей и не отдаст
+        ничего (fail-closed), вместо «возьму какой-нибудь мозг».
+        """
+        sid = self._store.bindings.resolve(SURFACE, self.surface_key(chat_id, thread_id))
+        if sid is None:
+            return None
+        session = self._store.sessions.get(sid)
+        if session is None:
+            return None
+        project = self._store.projects.get(session.project_slug)
+        return project.brain_path if project is not None else None
 
     # ── команды ──────────────────────────────────────────────────────────────
 

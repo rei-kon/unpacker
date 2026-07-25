@@ -189,6 +189,56 @@ async def test_switch_orphans_old_session_to_stopped(router, store):
     assert store.sessions.get(old_sid).status == "stopped"
 
 
+# ── опоры для кнопок и файлов (Фаза 1b/1) ───────────────────────────────────
+
+
+async def test_ensure_session_creates_before_first_message(router, store):
+    """Файл нужно положить в uploads/<session_id>/ ДО того, как уйдёт промпт (§5.5).
+
+    Значит сессия обязана существовать раньше ask — иначе имя каталога взять негде.
+    """
+    sid = router.ensure_session(chat_id=100, thread_id=7, user_id=111)
+    assert sid == store.bindings.resolve("tg", "100:7")
+    assert store.sessions.get(sid).project_slug == "office"
+
+
+async def test_ensure_session_reuses_existing(router):
+    first = router.ensure_session(chat_id=100, thread_id=7, user_id=111)
+    assert router.ensure_session(chat_id=100, thread_id=7, user_id=111) == first
+
+
+async def test_ensure_session_then_message_same_session(router):
+    """Загруженный файл и промпт про него должны попасть в ОДНУ сессию."""
+    sid = router.ensure_session(chat_id=100, thread_id=7, user_id=111)
+    await router.on_message(chat_id=100, thread_id=7, user_id=111, text="что в файле?")
+    assert router._core.asks == [(sid, "что в файле?")]
+
+
+def test_ensure_session_raises_without_project(tmp_path):
+    empty = Store(str(tmp_path / "empty.db"))
+    r = SessionRouter(store=empty, core=FakeCore(), default_project_slug=None)
+    with pytest.raises(NoProjectError):
+        r.ensure_session(chat_id=1, thread_id=0, user_id=111)
+    empty.close()
+
+
+async def test_brain_path_of_window(router):
+    """Корень песочницы SEND_FILE — мозг ИМЕННО этой сессии (§8.2), не «какой-нибудь»."""
+    await router.on_message(chat_id=100, thread_id=7, user_id=111, text="привет")
+    assert router.brain_path(chat_id=100, thread_id=7) == "/b/office"
+
+
+async def test_brain_path_follows_project_switch(router):
+    await router.on_message(chat_id=100, thread_id=7, user_id=111, text="привет")
+    await router.switch_project(chat_id=100, thread_id=7, user_id=111, slug="sales")
+    assert router.brain_path(chat_id=100, thread_id=7) == "/b/sales"
+
+
+def test_brain_path_none_without_session(router):
+    # нет сессии → нет корня → песочница пустая → не отдаём ничего (fail-closed)
+    assert router.brain_path(chat_id=100, thread_id=7) is None
+
+
 async def test_binding_survives_store_reopen(tmp_path):
     """Критерий 1a «переживает рестарт»: тот же surface_key после reopen резолвит ту же сессию."""
     path = str(tmp_path / "state.db")

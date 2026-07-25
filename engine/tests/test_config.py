@@ -88,3 +88,59 @@ def test_response_timeout_override(monkeypatch):
         monkeypatch.setenv(k, v)
     s = _settings()
     assert s.response_timeout == 900.0
+
+
+# ── флаги косметики Фазы 1b (§6.1: включено по умолчанию, выключается флагом) ──
+
+
+def test_cosmetics_enabled_by_default(monkeypatch):
+    for k, v in _base_env().items():
+        monkeypatch.setenv(k, v)
+    s = _settings()
+    assert s.buttons_enabled is True
+    assert s.uploads_enabled is True
+    assert s.send_file_enabled is True
+
+
+def test_cosmetics_paths_match_deploy_layout(monkeypatch):
+    # deploy.sh кладёт buttons.yaml в корень инстанса и создаёт state/uploads
+    for k, v in _base_env().items():
+        monkeypatch.setenv(k, v)
+    s = _settings()
+    assert s.buttons_path == "buttons.yaml"
+    assert s.uploads_dir == "state/uploads"
+
+
+def test_buttons_can_be_switched_off(monkeypatch):
+    for k, v in _base_env(BUTTONS_ENABLED="false").items():
+        monkeypatch.setenv(k, v)
+    assert _settings().buttons_enabled is False
+
+
+def test_uploads_can_be_switched_off(monkeypatch):
+    for k, v in _base_env(UPLOADS_ENABLED="0").items():
+        monkeypatch.setenv(k, v)
+    assert _settings().uploads_enabled is False
+
+
+def test_send_file_can_be_switched_off(monkeypatch):
+    for k, v in _base_env(SEND_FILE_ENABLED="no").items():
+        monkeypatch.setenv(k, v)
+    assert _settings().send_file_enabled is False
+
+
+def test_upload_limit_defaults_to_bot_api_cap(monkeypatch):
+    from engine.core.uploads import MAX_UPLOAD_BYTES
+
+    for k, v in _base_env().items():
+        monkeypatch.setenv(k, v)
+    assert _settings().max_upload_bytes == MAX_UPLOAD_BYTES
+
+
+def test_upload_limit_cannot_exceed_bot_api_cap(monkeypatch):
+    """Поднять лимит выше предела Bot API нельзя — это была бы ложь пользователю:
+    движок обещает принять 100 МБ, а Telegram всё равно не отдаст файл."""
+    for k, v in _base_env(MAX_UPLOAD_BYTES=str(200 * 1024 * 1024)).items():
+        monkeypatch.setenv(k, v)
+    with pytest.raises(ValidationError):
+        _settings()

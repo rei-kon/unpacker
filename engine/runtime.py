@@ -10,19 +10,23 @@ projects.brain_path/claude_session_id (C2b), здесь только базов�
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from aiogram import Bot
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+from engine.adapters.telegram.attach import AttachmentIntake
 from engine.adapters.telegram.bot import TelegramBot, make_owner_alert
 from engine.adapters.telegram.router import SessionRouter
 from engine.core.agent import AgentCore, detect_ram_bytes
+from engine.core.buttons import ButtonRegistry
 from engine.core.config import Settings
 from engine.core.health import HealthMarker
 from engine.core.pool import ClientPool, compute_pool_ceiling
 from engine.core.security import AllowList
 from engine.core.store import Store
+from engine.core.uploads import UploadStore
 
 
 def _make_client(options: Any) -> ClaudeSDKClient:
@@ -85,4 +89,33 @@ def build_bot(settings: Settings) -> TelegramBot:
         store=store, core=core, default_project_slug=settings.default_project_slug
     )
     allow = AllowList(settings.allowed_user_ids)
-    return TelegramBot(bot=bot, allow=allow, router=router, store=store, pool=pool)
+
+    # Косметика Фазы 1b (§6.1: включена по умолчанию, выключается флагом в .env).
+    # Кнопки: реестр создаём всегда и передаём флаг внутрь — так «выключено» и «в файле нет
+    # кнопок» остаются разными состояниями (первое убирает ряд целиком, второе оставляет
+    # системные кнопки). Приём файлов при выключенном флаге НЕ создаётся вовсе: нет объекта —
+    # нечего случайно позвать.
+    buttons = ButtonRegistry(settings.buttons_path, enabled=settings.buttons_enabled)
+    intake = None
+    if settings.uploads_enabled:
+        intake = AttachmentIntake(
+            bot=bot,
+            uploads=UploadStore(settings.uploads_dir),
+            max_bytes=settings.max_upload_bytes,
+        )
+    # Второй корень песочницы `[SEND_FILE:]` — state/ инстанса (там же uploads): принятый
+    # файл агент вправе вернуть. Берём каталог db_path, а не строку из конфига: так корень
+    # гарантированно тот же, в котором реально лежит состояние.
+    state_dir = Path(settings.db_path).resolve().parent
+
+    return TelegramBot(
+        bot=bot,
+        allow=allow,
+        router=router,
+        store=store,
+        pool=pool,
+        buttons=buttons,
+        intake=intake,
+        state_dir=state_dir,
+        send_file_enabled=settings.send_file_enabled,
+    )
