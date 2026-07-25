@@ -39,7 +39,7 @@ def run_deploy(*args: str, env_extra: dict[str, str] | None = None) -> subproces
 
 def _brain(tmp_path: Path) -> Path:
     b = tmp_path / "brainsrc"
-    b.mkdir()
+    b.mkdir(exist_ok=True)  # хелпер зовут дважды за тест (сам мозг + аргументы деплоя)
     (b / "CLAUDE.md").write_text("# Тест-мозг\n")
     return b
 
@@ -414,7 +414,7 @@ def _green(tmp_path: Path, api: str, runtime: str) -> dict[str, str]:
     return e
 
 
-def _real_args(tmp_path: Path, name: str, *rest: str) -> list[str]:
+def _real_args(tmp_path: Path, name: str, *rest: str, brain: Path | None = None) -> list[str]:
     return [
         "--surface",
         "tg",
@@ -425,7 +425,7 @@ def _real_args(tmp_path: Path, name: str, *rest: str) -> list[str]:
         "--users",
         "111",
         "--brain",
-        str(_brain(tmp_path)),
+        str(brain if brain is not None else _brain(tmp_path)),
         "--project-slug",
         name,
         *rest,
@@ -473,62 +473,61 @@ def test_env_api_contour_writes_key_and_limits(tmp_path, api_base, isolated_runt
 
 # ── мост «мозг → инстанс»: buttons.yaml (контракт со срезом С2) ──────────────
 
-BRAINKIT_STUB = '''"""Заглушка engine.brainkit для теста моста (реальный модуль — срез С2)."""
 
-import sys
-
-
-def main() -> int:
-    args = sys.argv[1:]
-    out = args[args.index("--out") + 1]
-    with open(out, "w", encoding="utf-8") as f:
-        f.write("buttons:\\n  - label: Статус\\n    prompt: Расскажи статус\\n")
-    print("экспортировал кнопки")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-'''
+def _brain_with_buttons(tmp_path: Path, label: str = "Создать КП") -> Path:
+    """Мозг с паспортом: проверяем сквозной контракт «кнопка из .brain.yaml доехала в инстанс»."""
+    b = _brain(tmp_path)
+    (b / ".brain.yaml").write_text(
+        f'name: "Тест-мозг"\nslug: testbrain\nbuttons:\n  - label: "{label}"\n'
+        '    prompt: "Собери КП по данным клиента"\n',
+        encoding="utf-8",
+    )
+    return b
 
 
 def test_buttons_bridge_warns_when_brainkit_absent(tmp_path, api_base, isolated_runtime):
-    """Модуля С2 ещё нет → предупреждение и продолжение, а не падение деплоя."""
-    assert not (Path(isolated_runtime) / "engine" / "brainkit.py").exists()
-    env = _green(tmp_path, api_base, isolated_runtime)
-    r = run_deploy(*_real_args(tmp_path, "nobuttons"), env_extra=env)
-    assert r.returncode == 0, r.stderr + r.stdout
-    out = _out(r)
-    assert "buttons" in out and ("brainkit" in out or "кнопк" in out)
-    assert not (Path(env["TG_AGENTS_BASE"]) / "nobuttons" / "buttons.yaml").exists()
+    """Модуля моста нет в движке → предупреждение и продолжение, а не падение деплоя.
+
+    Сценарий не гипотетический: у ученика на VPS движок обновляется git-тегами, и деплой не
+    имеет права падать целиком из-за отсутствующей необязательной части. Модуль прячем
+    переименованием (runtime у тестов общий на сессию — удалять его насовсем нельзя).
+    """
+    real = Path(isolated_runtime) / "engine" / "brainkit.py"
+    hidden = real.with_suffix(".py.hidden")
+    real.rename(hidden)
+    try:
+        env = _green(tmp_path, api_base, isolated_runtime)
+        r = run_deploy(*_real_args(tmp_path, "nobuttons"), env_extra=env)
+        assert r.returncode == 0, r.stderr + r.stdout
+        out = _out(r)
+        assert "buttons" in out and ("brainkit" in out or "кнопк" in out)
+        assert not (Path(env["TG_AGENTS_BASE"]) / "nobuttons" / "buttons.yaml").exists()
+    finally:
+        hidden.rename(real)
 
 
 def test_buttons_bridge_exports_when_brainkit_present(tmp_path, api_base, isolated_runtime):
-    """Есть модуль — deploy.sh дергает его CLI и кладёт buttons.yaml в инстанс."""
-    stub = Path(isolated_runtime) / "engine" / "brainkit.py"
-    stub.write_text(BRAINKIT_STUB, encoding="utf-8")
-    try:
-        env = _green(tmp_path, api_base, isolated_runtime)
-        r = run_deploy(*_real_args(tmp_path, "withbtn"), env_extra=env)
-        assert r.returncode == 0, r.stderr + r.stdout
-        btn = Path(env["TG_AGENTS_BASE"]) / "withbtn" / "buttons.yaml"
-        assert btn.exists(), "мост мозг→инстанс должен создать buttons.yaml"
-        assert "buttons:" in btn.read_text()
-    finally:
-        stub.unlink()
+    """Стык С2×С3 вживую: deploy.sh дергает настоящий CLI, кнопка мозга доезжает в инстанс."""
+    env = _green(tmp_path, api_base, isolated_runtime)
+    brain = _brain_with_buttons(tmp_path)
+    r = run_deploy(*_real_args(tmp_path, "withbtn", brain=brain), env_extra=env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    btn = Path(env["TG_AGENTS_BASE"]) / "withbtn" / "buttons.yaml"
+    assert btn.exists(), "мост мозг→инстанс должен создать buttons.yaml"
+    body = btn.read_text()
+    assert "buttons:" in body
+    assert "Создать КП" in body, "label из паспорта мозга должен доехать до инстанса"
 
 
 def test_buttons_bridge_does_not_overwrite_existing(tmp_path, api_base, isolated_runtime):
     """buttons.yaml инстанса правит владелец — синк мозга его НЕ перезатирает (§4)."""
-    stub = Path(isolated_runtime) / "engine" / "brainkit.py"
-    stub.write_text(BRAINKIT_STUB, encoding="utf-8")
-    try:
-        env = _green(tmp_path, api_base, isolated_runtime)
-        inst = Path(env["TG_AGENTS_BASE"]) / "keepbtn"
-        inst.mkdir(parents=True)
-        (inst / "buttons.yaml").write_text("buttons:\n  - label: Моя\n    prompt: моя\n")
-        r = run_deploy(*_real_args(tmp_path, "keepbtn"), env_extra=env)
-        assert r.returncode == 0, r.stderr + r.stdout
-        assert "Моя" in (inst / "buttons.yaml").read_text()
-    finally:
-        stub.unlink()
+    env = _green(tmp_path, api_base, isolated_runtime)
+    brain = _brain_with_buttons(tmp_path)
+    inst = Path(env["TG_AGENTS_BASE"]) / "keepbtn"
+    inst.mkdir(parents=True)
+    (inst / "buttons.yaml").write_text("buttons:\n  - label: Моя\n    prompt: моя\n")
+    r = run_deploy(*_real_args(tmp_path, "keepbtn", brain=brain), env_extra=env)
+    assert r.returncode == 0, r.stderr + r.stdout
+    kept = (inst / "buttons.yaml").read_text()
+    assert "Моя" in kept
+    assert "Создать КП" not in kept, "правки владельца не затираются кнопками мозга"
