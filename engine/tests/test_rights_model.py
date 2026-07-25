@@ -178,6 +178,30 @@ def test_installer_dry_run_writes_nothing(tmp_path):
     assert not (tmp_path / "sudoers.d" / "unpacker").exists()
 
 
+def test_installer_survives_run_user_absent_from_passwd(tmp_path):
+    """Linux-регрессия: run-user, которого ещё нет в passwd, не должен убивать скрипт молча.
+
+    `getent passwd <нет-такого>` отдаёт КОД 2, а не пустую строку. Резолвинг в _common.sh
+    делал `RUN_HOME="$(getent … | cut …)"` без страховки, и под `set -euo pipefail` (его
+    ставят все наши скрипты) это валило ЛЮБОЙ скрипт, который сорсит _common.sh: пустой
+    stdout, пустой stderr, код 2. Ученик видел ничего — ни строки о том, что сломалось.
+
+    На macOS баг не проявлялся вовсе: getent'а там нет, и ветка пропускалась целиком.
+    Поэтому проверяем именно то, что отличало баг, — что скрипт вообще ОТКРЫЛ РОТ.
+    """
+    rt = _fake_runtime(tmp_path)
+    # Юзер синтаксически валидный, но заведомо отсутствующий в passwd — ровно случай
+    # «install.sh ещё не создал юзера движка» и «ученик опечатался в TG_RUN_USER».
+    r = run_installer("--dry-run", env_extra=_inst_env(tmp_path, rt, run_user="ghostuser"))
+    combined = r.stdout + r.stderr
+    assert combined.strip(), (
+        "скрипт умер молча: ни stdout, ни stderr, код "
+        f"{r.returncode}. Это подпись getent-бага под pipefail"
+    )
+    assert r.returncode == 0, combined
+    assert "ghostuser" in combined, "резолвинг личности обязан дойти до печати run-user'а"
+
+
 def test_installer_renders_and_sets_0440(tmp_path):
     rt = _fake_runtime(tmp_path)
     r = run_installer(env_extra=_inst_env(tmp_path, rt))

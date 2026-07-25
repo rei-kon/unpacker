@@ -71,7 +71,13 @@ resolve_run_identity() {
   fi
   RUN_HOME=""
   if command -v getent >/dev/null 2>&1; then
-    RUN_HOME="$(getent passwd "$RUN_USER" 2>/dev/null | cut -d: -f6)"
+    # `|| true` здесь обязателен, а не косметика: `getent passwd <нет-такого-юзера>` отдаёт
+    # КОД 2 (а не пустую строку), и под `set -euo pipefail` — его ставят все наши скрипты —
+    # присваивание умирало вместе со скриптом. Наружу это выглядело так: код 2, пустой
+    # stdout, пустой stderr, ни слова о причине. Ловилось на любом Linux, где run-user'а
+    # ещё нет в passwd: install.sh до создания юзера движка, опечатка в TG_RUN_USER.
+    # На macOS баг был невидим — getent'а там нет, и ветка пропускалась целиком.
+    RUN_HOME="$(getent passwd "$RUN_USER" 2>/dev/null | cut -d: -f6 || true)"
   fi
   if [ -z "$RUN_HOME" ]; then
     if [ "$RUN_USER" = "$(id -un)" ]; then RUN_HOME="$HOME"; else RUN_HOME="/home/$RUN_USER"; fi
