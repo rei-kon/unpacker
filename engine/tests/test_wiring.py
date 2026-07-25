@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from aiogram.types import Chat, Message, Update, User, Voice
@@ -76,7 +76,7 @@ def _msg(**fields) -> Message:
     """Настоящий aiogram Message — не SimpleNamespace."""
     base = {
         "message_id": 1,
-        "date": datetime.now(tz=timezone.utc),
+        "date": datetime.now(tz=UTC),
         "chat": Chat(id=CHAT_ID, type="private"),
         "from_user": User(id=OWNER, is_bot=False, first_name="Никита"),
         "message_thread_id": THREAD_ID,
