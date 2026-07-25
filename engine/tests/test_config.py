@@ -5,6 +5,8 @@ _env_file=None во всех вызовах: тесты меряют ОКРУЖ�
 зелёным в CI, красным локально.
 """
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -108,7 +110,43 @@ def test_cosmetics_paths_match_deploy_layout(monkeypatch):
         monkeypatch.setenv(k, v)
     s = _settings()
     assert s.buttons_path == "buttons.yaml"
-    assert s.uploads_dir == "state/uploads"
+    assert s.uploads_path == Path("state/uploads")
+
+
+# ── STATE_DIR: явный корень состояния (K1/M-07/SEC-5/C17) ────────────────────
+
+
+def test_state_dir_defaults_to_state_subdir(monkeypatch):
+    """Корень состояния объявлен ЯВНО, а не выводится из db_path.
+
+    Раньше корень песочницы считался как parent(db_path); при дефолтном
+    `DB_PATH=state.db` им становился каталог инстанса — вместе с `.env`, в котором
+    лежат токен бота и токен подписки.
+    """
+    for k, v in _base_env().items():
+        monkeypatch.setenv(k, v)
+    assert _settings().state_dir == "state"
+
+
+def test_uploads_path_derives_from_state_dir(monkeypatch):
+    """UPLOADS_DIR не задан → uploads считаются от STATE_DIR (одна вселенная путей)."""
+    for k, v in _base_env(STATE_DIR="/srv/inst/state").items():
+        monkeypatch.setenv(k, v)
+    assert _settings().uploads_path == Path("/srv/inst/state/uploads")
+
+
+def test_uploads_dir_still_overrides_state_dir(monkeypatch):
+    """UPLOADS_DIR остаётся рабочей ручкой (контракт .env не ломаем)."""
+    for k, v in _base_env(STATE_DIR="/srv/inst/state", UPLOADS_DIR="/mnt/big/up").items():
+        monkeypatch.setenv(k, v)
+    assert _settings().uploads_path == Path("/mnt/big/up")
+
+
+def test_state_dir_does_not_follow_db_path(monkeypatch):
+    """Ключевая развязка K1: сдвинули БД в каталог инстанса — корень состояния не поехал."""
+    for k, v in _base_env(DB_PATH="state.db").items():
+        monkeypatch.setenv(k, v)
+    assert _settings().state_dir == "state"
 
 
 def test_buttons_can_be_switched_off(monkeypatch):

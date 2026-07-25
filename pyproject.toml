@@ -42,6 +42,17 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.11"
 files = ["engine"]
 ignore_missing_imports = true
+# K9: нестрогий mypy новый код уже успел этим воспользоваться (Any + getattr на
+# aiogram-типах, `Callable[..., Any]` вместо подписи). Включаем обе проверки на боевой код.
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+# Тесты не аннотируем: pytest-фикстуры и дублёры живут без подписей осознанно, а требовать
+# `-> None` на 500+ тестов — шум, который прячет настоящие находки в боевом коде.
+[[tool.mypy.overrides]]
+module = "engine.tests.*"
+disallow_untyped_defs = false
+check_untyped_defs = false
 
 [build-system]
 requires = ["hatchling"]

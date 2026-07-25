@@ -10,10 +10,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Protocol
 
 from engine.core.models import Surface
 from engine.core.store import Store
+
+logger = logging.getLogger("unpacker.engine")
 
 SURFACE: Surface = "tg"
 VALID_MODELS = ("opus", "sonnet", "haiku")
@@ -104,7 +107,12 @@ class SessionRouter:
         if sid is None:
             return "В этом топике пока нет активной сессии. Напиши что-нибудь или /projects."
         s = self._store.sessions.get(sid)
-        assert s is not None
+        if s is None:
+            # Явная ветка вместо `assert` (K19): assert как управляющий поток исчезает под
+            # `python -O` и в норме роняет хендлер. Состояние аварийное (биндинг смотрит в
+            # никуда) — но отвечаем словами, а не трейсбеком в лицо.
+            logger.warning("биндинг %s указывает на несуществующую сессию %s", sk, sid)
+            return "Сессия потерялась — напиши что-нибудь, начну новую."
         return (
             f"Проект: {s.project_slug}\n"
             f"Сессия: {s.id}\n"
@@ -113,11 +121,19 @@ class SessionRouter:
             f"Статус: {s.status}"
         )
 
-    async def stop(self, chat_id: int, thread_id: int | None) -> None:
+    async def stop(self, chat_id: int, thread_id: int | None) -> str:
+        """Прервать генерацию окна. Возвращает то, что честно сказать человеку.
+
+        Раньше метод возвращал None, а адаптер безусловно печатал «⏹ Прервал» — в свежем
+        окне это ложь: прерывать было нечего (M8). Ложное «прервал» дороже, чем кажется:
+        человек верит, что остановил работу, и пишет следующее сообщение поверх.
+        """
         sk = self.surface_key(chat_id, thread_id)
         sid = self._store.bindings.resolve(SURFACE, sk)
-        if sid is not None:
-            await self._core.interrupt(sid)
+        if sid is None:
+            return "Прерывать нечего — в этом топике нет активной сессии."
+        await self._core.interrupt(sid)
+        return "⏹ Прервал."
 
     def close(self, chat_id: int, thread_id: int | None) -> str:
         sk = self.surface_key(chat_id, thread_id)

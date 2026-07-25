@@ -29,9 +29,14 @@ def test_missing_file_is_empty(tmp_path):
     assert _reg(tmp_path, text=None).get() == []
 
 
-def test_disabled_flag_hides_buttons(tmp_path):
-    # флаг косметики в .env: кнопки выключаются целиком, файл при этом не читается
-    assert _reg(tmp_path, enabled=False).get() == []
+def test_registry_has_no_enabled_flag(tmp_path):
+    """K10: одна конвенция косметики — «выключено» = реестра нет вовсе.
+
+    Флаг внутри объекта был третьим механизмом на однотипный флаг (у intake — None,
+    у send_file — bool). Проверку «выключено убирает ряд целиком» держит test_runtime
+    (`bot._buttons is None`) и test_bot_attachments (пустая клавиатура).
+    """
+    assert not hasattr(_reg(tmp_path), "enabled")
 
 
 def test_reloads_after_edit(tmp_path):

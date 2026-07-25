@@ -6,12 +6,19 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
 ProjectStatus = Literal["active", "disabled"]
 SessionStatus = Literal["active", "stopped", "closed"]
 Surface = Literal["tg", "web"]
+
+# Один инвариант slug на весь движок (K17). Раньше паттерн был выписан дважды — в
+# store.ProjectStore и в brain.BrainPassport — и «тот же инвариант» держался на честном
+# слове: правка в одном месте молча расходилась с проверкой в другом.
+SLUG_PATTERN = r"^[a-z0-9-]+$"
+SLUG_RE = re.compile(SLUG_PATTERN)
 
 
 @dataclass(frozen=True)

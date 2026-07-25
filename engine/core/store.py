@@ -23,15 +23,14 @@
 
 from __future__ import annotations
 
-import re
 import sqlite3
 import threading
 import uuid
 from datetime import UTC, datetime
 
-from engine.core.models import Binding, Project, Session, Surface
+# паттерн slug — один на движок (K17): раньше он был выписан и здесь, и в brain.py
+from engine.core.models import SLUG_PATTERN, SLUG_RE, Binding, Project, Session, Surface
 
-_SLUG_RE = re.compile(r"^[a-z0-9-]+$")
 _BUSY_TIMEOUT_MS = 5000
 _SCHEMA_VERSION = 1
 _SESSION_STATUSES = ("active", "stopped", "closed")
@@ -130,8 +129,8 @@ class ProjectStore(_SubStore):
     def create(
         self, *, slug: str, name: str, brain_path: str, default_model: str | None = None
     ) -> Project:
-        if not _SLUG_RE.match(slug):
-            raise ValueError(f"slug должен быть ^[a-z0-9-]+$, получено: {slug!r}")
+        if not SLUG_RE.match(slug):
+            raise ValueError(f"slug должен быть {SLUG_PATTERN}, получено: {slug!r}")
         with self._lock:
             self._conn.execute(
                 "INSERT INTO projects (slug, name, brain_path, default_model, status) "

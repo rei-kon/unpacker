@@ -252,3 +252,19 @@ async def test_binding_survives_store_reopen(tmp_path):
     s2 = Store(path)  # рестарт процесса
     assert s2.bindings.resolve("tg", "100:7") == sid_before  # то же окно → та же сессия
     s2.close()
+
+
+# ── K19: assert не используется как управляющий поток ────────────────────────
+
+
+def test_status_survives_resolve_returning_a_gone_session(router, store, monkeypatch):
+    """`assert s is not None` в status_text ронял хендлер, а под `python -O` шёл дальше на None.
+
+    Сегодня `bindings.resolve` делает JOIN по sessions, поэтому «мёртвый» sid оттуда не
+    приходит — вот ЭТУ страховку тест и фиксирует. Убери JOIN (а он там ради фильтра
+    `status='active'`, то есть повод для правки найдётся) — и бот падал бы на /status.
+    Ответ обязан быть словами, а не AssertionError.
+    """
+    monkeypatch.setattr(store.bindings, "resolve", lambda surface, key: "нет-такой-сессии")
+    text = router.status_text(100, 7)
+    assert text.strip() and "Traceback" not in text

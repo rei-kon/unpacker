@@ -12,6 +12,7 @@ from engine.adapters.telegram.keyboard import (
     SystemAction,
     TriggerPress,
     build_keyboard,
+    button_digest,
     encode_trigger,
     parse_callback,
 )
@@ -74,15 +75,48 @@ def test_callback_data_fits_telegram_64_bytes():
         assert len(data.encode()) <= 64
 
 
-def test_encode_trigger_is_index_only():
-    assert encode_trigger(7) == f"{CB_TRIGGER_PREFIX}7"
+def test_encode_trigger_carries_index_and_digest():
+    """ADV-13: одного индекса мало. Индекс + короткий отпечаток (label|prompt), чтобы
+    кнопка из старого сообщения не выполнила ЧУЖОЙ промпт после правки buttons.yaml."""
+    data = encode_trigger(7, BUTTONS[0])
+    assert data.startswith(f"{CB_TRIGGER_PREFIX}7:")
+    assert data.split(":")[2] == button_digest(BUTTONS[0])
+
+
+def test_digest_changes_when_prompt_changes():
+    """Ровно тот сценарий ADV-13: ученик переписал buttons.yaml, индекс тот же."""
+    old = ButtonSpec(label="Отчёт", prompt="сделай отчёт за неделю")
+    new = ButtonSpec(label="Отчёт", prompt="удали всё лишнее из мозга")
+    assert button_digest(old) != button_digest(new)
+
+
+def test_digest_changes_when_label_changes():
+    a = ButtonSpec(label="Отчёт", prompt="одно и то же")
+    b = ButtonSpec(label="Отчёт недельный", prompt="одно и то же")
+    assert button_digest(a) != button_digest(b)
+
+
+def test_digest_is_stable_for_same_button():
+    assert button_digest(BUTTONS[0]) == button_digest(
+        ButtonSpec(label="Создать КП", prompt="собери КП по клиенту")
+    )
+
+
+def test_digest_is_short_enough_for_callback_limit():
+    # 64 байта на всё callback_data: «btn:<индекс>:<отпечаток>» должно влезать с запасом
+    assert len(button_digest(BUTTONS[0])) <= 12
 
 
 # ── разбор входящего callback: fail-closed ───────────────────────────────────
 
 
 def test_parse_trigger():
-    assert parse_callback("btn:3") == TriggerPress(index=3)
+    assert parse_callback("btn:3:abcdef12") == TriggerPress(index=3, digest="abcdef12")
+
+
+def test_parse_rejects_trigger_without_digest():
+    """Старая форма `btn:N` больше не принимается: именно она и выполняла чужой промпт."""
+    assert parse_callback("btn:3") is None
 
 
 def test_parse_system_actions():
@@ -108,10 +142,17 @@ def test_parse_rejects_unknown_system_action():
 
 def test_parse_rejects_malformed_index():
     assert parse_callback("btn:") is None
-    assert parse_callback("btn:1x") is None
-    assert parse_callback("btn:-1") is None
-    assert parse_callback("btn:1.5") is None
-    assert parse_callback("btn:٣") is None  # арабо-индийская цифра: isdigit() бы прошла
+    assert parse_callback("btn:1x:abcdef12") is None
+    assert parse_callback("btn:-1:abcdef12") is None
+    assert parse_callback("btn:1.5:abcdef12") is None
+    # арабо-индийская цифра: isdigit() бы прошла
+    assert parse_callback("btn:٣:abcdef12") is None
+
+
+def test_parse_rejects_malformed_digest():
+    assert parse_callback("btn:1:") is None
+    assert parse_callback("btn:1:НЕ-ХЕКС") is None
+    assert parse_callback("btn:1:abcdef12:ещё") is None
 
 
 def test_parse_rejects_empty_and_garbage():

@@ -27,13 +27,14 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
+from engine.core.models import SLUG_PATTERN, SLUG_RE
+
 PASSPORT_NAME = ".brain.yaml"
 BUTTONS_KEY = "buttons"
 LABEL_MAX = 64
 PROMPT_MAX = 4000
 MAX_BUTTONS = 24
 
-_SLUG_PATTERN = r"^[a-z0-9-]+$"
 _BUTTONS_HEADER = (
     "# Кнопки-вкладки агента (§9). Правь этот файл — он инстансный, синк мозга его не трогает.\n"
     "# label — что видно на кнопке, prompt — что уйдёт агенту при нажатии.\n"
@@ -96,10 +97,10 @@ class BrainPassport(BaseModel):
     @field_validator("slug", mode="after")
     @classmethod
     def _check_slug(cls, v: str | None) -> str | None:
-        import re
-
-        if v is not None and not re.match(_SLUG_PATTERN, v):
-            raise ValueError(f"slug должен быть {_SLUG_PATTERN}, получено: {v!r}")
+        # K16: import был локальным внутри валидатора — на каждый разбор паспорта лишний
+        # поиск в sys.modules и ложное впечатление «тут что-то тяжёлое»
+        if v is not None and not SLUG_RE.match(v):
+            raise ValueError(f"slug должен быть {SLUG_PATTERN}, получено: {v!r}")
         return v
 
     @field_validator("buttons", mode="after")
@@ -147,8 +148,23 @@ def parse_passport(text: str, *, where: str = PASSPORT_NAME) -> BrainPassport:
 
 
 def parse_buttons(text: str, *, where: str = "buttons.yaml") -> list[ButtonSpec]:
-    """Разобрать инстансный `buttons.yaml` — тот же корневой ключ `buttons` (контракт срезов)."""
+    """Разобрать инстансный `buttons.yaml` — тот же корневой ключ `buttons` (контракт срезов).
+
+    Разбор СТРОГИЙ, в отличие от снисходительного «нет ключа — значит кнопок нет» (K7).
+    Этот файл правит ЧЕЛОВЕК руками, и `button:` вместо `buttons:` — самая частая опечатка.
+    Раньше она давала тихий ноль кнопок: владелец дописал строку, перечитал, ряда нет,
+    подсказки нет. Теперь это PassportError — реестр её логирует и держит прошлый набор,
+    то есть живой бот не раздевается, а причина видна в journalctl.
+    """
     data = _load_mapping(text, where=where)
+    if not data:  # пустой файл — честное «кнопок нет», а не опечатка
+        return []
+    unknown = sorted(set(data) - {BUTTONS_KEY})
+    if unknown:
+        raise PassportError(
+            f"{where}: неизвестные поля {', '.join(unknown)} — "
+            f"кнопки объявляются под корневым ключом «{BUTTONS_KEY}:»"
+        )
     raw = data.get(BUTTONS_KEY)
     if raw is None:
         return []

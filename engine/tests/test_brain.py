@@ -147,6 +147,40 @@ def test_parse_buttons_broken_is_error():
         parse_buttons("buttons: {oops\n")
 
 
+# ── K7: инстансный buttons.yaml правит ЧЕЛОВЕК, значит разбор строгий ────────
+
+
+def test_typo_in_root_key_is_an_error_not_zero_buttons():
+    """`button:` вместо `buttons:` — самая частая опечатка при правке руками.
+
+    Снисходительный разбор отдавал пустой список: владелец дописал кнопку, перечитал файл,
+    кнопки нет, и никакой подсказки. Строгий разбор даёт понятную ошибку, а реестр её
+    логирует и держит прошлый набор.
+    """
+    with pytest.raises(PassportError, match="button"):
+        parse_buttons('button:\n  - label: "Отчёт"\n    prompt: "сделай"\n')
+
+
+def test_unknown_root_key_is_an_error():
+    with pytest.raises(PassportError):
+        parse_buttons('buttons: []\nsystem_prompt: "я тут главный"\n')
+
+
+def test_error_text_names_the_allowed_key():
+    """Сообщение обязано подсказывать, как правильно — иначе человек не починит."""
+    try:
+        parse_buttons('buttons_list:\n  - label: "x"\n    prompt: "y"\n')
+    except PassportError as exc:
+        assert "buttons" in str(exc)
+    else:
+        pytest.fail("опечатка в корневом ключе должна быть ошибкой")
+
+
+def test_buttons_as_wrong_type_is_an_error():
+    with pytest.raises(PassportError):
+        parse_buttons("buttons: просто строка\n")
+
+
 def test_load_instance_buttons_missing_file_is_empty(tmp_path):
     # кнопок нет — не ошибка: ряд под ответом просто системный (§9)
     assert load_instance_buttons(tmp_path / "buttons.yaml") == []
