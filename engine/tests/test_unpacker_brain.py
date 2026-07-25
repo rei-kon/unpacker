@@ -267,3 +267,27 @@ def test_real_unpacker_brain_deploys_and_keeps_skills(tmp_path, api_base, isolat
     assert (dst / ".brain.yaml").exists(), "паспорт с кнопками обязан доехать до инстанса"
     assert (dst / ".claude" / "skills" / "deploy-surface" / "SKILL.md").exists()
     assert (dst / ".claude" / "skills" / "operate" / "SKILL.md").exists()
+
+
+def test_brain_calls_scripts_by_absolute_path():
+    """Вызов «deploy.sh …» без пути = `command not found`, и sudoers его не сматчит.
+
+    sudo сверяет РОВНО тот путь, которым команду позвали, а whitelist §7.5 перечисляет
+    абсолютные пути. Значит в протоколе скрипты обязаны звучать с полным путём — иначе
+    ученик получит либо «нет такой команды», либо запрос пароля.
+    """
+    problems: list[str] = []
+    for doc in _brain_docs():
+        if doc.suffix != ".md":
+            continue
+        for lineno, line in enumerate(doc.read_text().splitlines(), 1):
+            for script in SCRIPTS:
+                for m in re.finditer(re.escape(script), line):
+                    before = line[: m.start()]
+                    # допустимо: путь перед именем скрипта (/opt/unpacker/deploy/…),
+                    # либо упоминание файла в прозе/бэктиках без аргументов
+                    has_path = before.rstrip().endswith("/") or before.rstrip().endswith("`/")
+                    called = line[m.end() :].lstrip().startswith(("-", "d", "l", "s", "h"))
+                    if called and not has_path:
+                        problems.append(f"{doc.relative_to(REPO)}:{lineno} → {line.strip()[:80]}")
+    assert not problems, "скрипты надо звать полным путём:\n" + "\n".join(sorted(set(problems)))

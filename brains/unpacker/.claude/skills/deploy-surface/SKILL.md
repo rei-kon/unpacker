@@ -5,6 +5,11 @@ description: Развернуть агента из папки-мозга на �
 
 # Протокол деплоя
 
+**Где скрипты.** Движок обычно лежит в `/opt/unpacker` — ниже я так и пишу. Если владелец
+ставил в другое место, беру фактический путь (`agentctl.sh` и `deploy.sh` лежат в его подпапке
+`deploy/`). Зову ВСЕГДА полным путём: короткое имя даст «команда не найдена», а sudo сверяет
+ровно тот путь, что перечислен в его whitelist.
+
 Иду ровно по шагам. Не перескакиваю, не объединяю шаг 4 с шагом 6, не деплою «пока владелец
 думает». Каждый шаг заканчивается либо сообщением владельцу, либо запуском скрипта.
 
@@ -49,7 +54,7 @@ Telegram (`--surface tg`). Веб — это Фаза 3, standalone — Фаза
 Первый запуск — вхолостую, он же и покажет гейты:
 
 ```
-sudo deploy.sh --surface tg --name <имя> --token <ТОКЕН> --users <id> --brain <путь> --dry-run
+sudo /opt/unpacker/deploy/deploy.sh --surface tg --name <имя> --token <ТОКЕН> --users <id> --brain <путь> --dry-run
 ```
 
 Вывод гейтов пересказываю владельцу человеческим языком (5–7 строк, без простыни).
@@ -79,7 +84,7 @@ sudo deploy.sh --surface tg --name <имя> --token <ТОКЕН> --users <id> --
 · инстанс: ~/agents/<имя>/ (.env с правами 600, state/ для сессий и файлов)
 · мозг:    ~/brains/<имя>/ (копия твоей папки, без .git и .env)
 · автозапуск: agent-tg@<имя> — бот сам поднимется после перезагрузки
-· команда: sudo deploy.sh --surface tg --name <имя> --token [REDACTED] --users <id> --brain <путь>
+· команда: sudo /opt/unpacker/deploy/deploy.sh --surface tg --name <имя> --token [REDACTED] --users <id> --brain <путь>
 Живые боты не задеваю. Займёт около минуты.
 
 Разворачиваю? (да / поправить / стоп)
@@ -99,7 +104,7 @@ sudo deploy.sh --surface tg --name <имя> --token <ТОКЕН> --users <id> --
 ## Шаг 6. Проверка
 
 ```
-agentctl.sh doctor <имя>
+sudo /opt/unpacker/deploy/agentctl.sh doctor <имя>
 ```
 
 Читаю вердикт и пересказываю. `HEALTHY` — говорю, что бот жив и можно писать `/start`.
@@ -126,7 +131,7 @@ agentctl.sh doctor <имя>
 CLAUDE.md на месте, мозг не git (проверка чистоты не требовалась).
 
 ## Проверка
-agentctl.sh doctor sales-bot → HEALTHY. Ответ на /start получен.
+/opt/unpacker/deploy/agentctl.sh doctor sales-bot → HEALTHY. Ответ на /start получен.
 
 ## Что дальше
 Токен светился в чате — перевыпустить у @BotFather и прогнать деплой ещё раз с новым.
