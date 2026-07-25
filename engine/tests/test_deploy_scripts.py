@@ -27,6 +27,7 @@ from engine.tests.conftest import (
     run_agentctl,
     run_deploy,
     stub_bin,
+    temp_file_in,
 )
 
 # ── репо-гигиена: шаблоны обязаны ехать ученику вместе с репо ────────────────
@@ -794,3 +795,132 @@ def test_deploy_dropin_goes_into_overridable_dir(tmp_path, api_base, isolated_ru
     assert r.returncode == 0, r.stdout + r.stderr
     dropin = tmp_path / "systemd" / "agent-tg@dropin.service.d" / "10-unpacker.conf"
     assert dropin.exists(), "drop-in должен лечь в TG_DROPIN_DIR"
+
+
+# ── C2/ADV-07: deploy.sh не обновляет код движка. Совсем ─────────────────────
+
+
+@pytest.mark.skipif(not UV, reason="нужен uv")
+def test_deploy_succeeds_on_engine_at_detached_tag(tmp_path, api_base, git_runtime):
+    """Главный блокер: install.sh встаёт на ТЕГ → detached HEAD → `git pull --ff-only` = ошибка.
+
+    Ломался каждый деплой, включая все, что делает Распаковщик. Обновление кода — работа
+    update.sh, у deploy.sh такой ответственности нет вообще.
+    """
+    env = deploy_env(tmp_path, api_base, runtime=git_runtime)
+    r = run_deploy(*deploy_args(tmp_path, "detached"), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (Path(env["TG_AGENTS_BASE"]) / "detached" / ".env").exists()
+    out = (r.stdout + r.stderr).lower()
+    assert "pull" not in out, "deploy.sh не должен даже пытаться обновлять код движка"
+
+
+def test_deploy_has_no_engine_git_operations():
+    """Контракт-тест: git-операции над движком живут только в install.sh/update.sh (Р1)."""
+    code = "\n".join(
+        ln
+        for ln in (REPO / "deploy" / "deploy.sh").read_text().splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    )
+    for banned in ("git -C '$RUNTIME'", "git clone '$RUNTIME_URL'", '"$UV_BIN" sync'):
+        assert banned not in code, f"deploy.sh не трогает движок: {banned}"
+
+
+@pytest.mark.skipif(not UV, reason="нужен uv")
+def test_deploy_refuses_when_engine_venv_unusable(tmp_path, api_base, isolated_runtime):
+    """venv движка снаружи дерева (Р1) → его отсутствие обязано быть внятным отказом.
+
+    Иначе первый же `uv run` попытается создать venv в root-owned дереве и упадёт EACCES
+    посреди провизии.
+    """
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    env["UV_PROJECT_ENVIRONMENT"] = "/nonexistent-root-dir/venv"
+    r = run_deploy(*deploy_args(tmp_path, "novenv"), env_extra=env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    text = (r.stdout + r.stderr).lower()
+    assert "venv" in text and ("install.sh" in text or "update.sh" in text)
+
+
+# ── Р7 (M-08/C11/ADV-10): мозг внутри движка не копируется ───────────────────
+
+
+@pytest.mark.skipif(not UV, reason="нужен uv")
+def test_brain_inside_runtime_is_used_in_place(tmp_path, api_base, isolated_runtime):
+    """Служебный мозг живёт в дереве движка → обновление кода = обновление протокола.
+
+    Раньше мозг копировался один раз, а передеплой видел непустую папку и не трогал её —
+    правки скиллов не доезжали до учеников НИКОГДА.
+    """
+    import sqlite3
+
+    rt_brain = Path(isolated_runtime) / "brains" / "unpacker"
+    assert (rt_brain / "CLAUDE.md").exists(), "в движке обязан лежать мозг Распаковщика"
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    r = run_deploy(*deploy_args(tmp_path, "unpacker", brain=rt_brain), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    copy = Path(env["TG_BRAINS_BASE"]) / "unpacker"
+    assert not copy.exists(), "мозг движка не копируется — иначе релиз до ученика не доедет"
+    db = Path(env["TG_AGENTS_BASE"]) / "unpacker" / "state" / "state.db"
+    c = sqlite3.connect(str(db))
+    brain_path = c.execute("SELECT brain_path FROM projects WHERE slug='unpacker'").fetchone()[0]
+    c.close()
+    assert Path(brain_path) == rt_brain, f"агент смотрит в копию, а не в мозг движка: {brain_path}"
+    # «релиз изменил brains/unpacker/…» → развёрнутый агент видит новый файл сразу
+    with temp_file_in(rt_brain, "NEW-SKILL.md", "# новая версия протокола\n"):
+        assert (Path(brain_path) / "NEW-SKILL.md").exists()
+
+
+# ── ADV-08: читаемость мозга проверяем ОТ RUN_USER, а не от вызывающего ──────
+
+
+def test_gate_refuses_brain_unreadable_by_run_user(tmp_path, api_base):
+    """Гейт читал мозг от root (зелёный), а материализация шла от run-user → tar: Permission
+    denied посреди провизии. Классика: README учит держать мозги в /root/brains (mode 700).
+    """
+    brain = make_brain(tmp_path)
+    brain.chmod(0o300)  # каталог проходится (x), но не читается (r) — как чужой /root/brains
+    try:
+        r = run_deploy(
+            *deploy_args(tmp_path, "unreadable", "--dry-run", brain=brain),
+            env_extra=deploy_env(tmp_path, api_base),
+        )
+    finally:
+        brain.chmod(0o755)
+    assert r.returncode == 3, r.stdout + r.stderr
+    text = (r.stdout + r.stderr).lower()
+    assert "чита" in text or "прочит" in text, "отказ должен быть про ЧТЕНИЕ мозга"
+    assert "run-user" in text or "пользоват" in text
+
+
+@pytest.mark.skipif(not UV, reason="нужен uv")
+def test_unit_carries_external_venv_when_configured(tmp_path, api_base, isolated_runtime):
+    """Р1: venv движка снаружи дерева → юнит обязан нести UV_PROJECT_ENVIRONMENT.
+
+    Без этого ExecStart (`uv run --project`) полез бы создавать .venv в root-owned дереве
+    и упал бы 203/EXEC — бот-зомби, молчащий на каждое сообщение.
+    """
+    venv = tmp_path / "venv"
+    sysctl = stub_bin(tmp_path, "systemctl", SYSTEMCTL_STUB)
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    env["TG_SYSTEMCTL"] = str(sysctl)
+    env["SYSTEMCTL_LOG"] = str(tmp_path / "systemctl.log")
+    env["UV_PROJECT_ENVIRONMENT"] = str(venv)
+    r = run_deploy(*deploy_args(tmp_path, "venvunit"), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    unit = (tmp_path / "systemd" / "agent-tg@.service").read_text()
+    assert f"Environment=UV_PROJECT_ENVIRONMENT={venv}" in unit
+
+
+@pytest.mark.skipif(not UV, reason="нужен uv")
+def test_unit_has_no_empty_venv_assignment(tmp_path, api_base, isolated_runtime):
+    """venv не задан (dev, .venv внутри дерева) → строки-пустышки в юните быть не должно."""
+    sysctl = stub_bin(tmp_path, "systemctl", SYSTEMCTL_STUB)
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    env["TG_SYSTEMCTL"] = str(sysctl)
+    env["SYSTEMCTL_LOG"] = str(tmp_path / "systemctl.log")
+    env["UV_PROJECT_ENVIRONMENT"] = ""
+    r = run_deploy(*deploy_args(tmp_path, "novenvunit"), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    unit = (tmp_path / "systemd" / "agent-tg@.service").read_text()
+    assert "UV_PROJECT_ENVIRONMENT" not in unit
+    assert "REPLACE_WITH" not in unit, "нерендеренных плейсхолдеров в юните быть не должно"

@@ -23,8 +23,13 @@ EnvironmentFile=REPLACE_WITH_AGENTS_BASE/%i/.env
 # установки (~/.local/bin, npm-prefix) — без этого бот поднимется, но КАЖДОЕ сообщение упадёт
 # (claude не найден). Включаем домашние bin RUN_USER + системные.
 Environment=PATH=REPLACE_WITH_RUN_HOME/.local/bin:REPLACE_WITH_RUN_HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# venv движка живёт СНАРУЖИ дерева кода (Р1: код root-owned, venv принадлежит run-user).
+# Без этой строки `uv run` полез бы создавать .venv внутри /opt/unpacker и упал 203/EXEC —
+# бот поднялся бы «зомби». Строку удаляет deploy.sh, если внешний venv не настроен (dev).
+Environment=UV_PROJECT_ENVIRONMENT=REPLACE_WITH_VENV_PATH
 # Общий движок через --project; никогда не копируется под агента. `python -m engine` — точка входа.
-ExecStart=REPLACE_WITH_UV_PATH run --project REPLACE_WITH_RUNTIME_PATH python -m engine
+# --frozen: uv не переписывает uv.lock в root-owned дереве движка.
+ExecStart=REPLACE_WITH_UV_PATH run --project REPLACE_WITH_RUNTIME_PATH --frozen python -m engine
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15

@@ -49,17 +49,7 @@ def api_base() -> Iterator[str]:
         yield base
 
 
-@pytest.fixture(scope="session")
-def isolated_runtime(tmp_path_factory) -> str:
-    """Изолированная копия движка как RUNTIME.
-
-    deploy.sh зовёт `uv run --directory $RUNTIME` (мост кнопок, сид). Против рабочего репо
-    это трогало бы общий `.venv` (ruff/mypy/pytest). Копируем код в tmp с собственным venv —
-    тесты не трогают рабочее окружение.
-    """
-    if not UV:
-        pytest.skip("нужен uv")
-    dst = tmp_path_factory.mktemp("runtime") / "unpacker"
+def _copy_engine(dst: Path) -> None:
     shutil.copytree(
         REPO,
         dst,
@@ -73,6 +63,48 @@ def isolated_runtime(tmp_path_factory) -> str:
             "__pycache__",
         ),
     )
+
+
+@pytest.fixture(scope="session")
+def git_runtime(tmp_path_factory) -> str:
+    """Движок как git-репо в состоянии, которое оставляет install.sh: detached HEAD на теге.
+
+    Ровно здесь ломался КАЖДЫЙ деплой (C2/ADV-07/M-03): `git pull --ff-only` на detached HEAD
+    (да ещё и с недоступным remote) возвращал ошибку, и deploy.sh выходил с 3 — «не раскатываю
+    на устаревшем/битом коде». Фикстура нужна отдельная: session-runtime намеренно без .git.
+    """
+    if not UV:
+        pytest.skip("нужен uv")
+    dst = tmp_path_factory.mktemp("gitruntime") / "unpacker"
+    _copy_engine(dst)
+    git = ["git", "-C", str(dst), "-c", "user.email=a@b.c", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(dst)], check=True, capture_output=True)
+    subprocess.run([*git, "add", "-A"], check=True, capture_output=True)
+    subprocess.run([*git, "commit", "-qm", "release"], check=True, capture_output=True)
+    subprocess.run([*git, "tag", "v0.1.0"], check=True, capture_output=True)
+    # как install.sh: встаём на тег → detached HEAD; remote недоступен
+    subprocess.run([*git, "checkout", "-q", "v0.1.0"], check=True, capture_output=True)
+    subprocess.run(
+        [*git, "remote", "add", "origin", str(dst.parent / "no-such-remote.git")],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run([UV, "sync", "--project", str(dst)], check=True, capture_output=True)
+    return str(dst)
+
+
+@pytest.fixture(scope="session")
+def isolated_runtime(tmp_path_factory) -> str:
+    """Изолированная копия движка как RUNTIME.
+
+    deploy.sh зовёт `uv run --directory $RUNTIME` (мост кнопок, сид). Против рабочего репо
+    это трогало бы общий `.venv` (ruff/mypy/pytest). Копируем код в tmp с собственным venv —
+    тесты не трогают рабочее окружение.
+    """
+    if not UV:
+        pytest.skip("нужен uv")
+    dst = tmp_path_factory.mktemp("runtime") / "unpacker"
+    _copy_engine(dst)
     subprocess.run([UV, "sync", "--project", str(dst)], check=True, capture_output=True)
     return str(dst)
 
@@ -191,6 +223,20 @@ exit 0
 CLAUDE_STUB = """#!/usr/bin/env bash
 echo "1.0.0 (Claude Code)"
 """
+
+
+@contextmanager
+def temp_file_in(directory: Path, name: str, body: str) -> Iterator[Path]:
+    """Временный файл в общем каталоге (напр. «релиз добавил файл в мозг движка»).
+
+    Общий runtime — session-фикстура, поэтому убираем за собой через finally.
+    """
+    f = directory / name
+    f.write_text(body, encoding="utf-8")
+    try:
+        yield f
+    finally:
+        f.unlink(missing_ok=True)
 
 
 @contextmanager

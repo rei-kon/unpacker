@@ -34,8 +34,13 @@
 #   (или запусти из-под него через sudo, тогда SUDO_USER подхватится). При `sudo` от root uv/claude
 #   резолвятся В КОНТЕКСТЕ RUN_USER, а не root (иначе /root/.local/bin/uv недостижим для юнита).
 #
+# ВАЖНО: код движка deploy.sh НЕ обновляет — ни git, ни uv sync. Это работа install.sh/update.sh:
+#   дерево движка принадлежит root (Р1), а venv живёт снаружи (UV_PROJECT_ENVIRONMENT). Раньше
+#   здесь был `git pull --ff-only`, который после установки на тег (detached HEAD) ломал КАЖДЫЙ
+#   деплой. Мозг, лежащий внутри дерева движка, используется НА МЕСТЕ и не копируется.
+#
 # Шаги: гейты §7.3 (контур auth, мозг, чистота git-мозга, имя, занятость токена, getMe) → preflight →
-#   общий движок (pull/uv sync под RUN_USER) → мозг (clone/copy; scrub .env/.git/симлинков) →
+#   проверка движка (на месте, venv готов) → мозг (clone/copy; scrub .env/.git/симлинков) →
 #   инстанс + .env (chmod 600, секреты через printf, НЕ перезатирая) → buttons.yaml (мост из мозга) →
 #   сид проекта → templated systemd agent-tg@<name>.service + enable --now.
 set -euo pipefail
@@ -109,10 +114,9 @@ fi
 [ -n "$PROJECT_SLUG" ] || PROJECT_SLUG="$NAME"
 valid_slug "$PROJECT_SLUG" || { echo "--project-slug '$PROJECT_SLUG': недопустимый slug" >&2; exit 2; }
 [ -n "$BRAND" ] || BRAND="$NAME"
-# BRAIN_REPO/RUNTIME_URL втекают в bash -c-строки (git/tar) → метасимволы запрещены.
+# BRAIN_REPO втекает в bash -c-строки (git/tar) → метасимволы запрещены.
 # (BRAND/DEFAULT_MODEL уходят в seed через argv — им шелл-валидация не нужна, апостроф ок.)
 safe_arg "$BRAIN_REPO" || { echo "--brain '$BRAIN_REPO': недопустимые символы (шелл-метасимволы запрещены)" >&2; exit 2; }
-[ -z "${TG_RUNTIME_URL:-}" ] || safe_arg "${TG_RUNTIME_URL}" || { echo "TG_RUNTIME_URL: недопустимые символы" >&2; exit 2; }
 # TG_API_BASE влияет на сетевой запрос гейта — метасимволы тут тоже не нужны.
 safe_arg "$TG_API_BASE" || { echo "TG_API_BASE: недопустимые символы" >&2; exit 2; }
 
@@ -136,12 +140,21 @@ done
 
 # RUNTIME/AGENTS_BASE/BRAINS_BASE/VENV_PATH уже выставил resolve_run_identity (Р2:
 # env → /etc/unpacker/engine.conf → фолбэк) — здесь их больше не переопределяем.
-RUNTIME_URL="${TG_RUNTIME_URL:-}"
+# TG_RUNTIME_URL больше не читаем: код движка ставит install.sh, обновляет update.sh (C2/Р1).
 resolve_uv_bin
 # SEC-8: путь до uv втекает sed'ом в root-устанавливаемый юнит → валидируем ДО подстановки.
 validate_uv_bin || { echo "--> проверь TG_UV_BIN / TG_UV_BIN в /etc/unpacker/engine.conf" >&2; exit 2; }
 INST="$AGENTS_BASE/$NAME"
-BRAIN="$BRAINS_BASE/$NAME"
+# Р7 (M-08/C11/ADV-10): служебный мозг (Распаковщик) живёт ПРЯМО в дереве движка и не
+# копируется — тогда обновление кода = обновление протокола, и правки скиллов доезжают до
+# учеников. Копия же не обновлялась никогда: update.sh мозги не трогает, а передеплой видел
+# непустую папку и «идемпотентно» проходил мимо. Мутабельного состояния в мозге нет by
+# design (§4), поэтому read-only корень движка тут корректен.
+BRAIN_IN_RUNTIME="false"
+case "$BRAIN_REPO" in
+  "$RUNTIME"/*) [ -d "$BRAIN_REPO" ] && BRAIN_IN_RUNTIME="true" ;;
+esac
+if [ "$BRAIN_IN_RUNTIME" = "true" ]; then BRAIN="$BRAIN_REPO"; else BRAIN="$BRAINS_BASE/$NAME"; fi
 UNIT="$(unit_name "$NAME")"            # M-17: имя юнита — из _common.sh, не литералом
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
@@ -181,6 +194,21 @@ asuser_argv() {
   if [ "$DRY_RUN" = "true" ]; then echo "[dry-run] (as $RUN_USER) $*";
   elif [ "$RUN_USER" = "$(id -un)" ]; then "$@";
   else sudo -u "$RUN_USER" -H "$@"; fi
+}
+
+# uv_run_argv: запустить модуль движка от RUN_USER через uv.
+#   * --directory, а НЕ --project: `uv run --project` НЕ меняет cwd, и `python -m` подхватил бы
+#     пакет `engine` из каталога вызова (обычно чей-то чекаут репо) вместо общего движка;
+#   * --frozen: uv не переписывает uv.lock — дерево движка root-owned и на запись закрыто (Р1);
+#   * UV_PROJECT_ENVIRONMENT: venv живёт СНАРУЖИ дерева и принадлежит run-user'у. Передаём
+#     через `env` в argv, потому что sudo с env_reset переменную бы выбросил.
+uv_run_argv() {
+  if [ -n "$VENV_PATH" ]; then
+    asuser_argv env "UV_PROJECT_ENVIRONMENT=$VENV_PATH" \
+      "$UV_BIN" run --directory "$RUNTIME" --frozen "$@"
+  else
+    asuser_argv "$UV_BIN" run --directory "$RUNTIME" --frozen "$@"
+  fi
 }
 
 # asuser_real: как asuser, но ИСПОЛНЯЕТ даже в --dry-run. Только для ЧТЕНИЯ (гейты):
@@ -268,7 +296,16 @@ gates() {
   elif [ -d "$BRAIN_REPO" ]; then
     [ -f "$BRAIN_REPO/CLAUDE.md" ] \
       || gate_fail "в мозге '$BRAIN_REPO' нет CLAUDE.md — это не папка-мозг (§4: минимум один CLAUDE.md)."
-    echo "  ✓ мозг: $BRAIN_REPO (CLAUDE.md на месте)"
+    # ADV-08: раньше гейт читал мозг ОТ ВЫЗЫВАЮЩЕГО (root), а материализация шла от
+    # run-user — и `tar: Permission denied` прилетал посреди провизии. Классика:
+    # мозги в /root/brains (mode 700) при run-user != root: гейт зелёный, деплой мёртвый.
+    asuser_real "test -r '$BRAIN_REPO' && test -x '$BRAIN_REPO' && test -r '$BRAIN_REPO/CLAUDE.md'" \
+      || gate_fail "мозг '$BRAIN_REPO' НЕ читается пользователем $RUN_USER (run-user), от
+      которого бежит бот и идёт провизия. Проверить руками:
+        sudo -u $RUN_USER test -r '$BRAIN_REPO/CLAUDE.md' && echo ok
+      Чаще всего мозг лежит в /root (mode 700) — перенеси его в домашний каталог $RUN_USER
+      (или дай права на чтение всей цепочке каталогов)."
+    echo "  ✓ мозг: $BRAIN_REPO (CLAUDE.md на месте, читается от $RUN_USER)"
   else
     gate_fail "мозг '$BRAIN_REPO' не найден: это ни существующая папка, ни git-URL. Проверь путь."
   fi
@@ -363,6 +400,21 @@ preflight() {
     echo "  ! claude CLI не найден в PATH у $RUN_USER — движок не сможет спавнить агента."
     echo "      поставь Claude Code CLI (юнит подхватит его через Environment=PATH)."; warns=$((warns+1)); }
 
+  # venv движка (Р1) живёт СНАРУЖИ дерева кода: код root-owned, venv принадлежит run-user.
+  # Создаёт его install.sh/update.sh (`uv sync` от root). Здесь только проверяем готовность —
+  # иначе первый `uv run` попытается создать venv в root-owned дереве и упадёт EACCES
+  # посреди провизии, уже после записи .env.
+  if [ -n "$VENV_PATH" ] && [ ! -x "$VENV_PATH/bin/python" ]; then
+    if asuser_real "mkdir -p '$VENV_PATH' 2>/dev/null"; then
+      echo "  ! venv движка ($VENV_PATH) пуст — uv наполнит его при первом запуске"
+      warns=$((warns+1))
+    else
+      echo "  ✗ venv движка недоступен: $VENV_PATH (создать не удалось от $RUN_USER)"
+      echo "      его готовит install.sh/update.sh: UV_PROJECT_ENVIRONMENT=$VENV_PATH uv sync"
+      errs=$((errs+1))
+    fi
+  fi
+
   if [ -z "$CC_TOKEN" ] && [ ! -f "$INST/.env" ]; then
     echo "  ! нет --cc-token: бот поедет на ambient-auth и упадёт в 401 при протухании."
     echo "      durable: 'claude setup-token' (Max/Pro) под $RUN_USER, потом --cc-token <TOKEN>."; warns=$((warns+1))
@@ -384,21 +436,22 @@ if [ "$SKIP_PREFLIGHT" = "true" ]; then echo "==> preflight пропущен (--
 echo "==> деплой '$NAME' (surface=$SURFACE, project=$PROJECT_SLUG)"
 echo "    runtime=$RUNTIME  instance=$INST  brain=$BRAIN"
 
-# ── 1. общий движок (обновление ГРОМКОЕ, sync под RUN_USER) ──────────────────
-if [ -d "$RUNTIME/.git" ]; then
-  asuser "git -C '$RUNTIME' pull --ff-only" \
-    || { echo "  ✗ обновление движка ($RUNTIME) не удалось — не раскатываю на устаревшем/битом коде." >&2; exit 3; }
-elif [ -n "$RUNTIME_URL" ]; then
-  asuser "git clone '$RUNTIME_URL' '$RUNTIME'"
-else
-  echo "warn: движок не git и TG_RUNTIME_URL пуст — считаю, что он уже лежит в $RUNTIME (rsync-bootstrap)"
-fi
-# sync под RUN_USER: .venv/managed-python обязаны принадлежать тому, кто бежит юнит (иначе EACCES).
-asuser_argv "$UV_BIN" sync --project "$RUNTIME"
+# ── 1. общий движок: ТОЛЬКО проверяем, что он на месте и готов ───────────────
+# C2/ADV-07/M-03: раньше здесь был `git pull --ff-only`. install.sh встаёт на ТЕГ (detached
+# HEAD), поэтому pull возвращал ошибку и деплой выходил с 3 — ломался КАЖДЫЙ деплой, включая
+# все, что делает Распаковщик. Обновление кода — работа update.sh; движок root-owned (Р1),
+# и деплой в него не пишет вообще (ни git, ни uv sync).
+[ -d "$RUNTIME" ] || { echo "  ✗ каталога движка нет: $RUNTIME. Поставь движок: install.sh" >&2; exit 3; }
+[ -f "$RUNTIME/pyproject.toml" ] || {
+  echo "  ✗ в $RUNTIME нет pyproject.toml — это не дерево движка (проверь TG_RUNTIME/engine.conf)." >&2; exit 3; }
 
 # ── 2. мозг (чистота источника проверена гейтом; scrub; CLAUDE.md после клона) ─
 # materialize (условия — локальный stat; root читает /home/*; git-операции идут asuser)
-if [ -d "$BRAIN/.git" ]; then
+if [ "$BRAIN_IN_RUNTIME" = "true" ]; then
+  # Р7: мозг лежит внутри движка — используем НА МЕСТЕ. Ни копии, ни scrub'а, ни git-операций:
+  # каталог принадлежит root и read-only для агента, а обновляет его релиз (update.sh).
+  echo "    мозг движка ($BRAIN) — служебный, использую на месте (обновляется релизом)"
+elif [ -d "$BRAIN/.git" ]; then
   asuser "git -C '$BRAIN' pull --ff-only" || echo "warn: brain pull пропущен (расхождение/сеть) — проверь мозг вручную"
 elif [ -d "$BRAIN" ] && [ -n "$(ls -A "$BRAIN" 2>/dev/null)" ]; then
   echo "    мозг уже лежит (non-git) — не трогаю (idempotent)"
@@ -408,7 +461,7 @@ elif [ -d "$BRAIN_REPO" ]; then
 else
   asuser "git clone '$BRAIN_REPO' '$BRAIN'"
 fi
-if [ "$DRY_RUN" != "true" ]; then
+if [ "$DRY_RUN" != "true" ] && [ "$BRAIN_IN_RUNTIME" != "true" ]; then
   # scrub: вложенные .env/.env.* (§8.2 утечка секрета в cwd бота) + симлинки (path-traversal наружу)
   # + вложенные .git (submodule). Топ-уровневый .git оставляем для git-мозга (нужен pull).
   asuser "find '$BRAIN' -depth \\( -name .env -o -name '.env.*' \\) -type f -delete 2>/dev/null || true"
@@ -472,7 +525,7 @@ else
   # --directory, а НЕ --project: `uv run --project` НЕ меняет cwd, и `python -m` подхватил бы
   # пакет `engine` из каталога вызова (у deploy.sh это обычно чей-то чекаут репо) вместо
   # общего движка. Ловится тестом моста: со --project мост «не видел» модуль в рантайме.
-  if bk_out="$(asuser_argv "$UV_BIN" run --directory "$RUNTIME" python -m engine.brainkit \
+  if bk_out="$(uv_run_argv python -m engine.brainkit \
                 export-buttons --brain "$BRAIN" --out "$BUTTONS" 2>&1)"; then
     echo "    buttons.yaml экспортирован из мозга (engine.brainkit)"
   else
@@ -487,11 +540,11 @@ fi
 if [ "$DRY_RUN" = "true" ]; then
   echo "[dry-run] сид проекта: slug=$PROJECT_SLUG brand='$BRAND' brain=$BRAIN db=$INST/state/state.db"
 else
-  # --directory (см. про мост выше): гарантирует, что `engine` берётся из общего движка.
-  seed_args=("$UV_BIN" run --directory "$RUNTIME" python -m engine.seed
+  # uv_run_argv (см. про мост выше): `engine` берётся из общего движка, venv — снаружи дерева.
+  seed_args=(python -m engine.seed
              --db "$INST/state/state.db" --slug "$PROJECT_SLUG" --name "$BRAND" --brain "$BRAIN")
   [ -n "$DEFAULT_MODEL" ] && seed_args+=(--model "$DEFAULT_MODEL")
-  asuser_argv "${seed_args[@]}"
+  uv_run_argv "${seed_args[@]}"
 fi
 
 # ── 4b. модель прав мета-агента (§7.5) — только --role unpacker ──────────────
@@ -534,11 +587,16 @@ else
     TMP_UNIT="$(mktemp)"
     # Истинный шаблон: пер-агентные пути через %i. Подставляем только ХОСТ-глобальные значения.
     # PATH включает $RUN_HOME/.local/bin (per-user claude/uv) + системные — иначе SDK не найдёт claude.
+    # venv снаружи дерева задан → подставляем; не задан (dev) → строку УДАЛЯЕМ, потому что
+    # `Environment=UV_PROJECT_ENVIRONMENT=` (пустое значение) сбило бы uv с его дефолта.
+    if [ -n "$VENV_PATH" ]; then venv_sed="s|REPLACE_WITH_VENV_PATH|$VENV_PATH|g"
+    else venv_sed="/REPLACE_WITH_VENV_PATH/d"; fi
     sed -e "s|REPLACE_WITH_LINUX_USER|$RUN_USER|g" \
         -e "s|REPLACE_WITH_AGENTS_BASE|$AGENTS_BASE|g" \
         -e "s|REPLACE_WITH_UV_PATH|$UV_BIN|g" \
         -e "s|REPLACE_WITH_RUNTIME_PATH|$RUNTIME|g" \
         -e "s|REPLACE_WITH_RUN_HOME|$RUN_HOME|g" \
+        -e "$venv_sed" \
         "$UNIT_SRC" > "$TMP_UNIT"
     if [ "$DRY_RUN" = "true" ]; then
       echo "[dry-run] поставил бы $UNIT_DST и: $SUDO $SYSTEMCTL enable --now $UNIT"
