@@ -13,6 +13,8 @@ dependencies = [
     # релиз SDK молча приедет ученику на VPS и сломает живого бота.
     "claude-agent-sdk==0.2.121",
     "telegramify-markdown>=0.5",
+    # Паспорт мозга .brain.yaml и инстансный buttons.yaml (§4) — safe_load, без ! -тегов
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
