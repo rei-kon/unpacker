@@ -242,11 +242,18 @@ harden() {
       [ -s "$keys" ] || keys="/root/.ssh/authorized_keys"
     fi
     if [ -s "$keys" ]; then
+      run $SUDO mkdir -p /etc/ssh/sshd_config.d
       write_root_file /etc/ssh/sshd_config.d/99-unpacker.conf \
         "PasswordAuthentication no
 PermitRootLogin prohibit-password
 "
-      run $SUDO systemctl reload ssh
+      # Юнит зовётся то ssh, то sshd (зависит от дистрибутива), и необработанный отказ
+      # под `set -e` убил бы установку посреди шага 0. Пробуем оба имени и не сдаёмся.
+      if ! run $SUDO systemctl reload ssh 2>/dev/null; then
+        if ! run $SUDO systemctl reload sshd 2>/dev/null; then
+          say "  ! не смог перечитать конфиг ssh — примени сам: $SUDO systemctl reload ssh"
+        fi
+      fi
       say "    вход по паролю выключен (ключ найден: $keys)"
     else
       say "  ! ssh-ключ не найден ($keys) — вход по паролю НЕ выключаю."
@@ -384,14 +391,20 @@ ask() {  # ask <подсказка> <дефолт> → эхо ответа
 dialog_step() {
   say "==> шаг 4: четыре ответа"
   CONF="$ENGINE_DIR/.install.conf"
+  # Ответы этого запуска запоминаем ДО чтения прошлых: `. "$CONF"` перезаписал бы
+  # одноимённые переменные, и «поменял ответ и переустановил» тихо не срабатывало бы.
+  local now_users="${UNPACKER_ALLOWED_USERS:-}" now_brains="${UNPACKER_BRAINS_DIR:-}"
+  local now_auth="${UNPACKER_AUTH_MODE:-}" now_token="${UNPACKER_BOT_TOKEN:-}"
   # Прошлые ответы — дефолты (идемпотентность: второй раз ничего не переспрашиваем).
   # shellcheck disable=SC1090
   [ -r "$CONF" ] && . "$CONF"
-  USERS="${UNPACKER_ALLOWED_USERS:-${USERS:-}}"
-  BRAINS_DIR="${UNPACKER_BRAINS_DIR:-${BRAINS_DIR:-}}"
-  AUTH_MODE="${UNPACKER_AUTH_MODE:-${AUTH_MODE:-}}"
+  USERS="${now_users:-${UNPACKER_ALLOWED_USERS:-}}"
+  BRAINS_DIR="${now_brains:-${UNPACKER_BRAINS_DIR:-}}"
+  AUTH_MODE="${now_auth:-${UNPACKER_AUTH_MODE:-}}"
   CC_TOKEN="${UNPACKER_CC_TOKEN:-}"
-  TOKEN="${UNPACKER_BOT_TOKEN:-}"
+  TOKEN="$now_token"
+  # Токен уже развёрнутого бота: чтобы прочитать .env инстанса (600, владелец — юзер
+  # движка), install.sh должен идти от root/sudo — так он и запускается.
   [ -n "$TOKEN" ] || TOKEN="$(token_from_instance)"
 
   if [ "$NON_INTERACTIVE" = "true" ]; then
@@ -488,6 +501,13 @@ deploy_step() {
 # ── шаг 6: финал + шпаргалка ────────────────────────────────────────────────
 final_step() {
   say ""
+  # В dry-run нельзя рапортовать «бот поднят»: ничего не делали. Ложный успех в плане —
+  # это ученик, который ищет живого бота там, где его нет.
+  if [ "$DRY_RUN" = "true" ]; then
+    say "==> это был только план — ничего не изменено."
+    say "    Всё устраивает? Запусти по-настоящему, без --dry-run:  bash install.sh"
+    return 0
+  fi
   say "==> готово. Бот поднят."
   say ""
   say "    ЧТО ДЕЛАТЬ СЕЙЧАС: открой своего бота в Telegram и напиши ему /start."

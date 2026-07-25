@@ -954,3 +954,97 @@ def test_readme_warns_about_subscription_limit_and_client_ban():
     low = (REPO / "README.md").read_text().lower()
     assert "лимит" in low and "подписк" in low, "SDK жжёт лимит подписки — предупредить"
     assert "клиент" in low, "обслуживать внешних клиентов с подписки нельзя — сказать прямо"
+
+
+def test_install_dry_run_does_not_claim_bot_is_alive(tmp_path):
+    """В dry-run финал не должен утверждать, что бот поднят: ничего же не делали."""
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--dry-run",
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "Бот поднят" not in out
+    assert "ничего не изменено" in out, "должен честно сказать, что это был только план"
+    assert "install.sh" in out, "и подсказать, как запустить по-настоящему"
+
+
+def test_install_new_env_answers_win_over_saved_ones(tmp_path):
+    """Повторный запуск с ДРУГИМ ответом обязан взять новый, а не запомненный.
+
+    Иначе «поменял список пользователей и переустановил» тихо не срабатывает: сохранённый
+    .install.conf перезаписывал бы переменные окружения.
+    """
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    argv_log = tmp_path / "argv.txt"
+    args = (
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--no-hardening",
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+    )
+    r1 = run_install(*args, env_extra=_answers(tmp_path, DEPLOY_ARGV=str(argv_log)), stub=stub)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    r2 = run_install(
+        *args,
+        env_extra=_answers(tmp_path, UNPACKER_ALLOWED_USERS="333", DEPLOY_ARGV=str(argv_log)),
+        stub=stub,
+    )
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    argv = argv_log.read_text().splitlines()
+    assert argv[argv.index("--users") + 1] == "333", "новый ответ должен побеждать запомненный"
+    assert "UNPACKER_ALLOWED_USERS=333" in (engine / ".install.conf").read_text()
+
+
+def test_install_survives_distro_where_ssh_unit_is_named_differently(tmp_path):
+    """`systemctl reload ssh` падает (юнит зовётся sshd) — установка обязана продолжиться.
+
+    Под `set -e` необработанный отказ убил бы install.sh посреди шага 0, и ученик остался
+    бы с полу-настроенным сервером без объяснений.
+    """
+    stub = _base_stub(tmp_path)
+    sysctl = stub / "systemctl"
+    sysctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "systemctl %s\\n" "$*" >> "$STUB_LOG"\n'
+        'if [ "$1 $2" = "reload ssh" ]; then echo "Unit ssh.service not found." >&2; exit 5; fi\n'
+        "exit 0\n"
+    )
+    sysctl.chmod(0o755)
+    keys = tmp_path / "authorized_keys"
+    keys.write_text("ssh-ed25519 AAAA... test@key\n")
+    engine = _fake_engine_repo(tmp_path)
+    r = run_install(
+        "--ram-mb",
+        "8192",
+        "--non-interactive",
+        "--ssh-keys",
+        str(keys),
+        "--engine-dir",
+        str(engine),
+        "--run-user",
+        os.environ.get("USER", "nobody"),
+        env_extra=_answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt")),
+        stub=stub,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert (tmp_path / "argv.txt").exists(), "деплой должен состояться, несмотря на имя ssh-юнита"
+    log = (tmp_path / "stub.log").read_text()
+    assert "reload sshd" in log, "должен попробовать второе имя юнита"
