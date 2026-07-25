@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from engine.tests._tgapi_stub import api_base as api_base  # noqa: PLC0414 — фикстура для pytest
+
 REPO = Path(__file__).resolve().parents[2]
 DEPLOY = REPO / "deploy" / "deploy.sh"
 AGENTCTL = REPO / "deploy" / "agentctl.sh"
@@ -59,7 +61,7 @@ def test_env_template_present_and_tracked():
     r = subprocess.run(
         ["git", "check-ignore", "-q", str(tpl)], cwd=str(REPO), capture_output=True, text=True
     )
-    assert r.returncode != 0, "deploy/templates/.env.template игнорируется git — ученик его не получит"
+    assert r.returncode != 0, "шаблон .env игнорируется git — ученик его не получит"
 
 
 def test_deploys_report_dir_exists_but_reports_ignored():
@@ -162,7 +164,7 @@ def test_deploy_blocks_root_run_user():
     assert "root" in (r.stderr + r.stdout).lower()
 
 
-def test_deploy_dry_run_makes_no_instance_dir(tmp_path):
+def test_deploy_dry_run_makes_no_instance_dir(tmp_path, api_base):
     agents = tmp_path / "agents"
     brain = tmp_path / "brainsrc"
     brain.mkdir()
@@ -185,6 +187,7 @@ def test_deploy_dry_run_makes_no_instance_dir(tmp_path):
             "TG_BRAINS_BASE": str(tmp_path / "brains"),
             "TG_RUNTIME": str(REPO),
             "TG_UV_BIN": UV,
+            "TG_API_BASE": api_base,
         },
     )
     assert r.returncode == 0, r.stderr
@@ -223,13 +226,15 @@ def isolated_runtime(tmp_path_factory):
     return str(dst)
 
 
-def _green_env(tmp_path, runtime):
+def _green_env(tmp_path, runtime, api_base):
     return {
         "TG_RUN_USER": os.environ.get("USER", ""),
         "TG_AGENTS_BASE": str(tmp_path / "agents"),
         "TG_BRAINS_BASE": str(tmp_path / "brains"),
         "TG_RUNTIME": runtime,
         "TG_UV_BIN": UV,
+        # гейт §7.3 «токен валиден» стучится в getMe → в тестах это локальная заглушка
+        "TG_API_BASE": api_base,
     }
 
 
@@ -241,9 +246,9 @@ def _make_brain(tmp_path):
 
 
 @pytest.mark.skipif(not UV, reason="нужен uv для seed-шага")
-def test_deploy_green_provisions_instance(tmp_path, isolated_runtime):
+def test_deploy_green_provisions_instance(tmp_path, isolated_runtime, api_base):
     brain = _make_brain(tmp_path)
-    env = _green_env(tmp_path, isolated_runtime)
+    env = _green_env(tmp_path, isolated_runtime, api_base)
     r = run_deploy(
         "--surface",
         "tg",
@@ -286,9 +291,9 @@ def test_deploy_green_provisions_instance(tmp_path, isolated_runtime):
 
 
 @pytest.mark.skipif(not UV, reason="нужен uv для seed-шага")
-def test_deploy_idempotent_does_not_overwrite_env(tmp_path, isolated_runtime):
+def test_deploy_idempotent_does_not_overwrite_env(tmp_path, isolated_runtime, api_base):
     brain = _make_brain(tmp_path)
-    env = _green_env(tmp_path, isolated_runtime)
+    env = _green_env(tmp_path, isolated_runtime, api_base)
     args = (
         "--surface",
         "tg",
@@ -318,7 +323,7 @@ def test_deploy_idempotent_does_not_overwrite_env(tmp_path, isolated_runtime):
 
 
 @pytest.mark.skipif(not UV, reason="git required")
-def test_deploy_stops_on_dirty_git_brain(tmp_path, isolated_runtime):
+def test_deploy_stops_on_dirty_git_brain(tmp_path, isolated_runtime, api_base):
     # мозг — git-репо с грязным рабочим деревом → деплой отказывается (§6.1 dirty-мозг=стоп)
     brain = _make_brain(tmp_path)
     subprocess.run(["git", "init", "-q", str(brain)], check=True)
@@ -339,7 +344,7 @@ def test_deploy_stops_on_dirty_git_brain(tmp_path, isolated_runtime):
         check=True,
     )
     (brain / "CLAUDE.md").write_text("# изменено, не закоммичено\n")  # грязь
-    env = _green_env(tmp_path, isolated_runtime)
+    env = _green_env(tmp_path, isolated_runtime, api_base)
     r = run_deploy(
         "--surface",
         "tg",
@@ -488,10 +493,10 @@ def test_deploy_rejects_brain_metachars_no_execution(tmp_path):
 
 
 @pytest.mark.skipif(not UV, reason="нужен uv")
-def test_deploy_brand_with_apostrophe_ok(tmp_path, isolated_runtime):
+def test_deploy_brand_with_apostrophe_ok(tmp_path, isolated_runtime, api_base):
     # BRAND уходит в seed через argv → апостроф безопасен и НЕ ломает деплой
     brain = _make_brain(tmp_path)
-    env = _green_env(tmp_path, isolated_runtime)
+    env = _green_env(tmp_path, isolated_runtime, api_base)
     r = run_deploy(
         "--surface",
         "tg",
@@ -520,12 +525,12 @@ def test_deploy_brand_with_apostrophe_ok(tmp_path, isolated_runtime):
 
 
 @pytest.mark.skipif(not UV, reason="нужен uv")
-def test_deploy_scrubs_nested_env_and_symlink(tmp_path, isolated_runtime):
+def test_deploy_scrubs_nested_env_and_symlink(tmp_path, isolated_runtime, api_base):
     brain = _make_brain(tmp_path)
     (brain / "sub").mkdir()
     (brain / "sub" / ".env").write_text("SECRET=leak\n")
     (brain / "outref").symlink_to("/etc/hostname")  # симлинк наружу
-    env = _green_env(tmp_path, isolated_runtime)
+    env = _green_env(tmp_path, isolated_runtime, api_base)
     r = run_deploy(
         "--surface",
         "tg",
@@ -551,12 +556,12 @@ def test_deploy_scrubs_nested_env_and_symlink(tmp_path, isolated_runtime):
 
 
 @pytest.mark.skipif(not UV, reason="нужен uv")
-def test_deploy_requires_claude_md(tmp_path, isolated_runtime):
+def test_deploy_requires_claude_md(tmp_path, isolated_runtime, api_base):
     # мозг без CLAUDE.md (half-clone/битая папка) → СТОП (§7.3)
     brain = tmp_path / "brainsrc"
     brain.mkdir()
     (brain / "notes.txt").write_text("нет CLAUDE.md\n")
-    env = _green_env(tmp_path, isolated_runtime)
+    env = _green_env(tmp_path, isolated_runtime, api_base)
     r = run_deploy(
         "--surface",
         "tg",
@@ -577,9 +582,9 @@ def test_deploy_requires_claude_md(tmp_path, isolated_runtime):
 
 
 @pytest.mark.skipif(not UV, reason="нужен uv")
-def test_deploy_cc_token_rotation(tmp_path, isolated_runtime):
+def test_deploy_cc_token_rotation(tmp_path, isolated_runtime, api_base):
     brain = _make_brain(tmp_path)
-    env = _green_env(tmp_path, isolated_runtime)
+    env = _green_env(tmp_path, isolated_runtime, api_base)
     base = (
         "--surface",
         "tg",
