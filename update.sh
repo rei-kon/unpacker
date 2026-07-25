@@ -249,10 +249,14 @@ restore_dbs() {
   for name in ${INSTANCES+"${INSTANCES[@]}"}; do
     [ -z "$RESTORE_ONLY" ] || [ "$RESTORE_ONLY" = "$name" ] || continue
     inst="$AGENTS_BASE/$name"
-    latest=""
-    if [ -d "$inst/state/backups" ]; then
-      latest="$(ls -1 "$inst/state/backups" 2>/dev/null | sort | tail -1)"
-    fi
+    # Самый свежий бэкап выбираем по метке времени в имени каталога (<релиз>-ГГГГММДД-ЧЧММСС),
+    # а не по алфавиту: имя релиза само может содержать дефисы (v1.0.0-rc1).
+    latest=""; local d b stamp best_stamp=""
+    for d in "$inst"/state/backups/*/; do
+      [ -d "$d" ] || continue
+      b="$(basename "$d")"; stamp="${b: -15}"
+      if [ -z "$latest" ] || [ "$stamp" \> "$best_stamp" ]; then latest="$b"; best_stamp="$stamp"; fi
+    done
     if [ -z "$latest" ]; then
       say "  ! $name: бэкапов нет ($inst/state/backups) — восстанавливать нечего"
       continue
