@@ -45,17 +45,23 @@ Telegram (`--surface tg`). Веб — это Фаза 3, standalone — Фаза
 
 Токен в чате остаётся навсегда: он ложится в историю Telegram и в мою же историю сессий на
 сервере. Значение из командной строки — навсегда в `/var/log/auth.log`. Поэтому веду так
-(владелец делает это на сервере по ssh, я эти команды не запускаю — их нет в моём whitelist):
+(владелец делает это на сервере по ssh, он там root; я эти команды не запускаю — их нет
+в моём whitelist). Пути полные: у root свой домашний каталог, и `~` у него означает совсем
+не то же, что у меня:
 
 ```
-mkdir -p ~/secrets && chmod 700 ~/secrets
-nano ~/secrets/<имя>.token       # вставь токен ОДНОЙ строкой, Ctrl+O, Enter, Ctrl+X
-chmod 600 ~/secrets/<имя>.token
+mkdir -p /home/unpacker/secrets && chmod 700 /home/unpacker/secrets
+nano /home/unpacker/secrets/<имя>.token   # вставь токен ОДНОЙ строкой, Ctrl+O, Enter, Ctrl+X
+chmod 600 /home/unpacker/secrets/<имя>.token
+chown -R unpacker:unpacker /home/unpacker/secrets
 ```
+
+(`/home/unpacker` — домашний каталог пользователя движка. Если движок ставили под другим
+пользователем, точный путь машина держит в `/etc/unpacker/engine.conf`, ключ `TG_RUN_USER`.)
 
 Дальше мне нужен только путь: я передаю его скрипту флагом `--token-file` (для токена
 подписки — `--cc-token-file`), скрипт читает файл один раз. После деплоя напоминаю удалить
-файл: `shred -u ~/secrets/<имя>.token`.
+файл: `shred -u /home/unpacker/secrets/<имя>.token`.
 
 Если владелец всё-таки прислал токен прямо в чат — не ругаюсь, а: (1) в своих сообщениях
 показываю его как `[REDACTED]`, (2) сам сохраняю его в файл `chmod 600` и дальше работаю
@@ -73,7 +79,7 @@ chmod 600 ~/secrets/<имя>.token
 Первый запуск — вхолостую, он же и покажет гейты:
 
 ```
-sudo /opt/unpacker/deploy/deploy.sh --surface tg --name <имя> --token-file ~/secrets/<имя>.token --users <id> --brain <путь> --dry-run
+sudo /opt/unpacker/deploy/deploy.sh --surface tg --name <имя> --token-file /home/unpacker/secrets/<имя>.token --users <id> --brain <путь> --dry-run
 ```
 
 Вывод гейтов пересказываю владельцу человеческим языком (5–7 строк, без простыни).
@@ -103,7 +109,7 @@ sudo /opt/unpacker/deploy/deploy.sh --surface tg --name <имя> --token-file ~/
 · инстанс: ~/agents/<имя>/ (.env с правами 600, state/ для сессий и файлов)
 · мозг:    ~/brains/<имя>/ (копия твоей папки, без .git и .env)
 · автозапуск: agent-tg@<имя> — бот сам поднимется после перезагрузки
-· команда: sudo /opt/unpacker/deploy/deploy.sh --surface tg --name <имя> --token-file ~/secrets/<имя>.token --users <id> --brain <путь>
+· команда: sudo /opt/unpacker/deploy/deploy.sh --surface tg --name <имя> --token-file /home/unpacker/secrets/<имя>.token --users <id> --brain <путь>
 Живые боты не задеваю. Займёт около минуты.
 
 Разворачиваю? (да / поправить / стоп)

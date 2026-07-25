@@ -52,9 +52,15 @@ PENDING_FLAGS = {
 
 
 def _brain_docs() -> list[Path]:
-    """Файлы мозга + наша дока по деплою: у них один и тот же риск «выдуманного флага»."""
+    """Файлы мозга, README и наша дока по деплою.
+
+    У всех трёх один и тот же риск: напечатанный флаг или подкоманда, которых в скрипте нет.
+    README тут не для красоты — он печатает те же вызовы `agentctl.sh`, и мёртвая подкоманда
+    в нём стоит ученику того же, что мёртвый флаг в скилле.
+    """
     docs = [p for p in BRAIN.rglob("*") if p.is_file()]
     docs += [p for p in (REPO / "docs" / "deploy").rglob("*.md") if p.is_file()]
+    docs.append(REPO / "README.md")
     return sorted(docs)
 
 
