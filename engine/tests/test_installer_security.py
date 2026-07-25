@@ -24,7 +24,8 @@ UPDATE = REPO / "update.sh"
 # (объявляет обе функции), чтобы дальше скрипт не упал раньше, чем мы это заметим.
 _EVIL_COMMON = """#!/usr/bin/env bash
 touch "{marker}"
-resolve_run_identity() {{ RUN_USER=root; RUN_HOME=/root; AGENTS_BASE=/root/agents; BRAINS_BASE=/root/brains; }}
+resolve_run_identity() {{ RUN_USER=root; RUN_HOME=/root
+  AGENTS_BASE=/root/agents; BRAINS_BASE=/root/brains; }}
 resolve_uv_bin() {{ UV_BIN=/bin/true; }}
 """
 
@@ -83,6 +84,51 @@ def test_update_ignores_engine_dir_from_environment(tmp_path):
     for var in ("TG_RUNTIME", "UNPACKER_ENGINE_DIR", "ENGINE_DIR"):
         _run("--dry-run", env_extra={var: str(evil)})
         assert not marker.exists(), f"{var} уводит update.sh на чужой каталог движка (SEC-1)"
+
+
+def test_install_parses_saved_answers_instead_of_sourcing_them(tmp_path):
+    """Файл ответов ПАРСИМ, а не сорсим: `source` конфига = запуск чего угодно от root.
+
+    Ровно тот же класс дыр, что SEC-1: install.sh идёт от root, а значение из файла попадало
+    в шелл как код. Файл лежит в /etc, но защита не может держаться на «туда никто не запишет».
+    """
+    from engine.tests.test_install_scripts import (  # локальный импорт: общие заглушки
+        INSTALL,
+        _answers,
+        _base_stub,
+        _fake_engine_repo,
+    )
+
+    marker = tmp_path / "PWNED-CONF"
+    etc = tmp_path / "etc" / "unpacker"
+    etc.mkdir(parents=True)
+    (etc / "install.conf").write_text(
+        f"UNPACKER_ALLOWED_USERS=111\nUNPACKER_BRAINS_DIR=$(touch {marker})\n"
+    )
+    stub = _base_stub(tmp_path)
+    engine = _fake_engine_repo(tmp_path)
+    env = _answers(tmp_path, DEPLOY_ARGV=str(tmp_path / "argv.txt"))
+    for k in ("UNPACKER_ALLOWED_USERS", "UNPACKER_BRAINS_DIR"):
+        env.pop(k, None)
+    subprocess.run(
+        [
+            "bash",
+            str(INSTALL),
+            "--ram-mb",
+            "8192",
+            "--non-interactive",
+            "--no-hardening",
+            "--engine-dir",
+            str(engine),
+            "--run-user",
+            os.environ.get("USER", "nobody"),
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}", **env},
+        timeout=180,
+    )
+    assert not marker.exists(), "значение из файла ответов исполнилось как команда"
 
 
 def test_update_refuses_world_writable_common_sh(tmp_path):
