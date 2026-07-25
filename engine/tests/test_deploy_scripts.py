@@ -45,6 +45,40 @@ def run_agentctl(*args, env_extra=None):
     return subprocess.run(["bash", str(AGENTCTL), *args], capture_output=True, text=True, env=env)
 
 
+# ── репо-гигиена: шаблоны обязаны ехать ученику вместе с репо ────────────────
+
+
+def test_env_template_present_and_tracked():
+    """`.env.template` НЕ должен попадать под `.env.*` в .gitignore.
+
+    Иначе выдача ученикам ломается молча: репо клонируется без шаблона, deploy.sh
+    падает на `sed: .env.template: No such file` уже после провизии инстанса.
+    """
+    tpl = REPO / "deploy" / "templates" / ".env.template"
+    assert tpl.exists(), "шаблон .env инстанса обязан лежать в репо"
+    r = subprocess.run(
+        ["git", "check-ignore", "-q", str(tpl)], cwd=str(REPO), capture_output=True, text=True
+    )
+    assert r.returncode != 0, "deploy/templates/.env.template игнорируется git — ученик его не получит"
+
+
+def test_deploys_report_dir_exists_but_reports_ignored():
+    """Каталог отчётов деплоя (§7.4) есть в репо, а сами отчёты — нет."""
+    keep = REPO / "deploys" / ".gitkeep"
+    assert keep.exists(), "нужен deploys/.gitkeep — Распаковщику некуда писать отчёт"
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", str(REPO / "deploys" / "2026-07-25-demo.md")],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+    )
+    assert ignored.returncode == 0, "отчёты деплоя должны быть в .gitignore (пути/имена владельца)"
+    tracked = subprocess.run(
+        ["git", "check-ignore", "-q", str(keep)], cwd=str(REPO), capture_output=True, text=True
+    )
+    assert tracked.returncode != 0, ".gitkeep не должен игнорироваться — иначе каталога не будет"
+
+
 # ── deploy.sh: валидация и гейты ────────────────────────────────────────────
 
 
