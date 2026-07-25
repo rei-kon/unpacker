@@ -19,6 +19,7 @@ from engine.core.sendfile import (
     SandboxError,
     blocked_message,
     extract_send_files,
+    hide_partial_marker,
 )
 
 
@@ -379,3 +380,33 @@ def test_missing_file_message_says_missing(world):
         msg = blocked_message("docs/ghost.pdf", exc)
     assert "не наш" not in msg.lower()  # не путаем «нет файла» с «запрещено»
     assert "нет" in msg.lower() or "не найд" in msg.lower()
+
+
+# ── hide_partial_marker: только для черновика псевдо-стриминга ────────────────
+
+
+def test_hide_partial_marker_removes_complete_marker():
+    assert "SEND_FILE" not in hide_partial_marker("Готово [SEND_FILE:kp.pdf] держи")
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ["[", "[S", "[SEND", "[SEND_FILE", "[SEND_FILE:", "[SEND_FILE:state/отч"],
+)
+def test_hide_partial_marker_removes_unfinished_tail(tail):
+    assert hide_partial_marker(f"Секунду, собираю {tail}").strip() == "Секунду, собираю"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "смотри [ссылку",  # обычная скобка
+        "вот [текст](url) внутри",  # готовая markdown-ссылка
+        "начал [тек",  # незакрытая markdown-ссылка
+        "массив a[0] = 1",
+        "[SEND_MAIL:кому] — не наш маркер",
+    ],
+)
+def test_hide_partial_marker_keeps_ordinary_brackets(text):
+    """Лечить мигание маркера ценой съеденных квадратных скобок нельзя."""
+    assert hide_partial_marker(text) == text

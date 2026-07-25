@@ -16,6 +16,7 @@ import contextlib
 import logging
 from typing import Any
 
+from engine.core.sendfile import hide_partial_marker
 from engine.core.streaming import split_message
 
 logger = logging.getLogger("unpacker.engine")
@@ -107,7 +108,10 @@ class DraftStreamer:
             await asyncio.sleep(self._interval)
 
     async def _flush(self) -> None:
-        text = "".join(self._buf)
+        # Маркер `[SEND_FILE:]` из черновика убираем ВСЕГДА, включая недописанный хвост:
+        # финал его вырежет, а до финала человек видел служебную строку с абсолютным путём
+        # на сервере внутри — и через секунду она исчезала (residual-находка ревью).
+        text = hide_partial_marker("".join(self._buf))
         if not text.strip():
             return
         first = split_message(text, self._max)[0]
