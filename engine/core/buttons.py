@@ -19,27 +19,23 @@ logger = logging.getLogger("unpacker.engine")
 
 
 class ButtonRegistry:
-    def __init__(self, path: str | Path, *, enabled: bool = True):
+    """Реестр существует ⇔ кнопки включены (K10: одна конвенция косметики §6.1).
+
+    Флага `enabled` внутри нет намеренно: `BUTTONS_ENABLED=false` означает «реестра нет»
+    (runtime не создаёт объект), и адаптер убирает ряд целиком. Разница с «в файле нет
+    кнопок» сохраняется: там реестр есть и возвращает пустой список, а системный ряд
+    (Проекты/Статус/Стоп) остаётся полезным.
+    """
+
+    def __init__(self, path: str | Path):
         self._path = Path(path)
-        self._enabled = enabled
         self._buttons: list[ButtonSpec] = []
         # Отпечаток файла: (mtime_ns, size, inode). Только mtime мало — правка «в ту же
         # наносекунду» бывает при копировании файла целиком (cp сохраняет mtime).
         self._stamp: tuple[int, int, int] | None = None
 
-    @property
-    def enabled(self) -> bool:
-        """Флаг .env живёт здесь одним местом: адаптер спрашивает, а не хранит копию флага.
-
-        Разница между «выключено» и «в файле нет кнопок» важна для UX: выключено — ряда нет
-        совсем; кнопок нет — системный ряд (Проекты/Статус/Стоп) всё равно полезен.
-        """
-        return self._enabled
-
     def get(self) -> list[ButtonSpec]:
         """Актуальные кнопки. Перечитывает файл при изменении, ошибки не пробрасывает."""
-        if not self._enabled:
-            return []
         stamp = self._read_stamp()
         if stamp is None:
             # файла нет: на первом вызове это честный «кнопок нет», после — «его снесли,

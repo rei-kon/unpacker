@@ -1,42 +1,98 @@
-"""Отдача файлов агентом: маркер `[SEND_FILE:путь]` + песочница путей — §9, §8.2.
+"""Отдача файлов агентом: маркер `[SEND_FILE:путь]` + проверка путей — §9, §8.2.
 
 Механизм отдачи в движке ОДИН (§9, §14): агент пишет в текст ответа маркер, движок вырезает
 его и отправляет файл документом. MCP-тулы под это не заводим — лишняя поверхность.
 
-Плата за простоту: путь диктует МОДЕЛЬ. А модель читает недоверенные файлы (uploads) и чужие
-мозги, то есть путь — недоверенный ввод даже когда «агент свой». Поэтому разрешены ровно два
-корня: папка-мозг проекта и `state/` инстанса (там же uploads — файл, пришедший от владельца,
-можно вернуть). Всё остальное — блок с понятной строкой в чат:
+## Что это на самом деле (честно, SEC-9)
+
+Это **guardrail против ошибки модели, а не sandbox против агента**. Агент внутреннего контура
+работает с `bypassPermissions`, у него есть Bash — и `cp ~/.claude/.credentials.json
+brain/notes.txt` обходит любую проверку пути, потому что после копии файл действительно лежит
+внутри разрешённого корня под невинным именем. Так же не ловятся hardlink (у жёсткой ссылки нет
+«цели», `resolve()` её не раскроет) и TOCTOU-подмена содержимого после проверки.
+
+Настоящая защита от агента — урезанный ToolPolicy клиентского контура (Фаза 4). Здесь мы решаем
+задачу поменьше, но реальную: путь диктует МОДЕЛЬ, а модель читает недоверенные файлы (uploads)
+и чужие мозги. Значит путь — недоверенный ввод даже когда «агент свой», и модель, которую
+уговорили строкой в файле, не должна одним маркером выдать секрет:
 
   • `/etc/passwd`, `/root/.ssh/id_rsa`      — абсолютный путь наружу;
   • `../../.env`                            — токен бота инстанса;
   • `~/.claude/.credentials.json`           — токен подписки владельца;
   • симлинк из мозга на файл снаружи        — легальное имя, чужая цель.
 
-Проверка одна и надёжная: `Path.resolve()` (раскрывает `..` И симлинки) обязан лежать внутри
-одного из корней. Проверять текст пути на «..» — путь в никуда: симлинки так не поймать.
+## Две проверки, а не одна
+
+1. **Корни.** `Path.resolve()` (раскрывает `..` И симлинки) обязан лежать внутри одного из
+   разрешённых корней: папка-мозг проекта и `state/` инстанса (там же uploads — файл,
+   пришедший от владельца, можно вернуть). Проверять текст пути на «..» — путь в никуда:
+   симлинки так не поймать.
+2. **Deny-list по имени, безусловный.** Корни приходят из конфига, а конфиг ученик правит
+   руками: `STATE_DIR=.` или `DB_PATH=state.db` в старой версии делали корнем каталог
+   инстанса вместе с `.env`. Поэтому секретные ИМЕНА запрещены всегда, независимо от корней —
+   ремень поверх подтяжек (K1/SEC-5).
 """
 
 from __future__ import annotations
 
+import fnmatch
+import logging
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
+logger = logging.getLogger("unpacker.engine")
 
 # Маркер намеренно однострочный и без `]` внутри: жадный матч через абзац съел бы полответа.
 _MARKER_RE = re.compile(r"\[SEND_FILE:([^\]\n]*)\]")
 MAX_SEND_BYTES = 50 * 1024 * 1024  # предел Bot API на отправку документа ботом
 
-Reason = str  # "empty" | "home" | "outside" | "missing" | "not_file" | "too_big" | "bad_path"
+# Имена, которые не отдаём НИКОГДА — даже лежащие внутри разрешённого корня.
+# Список короткий и про секреты: разрастись он не должен, потому что каждый лишний шаблон
+# отнимает у агента легальный файл (отказ виден человеку строкой в чате, но всё равно шум).
+_DENY_GLOBS: tuple[str, ...] = (
+    ".env",
+    ".env.*",
+    "*.credentials.json",
+    "id_*",  # id_rsa, id_ed25519 и их .pub
+    "*.pem",
+)
+# `.git/config` держит токен приватного репо в URL remote — проверяется парой (parent, name)
+_DENY_PAIRS: tuple[tuple[str, str], ...] = ((".git", "config"),)
+
+Reason = Literal[
+    "empty",  # маркер без пути
+    "home",  # путь начинается с ~
+    "outside",  # вне разрешённых корней
+    "denied",  # секретное имя (deny-list) — независимо от корней
+    "missing",  # файла нет
+    "not_file",  # каталог/устройство/сокет
+    "too_big",  # больше лимита Bot API
+    "bad_path",  # NUL-байт, цикл симлинков, относительный путь без base
+]
 
 
 class SandboxError(Exception):
-    """Путь не прошёл песочницу. `reason` — машинный код, текст — для лога."""
+    """Путь не прошёл проверку. `reason` — машинный код, текст — для лога."""
 
     def __init__(self, reason: Reason, detail: str = ""):
         super().__init__(detail or reason)
-        self.reason = reason
+        self.reason: Reason = reason
         self.detail = detail
+
+
+@dataclass(frozen=True)
+class SendFilePolicy:
+    """Отдача файлов включена; `state_root` — второй корень проверки путей (§8.2).
+
+    Одна конвенция косметики (K10): объект есть — фича включена, `None` — выключена флагом
+    `.env`. Раньше «включено» и «а корень-то известен?» были двумя независимыми полями, и
+    состояние «send_file_enabled=True, state_dir=None» было тихо-полурабочим.
+    """
+
+    state_root: Path
 
 
 def extract_send_files(text: str) -> tuple[str, list[str]]:
@@ -60,23 +116,56 @@ def extract_send_files(text: str) -> tuple[str, list[str]]:
     return cleaned.strip("\n"), paths
 
 
+def is_denied_name(path: Path) -> bool:
+    """Секретное имя из deny-list? Смотрим на РАЗРЕШЁННЫЙ путь, а не на то, что дал агент.
+
+    Симлинк `readme.txt` → `.env` ловится именно здесь: `resolve()` уже вернул настоящее имя.
+    """
+    name = path.name
+    if any(fnmatch.fnmatch(name, glob) for glob in _DENY_GLOBS):
+        return True
+    return any(path.parent.name == parent and name == leaf for parent, leaf in _DENY_PAIRS)
+
+
 class FileSandbox:
     """Разрешённые корни для отдачи файлов. Пустой список корней = не отдаём ничего."""
 
-    def __init__(self, roots: Sequence[str | Path], *, max_bytes: int = MAX_SEND_BYTES):
+    def __init__(
+        self,
+        roots: Sequence[str | Path],
+        *,
+        base: str | Path | None = None,
+        max_bytes: int = MAX_SEND_BYTES,
+    ):
         # Корни резолвим сразу: сам корень может быть симлинком (/tmp → /private/tmp на macOS),
         # и тогда сравнение «внутри корня» ложно провалилось бы на легальном файле.
         self._roots: list[Path] = []
         for root in roots:
             try:
                 self._roots.append(Path(root).resolve())
-            except OSError:
-                continue
+            except (OSError, RuntimeError, ValueError) as exc:
+                # K13: выпавший корень — не пустяк, а урезанная песочница. Молчать нельзя:
+                # человек получит «файл вне разрешённых корней» на легальном файле и не
+                # поймёт, почему. ValueError — NUL-байт в пути (Path.resolve его бросает).
+                logger.warning("корень песочницы %r не резолвится, пропускаю: %s", str(root), exc)
+        # base — от чего считать ОТНОСИТЕЛЬНЫЙ путь (cwd агента = папка-мозг, §5.2).
+        # Явное поле вместо «первого корня» (K5): порядок списка корней был неявным
+        # контрактом, который ломался при любой перестановке аргументов.
+        self._base: Path | None = None
+        if base is not None:
+            try:
+                self._base = Path(base).resolve()
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.warning("base песочницы %r не резолвится: %s", str(base), exc)
         self._max_bytes = max_bytes
 
     @property
     def roots(self) -> list[Path]:
         return list(self._roots)
+
+    @property
+    def base(self) -> Path | None:
+        return self._base
 
     def resolve(self, raw: str) -> Path:
         """Проверить путь и вернуть реальный файл. Всё непрошедшее → SandboxError."""
@@ -94,15 +183,18 @@ class FileSandbox:
 
         path = Path(candidate)
         if not path.is_absolute():
-            # cwd агента = папка-мозг (§5.2), поэтому относительный путь считаем от неё
-            path = self._roots[0] / path
+            if self._base is None:
+                raise SandboxError("bad_path", "относительный путь, а базового каталога нет")
+            path = self._base / path
         try:
             real = path.resolve()  # раскрывает и `..`, и симлинки — главная защита
-        except (OSError, RuntimeError) as exc:  # RuntimeError — цикл симлинков
+        except (OSError, RuntimeError, ValueError) as exc:  # RuntimeError — цикл симлинков
             raise SandboxError("bad_path", f"путь не разрешается: {exc}") from exc
 
         if not any(real == root or real.is_relative_to(root) for root in self._roots):
             raise SandboxError("outside", f"{real} вне разрешённых корней")
+        if is_denied_name(real):
+            raise SandboxError("denied", f"{real.name} в deny-list секретных имён")
         if not real.exists():
             raise SandboxError("missing", f"{real} не существует")
         if not real.is_file():
@@ -113,10 +205,11 @@ class FileSandbox:
         return real
 
 
-_REASON_TEXT = {
+_REASON_TEXT: dict[Reason, str] = {
     "empty": "путь пустой",
     "home": "путь ведёт в домашний каталог — такие файлы я не отдаю",
     "outside": "файл вне папки проекта и состояния агента — не отдаю по правилам безопасности",
+    "denied": "такие файлы я не отдаю никогда (секреты и ключи)",
     "missing": "такого файла нет",
     "not_file": "это не файл (каталог или устройство)",
     "too_big": "файл больше лимита Telegram на отправку",

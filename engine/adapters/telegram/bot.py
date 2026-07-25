@@ -50,7 +50,13 @@ from engine.core.events import TextDelta, TextStart, ToolStarted
 from engine.core.formatting import to_telegram_markdown
 from engine.core.pool import ClientPool
 from engine.core.security import AllowList
-from engine.core.sendfile import FileSandbox, SandboxError, blocked_message, extract_send_files
+from engine.core.sendfile import (
+    FileSandbox,
+    SandboxError,
+    SendFilePolicy,
+    blocked_message,
+    extract_send_files,
+)
 from engine.core.store import Store
 from engine.core.streaming import split_message
 from engine.core.uploads import frame_attachment_prompt
@@ -100,8 +106,7 @@ class TelegramBot:
         pool: ClientPool,
         buttons: ButtonRegistry | None = None,
         intake: AttachmentIntake | None = None,
-        state_dir: str | Path | None = None,
-        send_file_enabled: bool = True,
+        send_file: SendFilePolicy | None = None,
     ):
         # Bot передаётся готовым (один на процесс): тот же объект шлёт алерты владельцу
         # (make_owner_alert) и ведёт polling — два Bot на один токен не нужны.
@@ -111,12 +116,13 @@ class TelegramBot:
         self._router = router
         self._store = store
         self._pool = pool
-        # None у buttons/intake = фича выключена флагом .env (§6.1). Отсутствие объекта, а не
-        # флаг внутри объекта: выключенную фичу нельзя случайно вызвать — её просто нет.
+        # ОДНА конвенция косметики §6.1 (K10): объект есть — фича включена, None — выключена
+        # флагом .env. Отсутствие объекта, а не флаг внутри объекта: выключенную фичу нельзя
+        # случайно вызвать — её просто нет, а состояния «включено, но недонастроено»
+        # (send_file_enabled=True при state_dir=None) больше не существует.
         self._buttons = buttons
         self._intake = intake
-        self._state_dir = Path(state_dir) if state_dir is not None else None
-        self._send_file_enabled = send_file_enabled
+        self._send_file = send_file
         self._register()
 
     @property
@@ -388,7 +394,7 @@ class TelegramBot:
     async def _deliver(self, chat_id: int, thread_id: int | None, text: str) -> None:
         """Отправить ответ: текст нарезкой, файлы по маркерам, ряд кнопок под последним."""
         paths: list[str] = []
-        if self._send_file_enabled:
+        if self._send_file is not None:
             text, paths = extract_send_files(text)
         files, notes = self._resolve_send_files(chat_id, thread_id, paths)
 
@@ -410,12 +416,12 @@ class TelegramBot:
     def _resolve_send_files(
         self, chat_id: int, thread_id: int | None, paths: list[str]
     ) -> tuple[list[Path], list[str]]:
-        """Прогнать пути через песочницу (§8.2). Непрошедшие → строки-объяснения человеку."""
+        """Прогнать пути через проверку (§8.2). Непрошедшие → строки-объяснения человеку."""
         if not paths:
             return [], []
-        sandbox = FileSandbox(self._sandbox_roots(chat_id, thread_id))
         files: list[Path] = []
         notes: list[str] = []
+        sandbox = self._sandbox(chat_id, thread_id)
         for raw in paths:
             try:
                 files.append(sandbox.resolve(raw))
@@ -424,22 +430,24 @@ class TelegramBot:
                 notes.append(blocked_message(raw, exc))
         return files, notes
 
-    def _sandbox_roots(self, chat_id: int, thread_id: int | None) -> list[Path]:
+    def _sandbox(self, chat_id: int, thread_id: int | None) -> FileSandbox:
         """Разрешённые корни: мозг ТЕКУЩЕГО проекта окна + state/ инстанса.
 
         Считаются на каждый ответ, а не один раз при старте: /switch меняет проект, и мозг
-        другого проекта отдавать нельзя (§8.2 — изоляция путей).
+        другого проекта отдавать нельзя (§8.2 — изоляция путей). base = папка-мозг: cwd
+        агента именно там (§5.2), от неё и считаются относительные пути.
         """
         roots: list[Path] = []
         brain = self._router.brain_path(chat_id, thread_id)
-        if brain:
-            roots.append(Path(brain))
-        if self._state_dir is not None:
-            roots.append(self._state_dir)
-        return roots
+        base = Path(brain) if brain else None
+        if base is not None:
+            roots.append(base)
+        if self._send_file is not None:
+            roots.append(self._send_file.state_root)
+        return FileSandbox(roots, base=base)
 
     def _keyboard(self) -> InlineKeyboardMarkup | None:
-        if self._buttons is None or not self._buttons.enabled:
+        if self._buttons is None:
             return None
         return build_keyboard(self._buttons.get())
 

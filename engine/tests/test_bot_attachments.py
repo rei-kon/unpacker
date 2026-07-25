@@ -27,6 +27,7 @@ from engine.core.buttons import ButtonRegistry
 from engine.core.errors import Outcome
 from engine.core.pool import ClientPool
 from engine.core.security import AllowList
+from engine.core.sendfile import SendFilePolicy
 from engine.core.store import Store
 from engine.core.uploads import UploadStore
 
@@ -183,12 +184,11 @@ def _build(stand, *, bot=None, core=None, buttons=True, uploads=True, send_file=
         router=router,
         store=stand.store,
         pool=ClientPool(factory=lambda options: None, ceiling=2, idle_timeout=60.0),
-        buttons=ButtonRegistry(stand.inst / "buttons.yaml", enabled=buttons),
+        buttons=ButtonRegistry(stand.inst / "buttons.yaml") if buttons else None,
         intake=AttachmentIntake(bot=bot, uploads=UploadStore(stand.state / "uploads"))
         if uploads
         else None,
-        state_dir=stand.state,
-        send_file_enabled=send_file,
+        send_file=SendFilePolicy(state_root=stand.state) if send_file else None,
     )
     return SimpleNamespace(tg=tg, bot=bot, core=core, router=router)
 

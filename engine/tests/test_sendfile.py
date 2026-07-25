@@ -43,7 +43,9 @@ def world(tmp_path):
     return {
         "brain": brain,
         "state": state,
-        "sandbox": FileSandbox([brain, state]),
+        # base = папка-мозг: cwd агента там (§5.2), от него считаются относительные пути.
+        # Явный аргумент вместо «первого корня в списке» — K5.
+        "sandbox": FileSandbox([brain, state], base=brain),
         "env": secrets / ".env",
         "creds": creds / ".credentials.json",
     }
@@ -222,6 +224,140 @@ def test_sandbox_without_roots_blocks_everything(world):
     # выключенная фича / нет проекта → ничего не отдаём (fail-closed)
     with pytest.raises(SandboxError):
         FileSandbox([]).resolve(str(world["brain"] / "docs" / "kp.pdf"))
+
+
+# ── deny-list по ИМЕНИ: работает независимо от корней (K1/SEC-5) ─────────────
+#
+# Корень песочницы задаётся конфигом, а конфиг ученик правит руками. Поэтому одной
+# проверки «внутри корня» мало: секретные имена запрещены всегда, даже если файл лежит
+# внутри разрешённого каталога (`DB_PATH=/opt/x/state.db` → корнем станет /opt/x).
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".env",
+        ".env.local",
+        ".env.production",
+        "google.credentials.json",
+        "id_rsa",
+        "id_ed25519.pub",
+        "server.pem",
+    ],
+)
+def test_denylisted_name_blocked_even_inside_root(world, name):
+    victim = world["brain"] / name
+    victim.write_text("SECRET", encoding="utf-8")
+    with pytest.raises(SandboxError) as exc:
+        world["sandbox"].resolve(str(victim))
+    assert exc.value.reason == "denied"
+
+
+def test_denylist_blocks_git_config(world):
+    """`.git/config` несёт токен приватного репо в remote URL."""
+    (world["brain"] / ".git").mkdir()
+    (world["brain"] / ".git" / "config").write_text("[remote]\n", encoding="utf-8")
+    with pytest.raises(SandboxError) as exc:
+        world["sandbox"].resolve(".git/config")
+    assert exc.value.reason == "denied"
+
+
+def test_denylist_survives_root_equal_to_instance_dir(world):
+    """Худший случай K1: корнем стал каталог инстанса. `.env` всё равно не уходит."""
+    instance_dir = world["env"].parent
+    wide = FileSandbox([instance_dir], base=instance_dir)
+    with pytest.raises(SandboxError) as exc:
+        wide.resolve(".env")
+    assert exc.value.reason == "denied"
+
+
+def test_denylist_catches_symlink_to_secret_name(world):
+    """Симлинк с невинным именем на `.env` — deny-list смотрит на РАЗРЕШЁННОЕ имя."""
+    (world["brain"] / "readme.txt").symlink_to(world["env"])
+    wide = FileSandbox([world["brain"], world["env"].parent], base=world["brain"])
+    with pytest.raises(SandboxError) as exc:
+        wide.resolve("readme.txt")
+    assert exc.value.reason == "denied"
+
+
+def test_denylist_does_not_block_normal_names(world):
+    """Ремень не должен мешать работе: обычный файл проходит."""
+    assert world["sandbox"].resolve("docs/kp.pdf").name == "kp.pdf"
+
+
+def test_denylist_message_is_human_readable(world):
+    victim = world["brain"] / ".env"
+    victim.write_text("x", encoding="utf-8")
+    try:
+        world["sandbox"].resolve(".env")
+    except SandboxError as exc:
+        msg = blocked_message(".env", exc)
+    assert ".env" in msg and "Traceback" not in msg
+
+
+# ── явный base для относительных путей (K5) ──────────────────────────────────
+
+
+def test_relative_path_uses_explicit_base(world):
+    """Относительный путь считается от ЯВНОГО base, а не от «первого корня»."""
+    sandbox = FileSandbox([world["state"], world["brain"]], base=world["brain"])
+    assert sandbox.resolve("docs/kp.pdf").name == "kp.pdf"
+
+
+def test_without_base_relative_path_is_rejected(world):
+    """Нет base → относительный путь некуда считать: честный отказ вместо угадывания."""
+    sandbox = FileSandbox([world["brain"]], base=None)
+    with pytest.raises(SandboxError) as exc:
+        sandbox.resolve("docs/kp.pdf")
+    assert exc.value.reason == "bad_path"
+
+
+def test_unresolvable_root_is_logged(tmp_path, caplog):
+    """K13: корень, который не резолвится, не должен пропадать молча."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="unpacker.engine"):
+        FileSandbox([tmp_path / "нет-такого\x00"])
+    assert caplog.records, "выпавший корень песочницы обязан оставить след в логе"
+
+
+# ── hardlink и TOCTOU (пробел покрытия S3) ───────────────────────────────────
+
+
+def test_hardlink_inside_root_is_allowed_and_named_honestly(world):
+    """Hardlink на секрет НЕ ловится resolve() — ловится deny-list по имени цели.
+
+    Честная фиксация границы: hardlink с невинным именем внутри корня песочницу пройдёт
+    (у жёсткой ссылки нет «цели», resolve её не раскроет). Именно поэтому §8.2 называет
+    это guardrail'ом против ошибки модели, а не sandbox'ом против агента с Bash: реальная
+    защита — ToolPolicy Фазы 4 (SEC-9).
+    """
+    link = world["brain"] / "innocent.txt"
+    link.hardlink_to(world["env"])
+    got = world["sandbox"].resolve("innocent.txt")
+    assert got.name == "innocent.txt"
+
+
+def test_denylisted_hardlink_name_still_blocked(world):
+    """А вот hardlink, названный `.env`, deny-list остановит."""
+    link = world["brain"] / ".env"
+    link.hardlink_to(world["env"])
+    with pytest.raises(SandboxError) as exc:
+        world["sandbox"].resolve(".env")
+    assert exc.value.reason == "denied"
+
+
+def test_toctou_swap_after_resolve_is_out_of_scope(world):
+    """TOCTOU: между resolve() и отправкой файл можно подменить.
+
+    Тест закрепляет ГРАНИЦУ, а не защиту: путь уже проверен, подмена содержимого по тому
+    же пути ничем не ловится. Это записано в docstring модуля как известный предел (SEC-9).
+    """
+    victim = world["brain"] / "report.txt"
+    victim.write_text("безобидно", encoding="utf-8")
+    checked = world["sandbox"].resolve("report.txt")
+    victim.write_text("SECRET", encoding="utf-8")
+    assert checked.read_text(encoding="utf-8") == "SECRET"
 
 
 # ── сообщение человеку: понятная строка, не краш ─────────────────────────────

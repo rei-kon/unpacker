@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import field_validator
@@ -32,7 +33,13 @@ class Settings(BaseSettings):
     # Auth подписки (наследуется subprocess claude CLI)
     claude_code_oauth_token: str | None = None
 
-    # Инстанс-состояние (§4: живёт в ~/agents/<name>/state/, не в мозге)
+    # Инстанс-состояние (§4: живёт в ~/agents/<name>/state/, не в мозге).
+    # STATE_DIR — ЯВНЫЙ корень состояния и единственный источник для проверки путей
+    # `[SEND_FILE:]` (§8.2). Раньше корень выводился как parent(db_path), и при дефолтном
+    # `DB_PATH=state.db` им становился каталог инстанса — вместе с `.env`, где лежат токен
+    # бота и токен подписки (K1/M-07/SEC-5/C17). Настройка развязана: сдвиг БД больше не
+    # двигает границу безопасности.
+    state_dir: str = "state"
     db_path: str = "state.db"
     health_path: str = "health.json"
 
@@ -47,7 +54,9 @@ class Settings(BaseSettings):
     buttons_enabled: bool = True
     buttons_path: str = "buttons.yaml"
     uploads_enabled: bool = True
-    uploads_dir: str = "state/uploads"
+    # None → считаем от STATE_DIR (одна вселенная путей). Явный UPLOADS_DIR остаётся
+    # рабочей ручкой: у кого-то uploads уезжают на отдельный диск.
+    uploads_dir: str | None = None
     # Потолок на приём файла. Больше предела Bot API поднять нельзя (валидатор ниже):
     # движок обещал бы то, чего Telegram не даст, — тихий отказ вместо честного сообщения.
     max_upload_bytes: int = MAX_UPLOAD_BYTES
@@ -57,6 +66,13 @@ class Settings(BaseSettings):
     def owner_user_id(self) -> int | None:
         """Владелец = первый из allow-list (кому шлём health-алерты §5.4)."""
         return self.allowed_user_ids[0] if self.allowed_user_ids else None
+
+    @property
+    def uploads_path(self) -> Path:
+        """Куда кладём принятые файлы: явный UPLOADS_DIR либо `<STATE_DIR>/uploads`."""
+        if self.uploads_dir:
+            return Path(self.uploads_dir)
+        return Path(self.state_dir) / "uploads"
 
     @field_validator("max_upload_bytes", mode="after")
     @classmethod
