@@ -144,13 +144,19 @@ def test_deploy_report_path_is_absolute_and_outside_the_brain():
     агенту писать в мозг: git-мозг становится грязным и гейт чистоты блокирует следующий
     деплой. Отчёт живёт в состоянии инстанса.
     """
-    body = SKILL_DEPLOY.read_text()
-    paths = re.findall(r"[\w~/.<>-]*deploys/<дата>-<name>\.md", body)
-    assert paths, "в скилле должен быть назван путь отчёта с форматом имени"
-    for p in paths:
-        assert p.startswith(("/", "~/")), f"путь отчёта не абсолютный: {p}"
-        assert "/state/" in p, f"отчёт пишется в состояние инстанса (§4), получено: {p}"
-    assert "brains/" not in " ".join(paths), "отчёт не может лежать в папке-мозге"
+    found: list[tuple[Path, str]] = []
+    for doc in _brain_docs():
+        if doc.suffix != ".md":
+            continue
+        for path in re.findall(r"[\w~/.<>-]*deploys/<дата>-<name>\.md", doc.read_text()):
+            found.append((doc, path))
+    assert found, "путь отчёта с форматом имени должен быть назван (§7.4)"
+    assert any(doc == SKILL_DEPLOY for doc, _ in found), "в скилле деплоя — обязательно"
+    for doc, path in found:
+        where = doc.relative_to(REPO)
+        assert path.startswith(("/", "~/")), f"{where}: путь отчёта не абсолютный: {path}"
+        assert "/state/" in path, f"{where}: отчёт пишется в состояние инстанса (§4): {path}"
+        assert "brains/" not in path, f"{where}: отчёт не может лежать в папке-мозге: {path}"
 
 
 def test_operate_skill_does_not_restart_unit_after_button_edit():
