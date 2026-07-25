@@ -21,6 +21,7 @@ from engine.tests.conftest import (
     GOOD_TOKEN,
     deploy_env,
     make_brain,
+    module_hidden,
     out_of,
     run_deploy,
 )
@@ -472,18 +473,13 @@ def test_buttons_bridge_warns_when_brainkit_absent(tmp_path, api_base, isolated_
     имеет права падать целиком из-за отсутствующей необязательной части. Модуль прячем
     переименованием (runtime у тестов общий на сессию — удалять его насовсем нельзя).
     """
-    real = Path(isolated_runtime) / "engine" / "brainkit.py"
-    hidden = real.with_suffix(".py.hidden")
-    real.rename(hidden)
-    try:
+    with module_hidden(Path(isolated_runtime) / "engine" / "brainkit.py"):
         env = _green(tmp_path, api_base, isolated_runtime)
         r = run_deploy(*_real_args(tmp_path, "nobuttons"), env_extra=env)
         assert r.returncode == 0, r.stderr + r.stdout
         out = _out(r)
         assert "buttons" in out and ("brainkit" in out or "кнопк" in out)
         assert not (Path(env["TG_AGENTS_BASE"]) / "nobuttons" / "buttons.yaml").exists()
-    finally:
-        hidden.rename(real)
 
 
 def test_buttons_bridge_exports_when_brainkit_present(tmp_path, api_base, isolated_runtime):
@@ -746,3 +742,44 @@ def test_missing_token_file_refused_early(tmp_path, api_base):
         env_extra=_env(tmp_path, api_base),
     )
     assert r.returncode == 2, r.stdout + r.stderr
+
+
+# ── M2: успех моста кнопок ≠ warn, битый паспорт — отдельная ветка ────────────
+
+
+def test_buttons_bridge_success_is_not_a_warning(tmp_path, api_base, isolated_runtime):
+    """Тесты моста проверяли только «файл появился». Успех обязан быть ТИХИМ.
+
+    Иначе ветки «экспортировал» и «не смог, кнопок не будет» неразличимы, и молчаливая
+    поломка моста выглядит как норма.
+    """
+    env = _green(tmp_path, api_base, isolated_runtime)
+    brain = _brain_with_buttons(tmp_path)
+    r = run_deploy(*_real_args(tmp_path, "quietbtn", brain=brain), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (Path(env["TG_AGENTS_BASE"]) / "quietbtn" / "buttons.yaml").exists()
+    # смотрим ИМЕННО строки про кнопки: в выводе есть законный warn про отсутствие systemctl
+    btn_lines = [
+        ln for ln in (r.stdout + r.stderr).splitlines() if "buttons" in ln or "кнопк" in ln.lower()
+    ]
+    assert btn_lines, "шаг моста должен быть виден в выводе"
+    assert not any("warn" in ln.lower() for ln in btn_lines), (
+        f"успех напечатан как warn: {btn_lines}"
+    )
+    assert any("экспортирован" in ln for ln in btn_lines)
+
+
+def test_buttons_bridge_warns_on_broken_passport(tmp_path, api_base, isolated_runtime):
+    """Паспорт битый (кнопка без prompt) → громкое предупреждение, но бот всё равно поднят."""
+    env = _green(tmp_path, api_base, isolated_runtime)
+    brain = _brain(tmp_path)
+    (brain / ".brain.yaml").write_text(
+        'name: "Битый"\nbuttons:\n  - label: "Без промпта"\n', encoding="utf-8"
+    )
+    r = run_deploy(*_real_args(tmp_path, "badpass", brain=brain), env_extra=env)
+    assert r.returncode == 0, "деплой не падает из-за необязательного моста"
+    out = _out(r)
+    assert "warn" in out and ("паспорт" in out or "prompt" in out or "brainkit" in out)
+    assert not (Path(env["TG_AGENTS_BASE"]) / "badpass" / "buttons.yaml").exists(), (
+        "битый паспорт не должен оставлять огрызок buttons.yaml"
+    )

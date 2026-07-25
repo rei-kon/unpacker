@@ -1045,3 +1045,60 @@ def test_role_unpacker_warns_loudly_when_rights_not_installed(tmp_path, api_base
     assert not (tmp_path / "sudoers.d" / "unpacker").exists()
     assert "warn" in out.lower() and "install-sudoers.sh" in out
     assert "sudo" in out, "в предупреждении должна быть готовая команда"
+
+
+# ── M-13/C23/M7: .env.template — честная карта настроек инстанса ──────────────
+
+ENV_TPL = REPO / "deploy" / "templates" / ".env.template"
+
+
+def test_env_template_documents_all_phase1b_handles():
+    """Шаблон объявляет себя картой настроек, но не знал про ручки, добавленные в 1b.
+
+    Ученик правит .env глазами: чего в шаблоне нет, того для него не существует.
+    Имена — контракт с ядром (engine/core/config.py), поэтому сверяем дословно.
+    """
+    body = ENV_TPL.read_text()
+    for key in (
+        "STATE_DIR",
+        "BUTTONS_ENABLED",
+        "BUTTONS_PATH",
+        "UPLOADS_ENABLED",
+        "UPLOADS_DIR",
+        "MAX_UPLOAD_BYTES",
+        "SEND_FILE_ENABLED",
+        "AUDIENCE",
+    ):
+        assert key in body, f"в .env.template нет ручки {key} (Р8)"
+
+
+def test_env_template_has_live_state_dir_default():
+    """STATE_DIR — живая строка с дефолтом: от неё считаются и uploads, и корень песочницы."""
+    lines = [ln.strip() for ln in ENV_TPL.read_text().splitlines()]
+    assert "STATE_DIR=state" in lines
+
+
+def test_env_template_marks_declaration_only_keys():
+    """AUTH_MODE/LIMIT_* ядро НЕ читает до Фазы 4 — шаблон обязан говорить это прямо,
+    иначе владелец «выставит лимит» и будет думать, что он работает."""
+    body = ENV_TPL.read_text()
+    assert "AUTH_MODE" in body and "LIMIT_REQUESTS_PER_DAY" in body
+    low = body.lower()
+    assert "фаза 4" in low or "фазы 4" in low
+    assert "не читает" in low or "деклараци" in low
+
+
+def test_env_template_placeholders_are_all_substituted(tmp_path, api_base, isolated_runtime):
+    """Каждый {{PLACEHOLDER}} шаблона обязан подставляться deploy.sh.
+
+    Забытый плейсхолдер = мусорная строка в боевом .env (и молчаливый дефолт вместо значения).
+    """
+    import re as _re
+
+    placeholders = set(_re.findall(r"\{\{[A-Z_]+\}\}", ENV_TPL.read_text()))
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    r = run_deploy(*deploy_args(tmp_path, "phold"), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    body = (Path(env["TG_AGENTS_BASE"]) / "phold" / ".env").read_text()
+    left = {ph for ph in placeholders if ph in body}
+    assert not left, f"плейсхолдеры не подставлены: {sorted(left)}"
