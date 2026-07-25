@@ -14,6 +14,10 @@
 #   agentctl.sh health <name>        # OK/DEGRADED одной строкой (скриптовый exit code)
 #   agentctl.sh doctor <name>        # полная самодиагностика + подсказки (для ученика)
 #
+# Пути и личность run-user'а берутся ТАМ ЖЕ, где их берёт deploy.sh: env → машинный конфиг
+# /etc/unpacker/engine.conf → фолбэк (Р2). Иначе `doctor`, запущенный не так, как деплой,
+# читал другую вселенную путей и отвечал NOT DEPLOYED про живого бота (C14/ADV-05).
+#
 # Env (совпадают с deploy.sh): TG_AGENTS_BASE, TG_RUN_USER, TG_RUNTIME.
 set -euo pipefail
 
@@ -65,11 +69,12 @@ _health_marker() {
 }
 
 # systemd ActiveState юнита, либо "absent" (не установлен / нет systemctl — напр. macOS).
+# Зовём через $SYSTEMCTL из _common.sh: то же самое, чем ставит юнит deploy.sh (H6).
 _svc_state() {
-  command -v systemctl >/dev/null 2>&1 || { echo "absent"; return 0; }
+  have_systemctl || { echo "absent"; return 0; }
   local u; u="$(_unit "$1")"
-  if systemctl cat "$u" >/dev/null 2>&1; then
-    systemctl is-active "$u" 2>/dev/null || true
+  if "$SYSTEMCTL" cat "$u" >/dev/null 2>&1; then
+    "$SYSTEMCTL" is-active "$u" 2>/dev/null || true
   else
     echo "absent"
   fi
@@ -159,6 +164,18 @@ cmd_doctor() {
     absent) echo "  ✗ systemd юнит absent  → deploy.sh ставит+enable (нужен root/sudo)"; issues=$((issues+1)) ;;
     *)      echo "  ! systemd: $svc  → $([ "$(id -u)" -ne 0 ] && echo 'sudo ')systemctl status $(_unit "$name")"; issues=$((issues+1)) ;;
   esac
+
+  # ADV-16: наличие claude у RUN_USER doctor не проверял вообще — и живой «зомби-бот»
+  # (поднят, молчит на каждое сообщение, потому что CLI нет в PATH юнита) получал HEALTHY.
+  resolve_claude_bin
+  if [ -n "$CLAUDE_BIN" ]; then
+    echo "  ✓ claude CLI: $CLAUDE_BIN (в PATH юнита у $RUN_USER)"
+  else
+    echo "  ✗ claude CLI не найден в PATH юнита у $RUN_USER — бот жив, но МОЛЧИТ на каждое"
+    echo "      сообщение (движку нечем спавнить агента). Поставь CLI этому юзеру:"
+    echo "        sudo -u $RUN_USER -H npm install -g @anthropic-ai/claude-code"
+    issues=$((issues+1))
+  fi
 
   local resume; resume="$(_resume_db "$name")"
   if [ "$resume" = "present" ]; then echo "  ✓ resume: state.db есть (сессии переживут restart/reboot)"

@@ -122,6 +122,32 @@ validate_uv_bin() {
   return 0
 }
 
+# ── PATH юнита и claude CLI: ОДИН источник (Р4, ADV-16) ─────────────────────
+# PATH, с которым бежит юнит, — он же место, где ДОЛЖЕН лежать claude. Проверять CLI в
+# логин-шелле run-user'а бессмысленно: у юнита другое окружение (systemd-дефолт PATH не
+# включает ~/.local/bin и npm-prefix). Именно так рождался ADV-16: ученик ставил claude от
+# root, проверка в оболочке root была зелёной, а бот молчал на каждое сообщение.
+unit_path() {
+  printf '%s/.local/bin:%s/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+    "$RUN_HOME" "$RUN_HOME"
+}
+
+# CLAUDE_BIN: явный TG_CLAUDE_BIN → первый исполняемый claude в PATH юнита → пусто (=не найден).
+resolve_claude_bin() {
+  CLAUDE_BIN="${TG_CLAUDE_BIN:-}"
+  [ -z "$CLAUDE_BIN" ] || { [ -x "$CLAUDE_BIN" ] || CLAUDE_BIN=""; return 0; }
+  local saved_ifs="$IFS" d
+  IFS=:
+  for d in $(unit_path); do
+    if [ -x "$d/claude" ]; then CLAUDE_BIN="$d/claude"; break; fi
+  done
+  IFS="$saved_ifs"
+}
+
+# systemctl: чем зовём службы. Переопределяемо (H6) — тесты не должны трогать живой systemd.
+SYSTEMCTL="${TG_SYSTEMCTL:-systemctl}"
+have_systemctl() { command -v "$SYSTEMCTL" >/dev/null 2>&1; }
+
 # ── имя systemd-юнита: ОДИН источник (M-17) ─────────────────────────────────
 # Раньше литерал 'agent-tg@' был зашит в шести файлах, и _common.sh его не отдавал:
 # переименование поверхности молча разводило deploy.sh, agentctl.sh, update.sh и sudoers.

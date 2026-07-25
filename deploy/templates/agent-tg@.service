@@ -22,7 +22,9 @@ EnvironmentFile=REPLACE_WITH_AGENTS_BASE/%i/.env
 # PATH обязателен: SDK спавнит `claude` по PATH-lookup. systemd-дефолт PATH не включает per-user
 # установки (~/.local/bin, npm-prefix) — без этого бот поднимется, но КАЖДОЕ сообщение упадёт
 # (claude не найден). Включаем домашние bin RUN_USER + системные.
-Environment=PATH=REPLACE_WITH_RUN_HOME/.local/bin:REPLACE_WITH_RUN_HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Значение подставляет deploy.sh из unit_path() (deploy/_common.sh) — ОДИН источник с
+# проверкой «claude есть у run-user» (ADV-16): проверяем ровно тот PATH, с которым бежим.
+Environment=PATH=REPLACE_WITH_UNIT_PATH
 # venv движка живёт СНАРУЖИ дерева кода (Р1: код root-owned, venv принадлежит run-user).
 # Без этой строки `uv run` полез бы создавать .venv внутри /opt/unpacker и упал 203/EXEC —
 # бот поднялся бы «зомби». Строку удаляет deploy.sh, если внешний venv не настроен (dev).

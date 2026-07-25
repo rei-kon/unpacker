@@ -178,6 +178,9 @@ def deploy_env(
         "UNPACKER_SUDOERS_DIR": str(tmp_path / "sudoers.d"),
         # engine.conf хоста в тестах не читаем: у машины разработчика он может существовать
         "UNPACKER_ENGINE_CONF": str(tmp_path / "no-such-engine.conf"),
+        # Р4/ADV-16: отсутствие claude у run-user — БЛОКЕР деплоя. В тестах (и на CI, где
+        # claude нет вообще) подставляем заглушку явно, а не полагаемся на PATH машины.
+        "TG_CLAUDE_BIN": str(stub_bin(tmp_path, "claude", CLAUDE_STUB)),
     }
     if UV:
         e["TG_UV_BIN"] = UV
@@ -216,7 +219,9 @@ def stub_bin(tmp_path: Path, name: str, body: str) -> Path:
 
 SYSTEMCTL_STUB = """#!/usr/bin/env bash
 # Заглушка systemctl: пишет argv в $SYSTEMCTL_LOG и всегда успешна.
+# `is-active` отвечает active — иначе agentctl видел бы пустое состояние.
 printf '%s\\n' "$*" >> "${SYSTEMCTL_LOG:-/dev/null}"
+case "${1:-}" in is-active) echo active ;; esac
 exit 0
 """
 

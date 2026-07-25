@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from engine.tests.conftest import (
+    CLAUDE_STUB,
     ME,
     REPO,
     SYSTEMCTL_STUB,
@@ -950,3 +951,97 @@ def test_cc_token_rotation_restarts_unit(tmp_path, api_base, isolated_runtime):
     assert "CLAUDE_CODE_OAUTH_TOKEN=sk-NEW" in envf.read_text()
     assert log.exists(), "systemctl не вызывался вообще"
     assert "restart agent-tg@rotres" in log.read_text(), "после ротации юнит обязан рестартнуть"
+
+
+# ── ADV-16/Р4: claude у RUN_USER — блокер деплоя и отдельная проверка doctor ──
+
+
+def test_preflight_blocks_when_claude_missing_for_run_user(tmp_path, api_base):
+    """Бот без claude поднимается и молчит на КАЖДОЕ сообщение. Это блокер, а не warn.
+
+    Классика ADV-16: ученик поставил claude заранее от root (/root/.local/bin) — проверка
+    `have claude` в оболочке root зелёная, а юнит бежит от run-user и CLI не видит.
+    """
+    env = deploy_env(tmp_path, api_base)
+    env["TG_CLAUDE_BIN"] = str(tmp_path / "нет-такого-claude")
+    r = run_deploy(*deploy_args(tmp_path, "noclaude", "--dry-run"), env_extra=env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    text = (r.stdout + r.stderr).lower()
+    assert "claude" in text
+    assert "✗" in (r.stdout + r.stderr), "это блокер (✗), а не предупреждение"
+
+
+def test_unit_path_is_single_source_with_claude_check():
+    """PATH юнита и место, где ищут claude, — одно и то же (иначе проверка врёт).
+
+    Логин-шелл run-user'а тут не годится: юнит бежит с Environment=PATH, а не с логин-шеллом.
+    """
+    common = (REPO / "deploy" / "_common.sh").read_text()
+    assert "unit_path" in common, "PATH юнита обязан быть в _common.sh одним источником"
+    unit = (REPO / "deploy" / "templates" / "agent-tg@.service").read_text()
+    assert "REPLACE_WITH_UNIT_PATH" in unit, "юнит берёт PATH из того же источника"
+
+
+def test_doctor_does_not_say_healthy_without_claude(tmp_path):
+    """Живой зомби-бот получал вердикт HEALTHY: doctor наличие claude не проверял вообще."""
+    base = _fixture_instance(tmp_path, "zombie", health_status="ok")
+    sysctl = stub_bin(tmp_path, "systemctl", SYSTEMCTL_STUB)
+    common = {
+        "TG_AGENTS_BASE": str(base),
+        "TG_RUN_USER": ME,
+        "TG_SYSTEMCTL": str(sysctl),
+        "SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
+        "UNPACKER_ENGINE_CONF": str(tmp_path / "no-such-engine.conf"),
+    }
+    # сначала убеждаемся, что при живом claude вердикт действительно HEALTHY —
+    # иначе тест ниже доказывал бы что угодно
+    ok = run_agentctl(
+        "doctor",
+        "zombie",
+        env_extra={**common, "TG_CLAUDE_BIN": str(stub_bin(tmp_path, "claude", CLAUDE_STUB))},
+    )
+    assert "HEALTHY" in ok.stdout, ok.stdout + ok.stderr
+    bad = run_agentctl(
+        "doctor", "zombie", env_extra={**common, "TG_CLAUDE_BIN": str(tmp_path / "no-claude")}
+    )
+    assert "HEALTHY" not in bad.stdout, bad.stdout
+    assert "claude" in (bad.stdout + bad.stderr).lower()
+    assert bad.returncode != 0
+
+
+# ── H3: «права реально установлены» vs «громкий warn с готовой командой» ──────
+
+
+@pytest.mark.skipif(not UV, reason="нужен uv")
+def test_role_unpacker_actually_installs_sudoers(tmp_path, api_base, isolated_runtime):
+    """Единственный живой прогон --role unpacker был зелёным при НЕ установленных правах.
+
+    install-sudoers.sh выходил с 3, deploy.sh глотал это в warn — и тест ничего не замечал.
+    """
+    sysctl = stub_bin(tmp_path, "systemctl", SYSTEMCTL_STUB)
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    env["TG_SYSTEMCTL"] = str(sysctl)
+    env["SYSTEMCTL_LOG"] = str(tmp_path / "systemctl.log")
+    env["UNPACKER_DEV_OWNER_OK"] = "1"  # дерево принадлежит тест-юзеру (на VPS — root)
+    r = run_deploy(*deploy_args(tmp_path, "rights", "--role", "unpacker"), env_extra=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    target = tmp_path / "sudoers.d" / "unpacker"
+    assert target.exists(), f"права НЕ установлены, а деплой зелёный:\n{r.stdout}"
+    assert oct(target.stat().st_mode)[-3:] == "440"
+    assert ME in target.read_text()
+
+
+@pytest.mark.skipif(not UV, reason="нужен uv")
+def test_role_unpacker_warns_loudly_when_rights_not_installed(tmp_path, api_base, isolated_runtime):
+    """Права не встали (дерево небезопасно) → бот жив, но об этом сказано ГРОМКО и с командой."""
+    sysctl = stub_bin(tmp_path, "systemctl", SYSTEMCTL_STUB)
+    env = deploy_env(tmp_path, api_base, runtime=isolated_runtime)
+    env["TG_SYSTEMCTL"] = str(sysctl)
+    env["SYSTEMCTL_LOG"] = str(tmp_path / "systemctl.log")
+    env["UNPACKER_DEV_OWNER_OK"] = ""  # строгий режим: владелец дерева == run-user → отказ
+    r = run_deploy(*deploy_args(tmp_path, "norights", "--role", "unpacker"), env_extra=env)
+    assert r.returncode == 0, "деплой не должен падать: бот уже живой"
+    out = r.stdout + r.stderr
+    assert not (tmp_path / "sudoers.d" / "unpacker").exists()
+    assert "warn" in out.lower() and "install-sudoers.sh" in out
+    assert "sudo" in out, "в предупреждении должна быть готовая команда"

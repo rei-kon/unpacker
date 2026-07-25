@@ -19,12 +19,10 @@ import pytest
 from engine.tests._tgapi_stub import BAD_TOKEN, DEAD_BASE
 from engine.tests.conftest import (
     GOOD_TOKEN,
-    SYSTEMCTL_STUB,
     deploy_env,
     make_brain,
     out_of,
     run_deploy,
-    stub_bin,
 )
 
 # Фикстуры (api_base, isolated_runtime) и хелперы живут в engine/tests/conftest.py —

@@ -200,11 +200,7 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 # `enable --now`. На боевом VPS значения по умолчанию — те самые системные.
 UNIT_BASE="${TG_UNIT_DIR:-/etc/systemd/system}"
 DROPIN_BASE="${TG_DROPIN_DIR:-/etc/systemd/system}"
-SYSTEMCTL="${TG_SYSTEMCTL:-systemctl}"
-
-# systemctl может быть и заглушкой по абсолютному пути (TG_SYSTEMCTL) — тогда `command -v`
-# по имени его не найдёт; проверяем именно то, чем будем звать.
-have_systemctl() { command -v "$SYSTEMCTL" >/dev/null 2>&1; }
+# SYSTEMCTL и have_systemctl приходят из _common.sh (общие с agentctl.sh).
 # systemctl подменён (TG_SYSTEMCTL) — это dev/тестовый стенд, sudo там не нужен и в
 # неинтерактивной сессии он бы просто попросил пароль и повесил прогон.
 SYSTEMCTL_SUDO="$SUDO"; [ -z "${TG_SYSTEMCTL:-}" ] || SYSTEMCTL_SUDO=""
@@ -456,13 +452,19 @@ preflight() {
     awk "BEGIN{exit !($pv < 3.11)}" && { echo "  ! system python3 $pv (<3.11) — uv поднимет свой, ок"; warns=$((warns+1)); }
   fi
 
-  # claude CLI проверяем В КОНТЕКСТЕ RUN_USER (юнит бежит от него; root-PATH — ложная зелёнка).
-  local has_claude
-  if [ "$RUN_USER" = "$(id -un)" ]; then has_claude="$(command -v claude 2>/dev/null || true)"
-  else has_claude="$(sudo -u "$RUN_USER" -H bash -lc 'command -v claude' 2>/dev/null || true)"; fi
-  [ -n "$has_claude" ] || {
-    echo "  ! claude CLI не найден в PATH у $RUN_USER — движок не сможет спавнить агента."
-    echo "      поставь Claude Code CLI (юнит подхватит его через Environment=PATH)."; warns=$((warns+1)); }
+  # claude CLI ищем ровно в PATH ЮНИТА (Р4/ADV-16): бот бежит от run-user с этим PATH, а не
+  # в логин-шелле. Отсутствие CLI — БЛОКЕР, не предупреждение: бот поднимется и будет молчать
+  # на каждое сообщение, а `doctor` до этого фикса отвечал HEALTHY.
+  resolve_claude_bin
+  if [ -n "$CLAUDE_BIN" ]; then
+    echo "  ✓ claude CLI: $CLAUDE_BIN (в PATH юнита у $RUN_USER)"
+  else
+    echo "  ✗ claude CLI не найден в PATH юнита у $RUN_USER — бот поднимется и будет МОЛЧАТЬ"
+    echo "      на каждое сообщение. Поставь CLI именно этому юзеру:"
+    echo "        sudo -u $RUN_USER -H npm install -g @anthropic-ai/claude-code"
+    echo "      (проверка идёт по PATH юнита: $(unit_path))"
+    errs=$((errs+1))
+  fi
 
   # venv движка (Р1) живёт СНАРУЖИ дерева кода: код root-owned, venv принадлежит run-user.
   # Создаёт его install.sh/update.sh (`uv sync` от root). Здесь только проверяем готовность —
@@ -693,7 +695,7 @@ else
         -e "s|REPLACE_WITH_AGENTS_BASE|$AGENTS_BASE|g" \
         -e "s|REPLACE_WITH_UV_PATH|$UV_BIN|g" \
         -e "s|REPLACE_WITH_RUNTIME_PATH|$RUNTIME|g" \
-        -e "s|REPLACE_WITH_RUN_HOME|$RUN_HOME|g" \
+        -e "s|REPLACE_WITH_UNIT_PATH|$(unit_path)|g" \
         -e "$venv_sed" \
         "$UNIT_SRC" > "$TMP_UNIT"
     if [ "$DRY_RUN" = "true" ]; then
