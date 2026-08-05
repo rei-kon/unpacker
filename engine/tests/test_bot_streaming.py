@@ -256,6 +256,47 @@ async def test_file_goes_after_the_final_edit_and_carries_the_keyboard(stand):
     assert kind == "send_document" and markup is not None
 
 
+# ── FA2: черновик не остаётся сиротой ни на одном пути ──────────────────────
+
+
+async def test_answer_of_only_file_markers_stops_the_draft(stand):
+    """Ответ — одни маркеры файлов: доставлять черновиком нечего, но и бросать его нельзя.
+
+    Раньше черновик финализировался ТОЛЬКО когда первым в очереди шёл текст. Ответ,
+    от которого после вырезания маркеров остаются одни пробелы, оставлял в чате вечный
+    курсор ▌, а фоновый цикл черновика продолжал крутиться после ответа.
+    """
+    s = _build(stand, StreamCore(reply="[SEND_FILE:kp.pdf] [SEND_FILE:kp.pdf]"))
+    await s.tg._on_text(_message())
+    methods = s.bot.methods
+    assert "delete_message" in methods, f"черновик брошен с курсором: {methods}"
+    assert methods.index("delete_message") < methods.index("send_document"), (
+        f"курсор ▌ висит, пока уходят файлы: {methods}"
+    )
+
+
+async def test_cancelled_run_stops_the_draft(stand):
+    """Снятие задачи (рестарт бота): фоновый цикл черновика некому остановить, кроме нас."""
+
+    class HangingCore(StreamCore):
+        async def ask(self, session_id, prompt, on_event=None):
+            if on_event is not None:
+                on_event(TextStart())
+                on_event(TextDelta(text="начало ответа"))
+            await asyncio.sleep(30)  # снимут отменой, не дождавшись
+            return AskResult(text="", outcome=Outcome("ok", ""))
+
+    s = _build(stand, HangingCore())
+    task = asyncio.create_task(s.tg._on_text(_message()))
+    await asyncio.sleep(0.1)  # черновик успел появиться
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    last = s.bot.edits[-1].replace("\\", "")
+    assert "начало ответа" in last, "прочитанное не стираем"
+    assert "▌" not in last, "курсор остался — цикл черновика не остановлен"
+
+
 # ── A2: не-ok исход — показанный текст остаётся ─────────────────────────────
 
 

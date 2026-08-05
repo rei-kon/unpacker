@@ -93,6 +93,9 @@ _REAPER_INTERVAL = 60.0
 # Пометка к показанному тексту, когда генерация упала совсем (A2): человек читал ответ —
 # он остаётся в чате, а не подменяется сухим «⚠️ сбой» на пустом месте.
 _ENGINE_FAILURE = "⚠️ Сбой на стороне движка — выше то, что успел написать."
+# Прогон сняли на полпути (рестарт бота, отмена задачи). Текст остаётся человеку: он его
+# читал, и стереть прочитанное ради сухой пометки — та же потеря ответа.
+_CANCELLED = "⏹ Остановлено — выше то, что успел написать."
 # Темп черновика по умолчанию — модульная константа, а не вызов в дефолте аргумента:
 # DraftTuning заморожен, один экземпляр на процесс безопасен и читается как «дефолт движка».
 _DEFAULT_DRAFT = DraftTuning()
@@ -549,6 +552,12 @@ class TelegramBot:
                 await draft.finish()
             await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
             return
+        except asyncio.CancelledError:
+            # Прогон сняли (рестарт бота, отмена задачи). Цикл черновика — фоновая задача:
+            # некому её остановить, кроме нас, иначе в чате навсегда остаётся курсор ▌.
+            if draft is not None:
+                await draft.abort(_CANCELLED)
+            raise
         except Exception:
             # Генерация упала: накопленный текст ядро выбросило, но показанный человеку —
             # остаётся в чате с пометкой. Сообщение в чат пришлёт errors-handler.
@@ -601,12 +610,18 @@ class TelegramBot:
             items = [OutText("…")]
 
         markup = self._keyboard()
-        if draft is not None and isinstance(items[0], OutText):
-            # Клавиатуру вешаем на edit только если доставлять больше нечего: правило
-            # «ряд под ПОСЛЕДНИМ элементом» от переезда финала в черновик не меняется.
-            only = len(items) == 1
-            if await draft.finalize(items[0].text, markup=markup if only else None):
-                items = items[1:]
+        if draft is not None:
+            first = items[0]
+            if isinstance(first, OutText):
+                # Клавиатуру вешаем на edit только если доставлять больше нечего: правило
+                # «ряд под ПОСЛЕДНИМ элементом» от переезда финала в черновик не меняется.
+                only = len(items) == 1
+                if await draft.finalize(first.text, markup=markup if only else None):
+                    items = items[1:]
+            else:
+                # Доставлять черновиком нечего (ответ — один файл): раньше он оставался
+                # висеть с вечным курсором ▌, а фоновый цикл продолжал крутиться.
+                await draft.finish()
 
         last = len(items) - 1
         for i, item in enumerate(items):
