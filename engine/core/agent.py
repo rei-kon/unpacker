@@ -187,6 +187,14 @@ class AgentCore:
             stopped = False
             last: Final | None = None
             for attempt in (0, 1):
+                if attempt and self._take_stop_flag(session_id):
+                    # «стоп» пришёл в окно между попытками — повтор отменяется. Без этой
+                    # проверки просьба долетала бы только до идущей генерации, а пауза
+                    # перед повтором оставалась слепой зоной
+                    if last is None:
+                        return AskResult("", _STOPPED, note=note)
+                    stopped = True
+                    break
                 try:
                     last = await self._generate(
                         session_id, options, prompt, on_event, fingerprint=session.model
@@ -409,13 +417,15 @@ class AgentCore:
     async def interrupt(self, session_id: str) -> None:
         """Control-plane: прервать идущую генерацию сессии. МИМО session-lock. Безопасный no-op.
 
-        Пометку ставим ДО вызова: клиент рвёт поток мгновенно, и `ask` успеет разобрать
-        падение раньше, чем мы вернёмся из `interrupt`.
+        Пометку ставим ДО вызова и БЕЗ оглядки на живого клиента. До — потому что клиент
+        рвёт поток мгновенно, и `ask` успеет разобрать падение раньше, чем мы вернёмся.
+        Без оглядки — потому что живого клиента может не быть и посреди работы: в паузе
+        перед повтором он уже выселен, а просьба человека действует и на повтор.
         """
+        self._stopped.add(session_id)
         client = self._pool.get_live(session_id)
         if client is None:
             return
-        self._stopped.add(session_id)
         try:
             await client.interrupt()
         except Exception:  # noqa: BLE001 — interrupt по вытесняемому клиенту = no-op

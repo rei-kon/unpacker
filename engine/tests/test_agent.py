@@ -859,6 +859,31 @@ async def test_stop_midway_is_not_a_failed_turn(store):
     await pool.close_all()
 
 
+async def test_stop_during_retry_pause_cancels_retry(store):
+    """Пауза перед повтором — окно, в котором живого клиента в пуле уже нет. Нажатый в него
+    «стоп» обязан отменить повтор: иначе человек видит честное «⏹ Прервал», а через три
+    секунды стартует ровно та задача, которую он попросил прекратить."""
+    holder = {}
+
+    class StopWhilePausing(_Sleeper):
+        async def __call__(self, seconds):
+            await super().__call__(seconds)
+            await holder["core"].interrupt(holder["sid"])
+
+    sleeper = StopWhilePausing()
+    core, pool, _, created = _core(
+        store, client_cls=AlwaysRateLimited, sleep=sleeper, retry_backoff=1.0
+    )
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    holder["core"], holder["sid"] = core, sess.id
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "stopped"
+    assert len(created) == 1  # второй заход не стартовал
+    await pool.close_all()
+
+
 # ── B6: обрыв потока без Final не должен стирать контекст ────────────────────
 
 
