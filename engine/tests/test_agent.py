@@ -863,6 +863,41 @@ async def test_usage_written_even_on_error_outcome(store):
     await pool.close_all()
 
 
+class CostlyExecErrorThenOk(FakeStreamClient):
+    """Первый заход упал после дорогой работы инструментами, второй прошёл штатно."""
+
+    _created = 0
+
+    def __init__(self, options):
+        super().__init__(options)
+        type(self)._created += 1
+        self._first = type(self)._created == 1
+
+    async def receive_response(self):
+        result = FakeResult(
+            self._reply_session,
+            subtype="error_during_execution" if self._first else "success",
+            is_error=self._first,
+        )
+        result.total_cost_usd = 0.05 if self._first else 0.01
+        result.usage = {"input_tokens": 900, "output_tokens": 40}
+        yield result
+
+
+async def test_usage_of_failed_attempt_is_not_lost(store):
+    """Повтор после exec_error — это ВТОРОЙ оплаченный заход. Учитывать только последний
+    значит занижать расход ровно на самых дорогих турнах: инструменты уже отработали."""
+    CostlyExecErrorThenOk._created = 0
+    core, pool, _, created = _core(store, client_cls=CostlyExecErrorThenOk)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+
+    await core.ask(sess.id, "привет")
+
+    assert len(created) == 2  # повтор реально был
+    assert abs(store.usage.session_cost(sess.id) - 0.06) < 1e-9
+    await pool.close_all()
+
+
 async def test_final_without_cost_writes_nothing(store):
     """Финал без полей расхода не должен плодить пустые строки в usage."""
 

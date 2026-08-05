@@ -224,6 +224,10 @@ class AgentCore:
                     return AskResult("", outcome, note=note)
 
                 outcome = last.outcome
+                # расход пишем за КАЖДЫЙ финал, а не за последний: заход, который мы решим
+                # повторить, уже оплачен — и как раз он самый дорогой (инструменты успели
+                # отработать до сбоя). Учёт «по последнему» занижал бы счёт именно там
+                self._record_usage(session_id, session.model, last)
                 if last.is_error:
                     # SDK после ЛЮБОГО результата с is_error намеренно завершает CLI ненулевым
                     # кодом — тёплый клиент в пуле уже мёртв. Не выселить его значит съесть
@@ -257,7 +261,6 @@ class AgentCore:
             # session_id пишем при ЛЮБОМ исходе, где он есть: сессия CLI создана, и следующий
             # resume должен вести на неё, а не на предыдущий турн (ревью SDK-ядра, §2).
             self._remember_session(session_id, last.session_id, cleared=note != "")
-            self._record_usage(session_id, session.model, last)
             if stopped:
                 # текст отдаём как есть: написанное до «стопа» — работа, за которую уже
                 # заплачено, и прятать её от человека не за что
