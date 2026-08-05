@@ -304,3 +304,27 @@ async def test_lease_keeps_client_when_fingerprint_same():
     assert first is second
     assert len(created) == 1
     await pool.close_all()
+
+
+async def test_fingerprint_change_does_not_evict_busy_client():
+    """Инвариант «занятого не вытесняем» сильнее смены отпечатка.
+
+    Смена отпечатка пересобирает клиента — и делала это без оглядки на refcount: disconnect
+    прилетал прямо посреди чужого стрима. Data-plane сессии сериализован замком, так что
+    случай защитный, но цена его ровно та же, что у вытеснения по LRU, — оборванный ответ.
+    Смена опций доедет следующим заходом, когда клиент освободится.
+    """
+    created = []
+
+    def factory(options):
+        c = FakeClient(options)
+        created.append(c)
+        return c
+
+    pool = ClientPool(factory=factory, ceiling=5, idle_timeout=1800, time_fn=lambda: 0.0)
+    async with pool.lease("s1", {"model": "sonnet"}, fingerprint="sonnet") as busy:
+        async with pool.lease("s1", {"model": "haiku"}, fingerprint="haiku") as second:
+            assert second is busy  # занятого не подменяем на ходу
+        assert not busy.disconnected  # и не рвём ему поток
+    assert len(created) == 1
+    await pool.close_all()

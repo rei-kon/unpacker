@@ -18,6 +18,8 @@ claude_session_id, продолжает диалог.
   • auth_error   → health degraded + алерт владельцу (протух OAuth, риск #13), evict;
   • rate_limited / overloaded → ОДИН повтор, но с паузой: мгновенный влетает в тот же лимит;
   • resume_error → ОДИН повтор с resume=None + честная пометка, что диалог начат заново;
+  • stopped      → сбой после /stop: НЕ ошибка и не повод повторять — человек сам попросил
+    прекратить, и перезапуск тут означал бы «нажал стоп — получил задачу заново»;
   • прочее исключение → drop клиента, вернуть outcome (D покажет сообщение, чат не залипает).
 
 Два сквозных правила, которые дороже любой ветки выше:
@@ -37,7 +39,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from engine.core.errors import Outcome, classify_exception
+from engine.core.errors import Outcome, OutcomeKind, classify_exception
 from engine.core.events import Event, Final, stream_events
 from engine.core.health import HealthMarker
 from engine.core.pool import ClientPool
@@ -69,10 +71,10 @@ _RESUME_LOST_NOTE = "ℹ️ Прошлый контекст не восстан�
 # перезапускают и историю за него не сжигают.
 _STOPPED = Outcome("stopped", "остановлено по просьбе человека")
 # Исходы, на которых повтор имеет смысл только с паузой (проблема на стороне провайдера).
-_BACKOFF_KINDS = ("rate_limited", "overloaded")
+_BACKOFF_KINDS: tuple[OutcomeKind, ...] = ("rate_limited", "overloaded")
 # Исходы, которые заведомо НЕ про мёртвый resume: чужой лимит и протухший токен убивают
 # заход одинаково рано, но история диалога здесь ни при чём (см. _resume_looks_dead).
-_NOT_RESUME_FAULT = ("auth_error", *_BACKOFF_KINDS)
+_NOT_RESUME_FAULT: tuple[OutcomeKind, ...] = ("auth_error", *_BACKOFF_KINDS)
 
 
 def detect_ram_bytes() -> int:
@@ -312,7 +314,7 @@ class AgentCore:
         options: Any,
         prompt: str,
         on_event: EventFn | None,
-        fingerprint: Any = None,
+        fingerprint: str | None = None,
     ) -> Final:
         """Один заход генерации: lease + семафор + событийный сбор до Final.
 
@@ -368,9 +370,7 @@ class AgentCore:
         except _GenerationFailed:
             raise  # уже с уликами — заворачивать второй раз незачем
         except Exception as exc:  # noqa: BLE001 — заворачиваем с уликами, не глушим
-            raise _GenerationFailed(
-                exc, session_id=seen_session_id, progressed=progressed
-            ) from exc
+            raise _GenerationFailed(exc, session_id=seen_session_id, progressed=progressed) from exc
 
     def _flag_unhealthy(self, outcome: Outcome) -> None:
         """Пометить degraded и алертить владельца — ТОЛЬКО на переходе (дедуп) и изолированно.

@@ -15,6 +15,22 @@ Duck-typing: не импортируем классы SDK ради устойч�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
+
+# Закрытая таксономия исходов. Была комментарием у поля — и опечатка в ветке («rate_limted»)
+# молча превращалась в other_error: движок честно показывал «внутренняя ошибка» вместо
+# «подожди пару минут», а найти это можно было только на живом боте. Literal ловит на mypy.
+OutcomeKind = Literal[
+    "ok",
+    "max_turns",
+    "exec_error",
+    "auth_error",
+    "rate_limited",
+    "overloaded",
+    "resume_error",
+    "stopped",  # прервано человеком (/stop) — не ошибка, см. AgentCore
+    "other_error",
+]
 
 # Подстроки, надёжно указывающие на протухший/неверный OAuth в тексте исключения (риск #13).
 # НЕ голое "401"/"forbidden": они ложно ловят «line 401», «/proj401/», «forbidden characters»
@@ -68,8 +84,7 @@ _OVERLOAD_STATUSES = frozenset({500, 503, 529})
 
 @dataclass(frozen=True)
 class Outcome:
-    kind: str  # ok | max_turns | exec_error | auth_error | rate_limited | overloaded
-    #          | resume_error | other_error
+    kind: OutcomeKind
     detail: str
 
 

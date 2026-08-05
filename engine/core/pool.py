@@ -25,11 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+logger = logging.getLogger("unpacker.engine")
 
 _GB = 1024**3
 _RAM_RESERVE_GB = 1.5  # резерв под ОС и сам процесс движка (офиц. ориентир hosting)
@@ -70,7 +73,7 @@ class _Entry:
     # Отпечаток опций, под которые клиент поднят (у нас — модель сессии). Клиент собирается
     # ОДИН раз при connect: сменить модель у живого коннекта нельзя, поэтому расхождение
     # отпечатка = клиент устарел и должен быть пересобран.
-    fingerprint: Any = None
+    fingerprint: str | None = None
 
 
 class ClientPool:
@@ -119,7 +122,7 @@ class ClientPool:
 
     @contextlib.asynccontextmanager
     async def lease(
-        self, session_id: str, options: Any, fingerprint: Any = None
+        self, session_id: str, options: Any, fingerprint: str | None = None
     ) -> AsyncIterator[Client]:
         """Взять клиента сессии в работу: поднимает refcount, чтобы его не вытеснили посреди
         стрима. Обязательный путь доступа для генерации — не `get_live` (тот для interrupt).
@@ -134,14 +137,25 @@ class ClientPool:
         finally:
             await self._release(session_id)
 
-    async def _acquire(self, session_id: str, options: Any, fingerprint: Any = None) -> Client:
+    async def _acquire(
+        self, session_id: str, options: Any, fingerprint: str | None = None
+    ) -> Client:
         stale: Client | None = None
         async with self._pool_lock:
             entry = self._clients.get(session_id)
-            if entry is not None and entry.fingerprint != fingerprint:
+            if entry is not None and entry.fingerprint != fingerprint and not entry.in_use:
                 # опции сессии изменились — тёплый клиент собран под старые и уже не годится
                 self._clients.pop(session_id)
                 stale, entry = entry.client, None
+            elif entry is not None and entry.fingerprint != fingerprint:
+                # занятого не вытесняем даже ради новых опций: disconnect посреди активного
+                # стрима рвёт живой ответ. Новый отпечаток доедет следующим заходом
+                logger.warning(
+                    "сессия %s: отпечаток сменился (%r → %r), но клиент занят — оставляю тёплым",
+                    session_id,
+                    entry.fingerprint,
+                    fingerprint,
+                )
             if entry is not None:
                 entry.last_activity = self._now()
                 entry.in_use += 1
