@@ -389,6 +389,31 @@ async def test_file_is_not_sent_on_a_failed_outcome_but_it_is_said_out_loud(stan
     assert "не отправлен" in s.bot.text.replace("\\", "").lower()
 
 
+# ── FB4: /stop — пометка к показанному, а не пересылка написанного ──────────
+
+
+async def test_stopped_adds_a_short_note_to_the_shown_text(stand):
+    """Человек сам остановил задачу: написанное он уже читает в черновике.
+
+    Пересылать его новыми сообщениями — шум ровно там, где человек попросил тишины.
+    """
+    s = _build(stand, StreamCore(reply="написанное до стопа", outcome="stopped"))
+    await s.tg._on_text(_message())
+    last = s.bot.edits[-1].replace("\\", "")
+    assert "начало ответа" in last, "показанное обязано остаться"
+    assert "останов" in last.lower() or "прерв" in last.lower()
+    assert s.bot.methods.count("send_message") == 1, f"лишние сообщения: {s.bot.methods}"
+
+
+async def test_stopped_without_a_draft_still_gives_the_written_text(stand):
+    """Стриминг выключен — человек не видел НИЧЕГО: написанное до стопа не выбрасываем."""
+    s = _build(stand, StreamCore(reply="написанное до стопа", outcome="stopped", deltas=[]))
+    await s.tg._on_text(_message())
+    delivered = s.bot.text.replace("\\", "")
+    assert "написанное до стопа" in delivered, "работа агента пропала совсем"
+    assert "останов" in delivered.lower() or "прерв" in delivered.lower()
+
+
 async def test_failed_outcome_without_draft_still_explains(stand):
     s = _build(stand, StreamCore(reply="", outcome="exec_error", deltas=[]))
     await s.tg._on_text(_message())

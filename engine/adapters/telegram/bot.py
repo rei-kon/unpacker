@@ -49,7 +49,7 @@ from engine.adapters.telegram.keyboard import (
     button_digest,
     parse_callback,
 )
-from engine.adapters.telegram.render import render_result, render_tool_status
+from engine.adapters.telegram.render import NOTE_ONLY_KINDS, render_result, render_tool_status
 from engine.adapters.telegram.router import NoProjectError, SessionRouter
 from engine.core.buttons import ButtonRegistry
 from engine.core.events import Event, TextDelta, TextStart, ToolStarted
@@ -667,12 +667,21 @@ class TelegramBot:
         if kind == "ok":
             await self._deliver(chat_id, thread_id, text, draft=draft)
             return kind
-        if result.text.strip():
-            # Не-ok с текстом (типично max_turns) несёт ЧАСТИЧНЫЙ ОТВЕТ — такой же ответ.
-            # Доставляем его нарезкой, как ok-путь: `abort` ужимал текст под лимит, отрезая
+        note_only = kind in NOTE_ONLY_KINDS
+        if note_only and draft is not None and await draft.abort(text, markup=self._keyboard()):
+            # Человек сам остановил задачу (/stop): написанное он читает в черновике, туда и
+            # дописываем пометку. Прислать тот же текст заново — шум ровно там, где попросили
+            # тишины.
+            return kind
+        body = result.text.strip()
+        if body:
+            # Не-ok с текстом несёт ЧАСТИЧНЫЙ ОТВЕТ — такой же ответ: max_turns или
+            # остановленная задача, показать которую было негде (стриминг выключен, черновика
+            # нет). Доставляем нарезкой, как ok-путь: `abort` ужимал текст под лимит, отрезая
             # ГОЛОВУ, а фолбэк слал простыню одним сообщением и получал 400. Файлы при этом
             # не отдаём: задача прервана, отдавать недоделанное нельзя.
-            await self._deliver(chat_id, thread_id, text, draft=draft, send_files=False)
+            full = f"{body}\n\n{text}".strip() if note_only else text
+            await self._deliver(chat_id, thread_id, full, draft=draft, send_files=False)
             return kind
         # Текста нет — пометка дописывается к показанному тексту, а не подменяет его (§5.4).
         if draft is None or not await draft.abort(text, markup=self._keyboard()):

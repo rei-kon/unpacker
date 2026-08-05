@@ -208,6 +208,14 @@ async def test_partial_answer_still_gets_the_done_reaction(stand):
     assert msg.reacted[-1] == [bot_module._DONE]
 
 
+async def test_stopped_gets_no_done_reaction(stand):
+    """«Готово» на задаче, которую человек сам остановил, — вранье в его же адрес."""
+    s = _build(stand, FakeCore(outcome="stopped"))
+    msg = _message()
+    await s.tg._on_text(msg)
+    assert [bot_module._DONE] not in msg.reacted, f"реакция врёт: {msg.reacted}"
+
+
 async def test_failed_answer_does_not_claim_success(stand):
     s = _build(stand, BoomCore())
     msg = _message()
