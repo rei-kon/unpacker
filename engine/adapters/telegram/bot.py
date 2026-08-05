@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import assert_never
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
@@ -40,7 +41,7 @@ from aiogram.types import (
 )
 
 from engine.adapters.telegram.attach import AttachmentIntake, attachment_from_message
-from engine.adapters.telegram.draft import DraftStreamer, DraftTuning
+from engine.adapters.telegram.draft import FLOOD_PAD, DraftStreamer, DraftTuning
 from engine.adapters.telegram.keyboard import (
     SystemAction,
     SystemActionName,
@@ -736,24 +737,49 @@ class TelegramBot:
         важнее разметки.
         """
         md = to_telegram_markdown(text)
+        if md is not None and await self._send_once(
+            chat_id, thread_id, md, "MarkdownV2", reply_markup
+        ):
+            return
         if md is not None:
+            logger.warning("MarkdownV2 не отправился, плейн")
+        if not await self._send_once(chat_id, thread_id, text, None, reply_markup):
+            logger.error("не удалось ответить в чат %s", chat_id)
+
+    async def _send_once(
+        self,
+        chat_id: int,
+        thread_id: int | None,
+        text: str,
+        parse_mode: str | None,
+        reply_markup: InlineKeyboardMarkup | None,
+    ) -> bool:
+        """Одна попытка отправки с одним повтором после 429.
+
+        429 — это «подожди столько-то», а не «текст плохой»: раньше он ловился общим
+        `except` и читался как отказ разметки, после чего плейн-ступень стучалась в тот же
+        флуд-бан и ответ терялся молча.
+        """
+        for attempt in (0, 1):
             try:
                 await self._bot.send_message(
                     chat_id,
-                    md,
+                    text,
                     message_thread_id=thread_id,
-                    parse_mode="MarkdownV2",
+                    parse_mode=parse_mode,
                     reply_markup=reply_markup,
                 )
-                return
-            except Exception:  # noqa: BLE001 — при ошибке разметки шлём плейн, ответ не теряем
-                logger.warning("MarkdownV2 не отправился, плейн", exc_info=True)
-        try:
-            await self._bot.send_message(
-                chat_id, text, message_thread_id=thread_id, reply_markup=reply_markup
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("не удалось ответить в чат %s", chat_id)
+            except TelegramRetryAfter as exc:
+                if attempt:  # второй бан подряд — ждать дальше дороже, чем идти следующей ступенью
+                    logger.warning("отправка во флуд-бане второй раз (%s)", parse_mode or "плейн")
+                    return False
+                await asyncio.sleep(exc.retry_after + FLOOD_PAD)
+            except Exception:  # noqa: BLE001 — следующая ступень: ответ важнее разметки
+                logger.warning("отправка не прошла (%s)", parse_mode or "плейн", exc_info=True)
+                return False
+            else:
+                return True
+        return False
 
     async def _send_document(
         self,

@@ -45,6 +45,9 @@ _NOT_MODIFIED = "message is not modified"
 # Переходная строка на TextStart (текст → tool → текст) и счётчик при переполнении окна.
 _TRANSITION = "⚙️ работаю дальше"
 _COUNTER = "…продолжаю, написано символов: {chars}"
+# Добавка к `retry_after` из 429: Telegram называет момент, когда бан снимется, а не момент,
+# когда можно стучаться. Секунда впритык — второй флуд-бан.
+FLOOD_PAD = 0.5
 
 
 @dataclass(frozen=True)
@@ -246,41 +249,75 @@ class DraftStreamer:
         parse_mode: str | None = None,
         markup: InlineKeyboardMarkup | None = None,
     ) -> bool:
-        try:
-            await self._bot.edit_message_text(
-                text,
-                chat_id=self._chat_id,
-                message_id=self._message_id,
-                parse_mode=parse_mode,
-                reply_markup=markup,
-            )
-        except TelegramBadRequest as exc:
-            if _NOT_MODIFIED in str(exc):
+        """Одна ступень каскада. 429 — не отказ ступени: ждём и повторяем ЕЁ ЖЕ.
+
+        Раньше 429 ловился общим `except` и читался как «эта ступень не работает» — каскад
+        MarkdownV2 → плейн → delete+send прожигал четыре вызова подряд внутри флуд-бана,
+        каждый следующий получал тот же 429, и ответ терялся целиком.
+        """
+        for attempt in (0, 1):
+            try:
+                await self._bot.edit_message_text(
+                    text,
+                    chat_id=self._chat_id,
+                    message_id=self._message_id,
+                    parse_mode=parse_mode,
+                    reply_markup=markup,
+                )
+            except TelegramRetryAfter as exc:
+                if attempt:  # второй бан подряд — дальше ждать дороже, чем идти по каскаду
+                    logger.warning("финальный edit во флуд-бане второй раз (%s)", parse_mode)
+                    return False
+                await asyncio.sleep(exc.retry_after + FLOOD_PAD)
+            except TelegramBadRequest as exc:
+                if _NOT_MODIFIED in str(exc):
+                    self._shown = text
+                    return True
+                logger.warning("финальный edit отвергнут Telegram (%s)", parse_mode or "плейн")
+                return False
+            except Exception:  # noqa: BLE001 — сеть моргнула: следующая ступень каскада
+                logger.warning(
+                    "финальный edit не прошёл (%s)", parse_mode or "плейн", exc_info=True
+                )
+                return False
+            else:
                 self._shown = text
                 return True
-            logger.warning("финальный edit отвергнут Telegram (%s)", parse_mode or "плейн")
-            return False
-        except Exception:  # noqa: BLE001 — сеть моргнула: пробуем следующую ступень каскада
-            logger.warning("финальный edit не прошёл (%s)", parse_mode or "плейн", exc_info=True)
-            return False
-        self._shown = text
-        return True
+        return False
 
     async def _resend(self, text: str, markup: InlineKeyboardMarkup | None) -> bool:
-        """Последняя ступень каскада: черновика в чате больше нет (удалён руками) — шлём заново."""
-        try:
-            await self._bot.delete_message(self._chat_id, self._message_id)
-        except Exception:  # noqa: BLE001 — скорее всего его и нет; не мешает отправке
-            logger.debug("черновик не удалился перед пересылкой финала", exc_info=True)
-        self._message_id = None
-        try:
-            await self._bot.send_message(
-                self._chat_id, text, message_thread_id=self._thread_id, reply_markup=markup
-            )
-        except Exception:  # noqa: BLE001 — не смогли: пусть бот доставит своим путём
-            logger.warning("финал не ушёл новым сообщением", exc_info=True)
+        """Последняя ступень каскада: черновика в чате больше нет (удалён руками) — шлём заново.
+
+        Сначала send, и только после его успеха delete: обратный порядок стирал единственное,
+        что от ответа осталось, ещё до того, как выяснится, что новое сообщение не уходит.
+        """
+        if not await self._send_final(text, markup):
             return False
+        old, self._message_id = self._message_id, None
+        try:
+            await self._bot.delete_message(self._chat_id, old)
+        except Exception:  # noqa: BLE001 — скорее всего его и нет; ответ уже доставлен
+            logger.debug("черновик не удалился после пересылки финала", exc_info=True)
         return True
+
+    async def _send_final(self, text: str, markup: InlineKeyboardMarkup | None) -> bool:
+        """Финал новым сообщением, с одним повтором после 429."""
+        for attempt in (0, 1):
+            try:
+                await self._bot.send_message(
+                    self._chat_id, text, message_thread_id=self._thread_id, reply_markup=markup
+                )
+            except TelegramRetryAfter as exc:
+                if attempt:
+                    logger.warning("финал во флуд-бане второй раз — отдаём боту")
+                    return False
+                await asyncio.sleep(exc.retry_after + FLOOD_PAD)
+            except Exception:  # noqa: BLE001 — не смогли: пусть бот доставит своим путём
+                logger.warning("финал не ушёл новым сообщением", exc_info=True)
+                return False
+            else:
+                return True
+        return False
 
     # ── фоновая задача ───────────────────────────────────────────────────────
 
@@ -364,7 +401,7 @@ class DraftStreamer:
             # 429 блокирует бота ЦЕЛИКОМ, а не только этот чат: черновик одного человека
             # не смеет затыкать бота остальным. Ждём ровно столько, сколько сказал Telegram,
             # и пол интервала обратно не опускаем — второй флуд-бан дороже лишних секунд.
-            self._floor = max(self._floor, exc.retry_after + 0.5)
+            self._floor = max(self._floor, exc.retry_after + FLOOD_PAD)
             self._dirty = True
             logger.warning("черновик поймал 429, интервал поднят до %.1f с", self._floor)
         except TelegramBadRequest as exc:

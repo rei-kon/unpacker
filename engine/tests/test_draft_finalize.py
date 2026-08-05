@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 
-from aiogram.exceptions import TelegramBadRequest
+import pytest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
+from engine.adapters.telegram import draft as draft_module
 from engine.adapters.telegram.draft import DraftStreamer, DraftTuning
 
 
@@ -152,7 +154,7 @@ async def test_finalize_deletes_and_sends_when_edit_is_impossible():
     bot = JournalBot(fail_edit=True)
     d = await _draft(bot)
     assert await d.finalize("итог") is True
-    assert bot.methods[-2:] == ["delete_message", "send_message"]
+    assert bot.methods[-2:] == ["send_message", "delete_message"]
     assert "итог" in bot.sent[-1]
 
 
@@ -197,6 +199,114 @@ async def test_abort_never_raises_even_when_telegram_is_dead():
     bot = JournalBot(fail_edit=True)
     d = await _draft(bot)
     assert await d.abort("⚠️ Сбой.") is False, "не смогли дописать — пусть бот скажет сам"
+
+
+# ── FA1: 429 в финальном тракте ──────────────────────────────────────────────
+#
+# Тут жила самая дорогая поломка контракта: 429 в финале ловился как «сеть моргнула», и
+# каскад MarkdownV2 → плейн → delete+send прожигал ЧЕТЫРЕ вызова внутри флуд-бана, а
+# `_resend` успевал удалить черновик до успешной отправки — ответ исчезал целиком.
+
+
+def _flood(seconds: int = 0) -> TelegramRetryAfter:
+    """429 Telegram. retry_after=0 — предмет теста ветка, а не секунды ожидания."""
+    return TelegramRetryAfter(
+        method=None,  # type: ignore[arg-type]
+        message="Flood control exceeded",
+        retry_after=seconds,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_flood_wait(monkeypatch):
+    """Добавку к retry_after в тестах обнуляем: ждать её вживую тесту незачем."""
+    monkeypatch.setattr(draft_module, "FLOOD_PAD", 0.0)
+
+
+class FloodBot(JournalBot):
+    """Telegram под флудом: первые `allow` вызовов `method` проходят, следующие — 429."""
+
+    def __init__(self, *, method: str, allow: int = 0, floods: int = 1, **kw):
+        super().__init__(**kw)
+        self.method = method
+        self.allow = allow
+        self.floods = floods
+
+    def _gate(self, method: str) -> None:
+        if method != self.method:
+            return
+        if self.allow:
+            self.allow -= 1
+            return
+        if self.floods:
+            self.floods -= 1
+            raise _flood()
+
+    async def send_message(self, chat_id, text, **kw):
+        message = await super().send_message(chat_id, text, **kw)
+        self._gate("send_message")
+        return message
+
+    async def edit_message_text(self, text, chat_id=None, message_id=None, **kw):
+        await super().edit_message_text(text, chat_id, message_id, **kw)
+        self._gate("edit_message_text")
+
+
+async def test_finalize_waits_out_the_flood_instead_of_burning_the_cascade():
+    """429 — «подожди», а не «эта ступень не работает»: повторяем ТУ ЖЕ ступень."""
+    bot = FloodBot(method="edit_message_text")
+    d = await _draft(bot)
+    assert await d.finalize("итог") is True
+    assert len(bot.edits) == 2, f"на 429 ждём и повторяем один раз: {bot.edits}"
+    assert bot.kwargs[-1].get("parse_mode") == "MarkdownV2", "повтор ТОЙ ЖЕ ступени каскада"
+    assert "delete_message" not in bot.methods, f"каскад прожёг флуд-бан: {bot.methods}"
+    assert len(bot.sent) == 1, "второго сообщения быть не должно"
+
+
+async def test_abort_waits_out_the_flood():
+    bot = FloodBot(method="edit_message_text")
+    d = await _draft(bot)
+    assert await d.abort("⚠️ Сбой.") is True
+    assert "начало ответа" in bot.edits[-1]
+
+
+async def test_second_flood_in_a_row_gives_way_to_the_next_step():
+    """Повтор ровно один: ждать флуд-бан бесконечно — та же потеря ответа, только молча."""
+    bot = FloodBot(method="edit_message_text", floods=99)
+    d = await _draft(bot)
+    assert await d.finalize("итог") is True
+    assert bot.methods[-2:] == ["send_message", "delete_message"], f"журнал: {bot.methods}"
+    assert "итог" in bot.sent[-1]
+
+
+async def test_resend_sends_the_answer_before_deleting_the_draft():
+    """Порядок — весь смысл: delete до успешного send оставлял человека вообще без ответа."""
+    bot = JournalBot(fail_edit=True)
+    d = await _draft(bot)
+    assert await d.finalize("итог") is True
+    assert bot.methods[-2:] == ["send_message", "delete_message"], f"журнал: {bot.methods}"
+
+
+async def test_resend_keeps_the_draft_when_the_new_message_did_not_go():
+    """Не смогли отправить заново — показанный текст обязан остаться в чате."""
+
+    class DeadSendBot(JournalBot):
+        async def send_message(self, chat_id, text, **kw):
+            if self.calls:  # первый send создал черновик, остальные — уже финал
+                raise RuntimeError("Telegram недоступен")
+            return await super().send_message(chat_id, text, **kw)
+
+    bot = DeadSendBot(fail_edit=True)
+    d = await _draft(bot)
+    assert await d.finalize("итог") is False
+    assert "delete_message" not in bot.methods, "черновик стёрли, а ответ не доставили"
+
+
+async def test_resend_waits_out_the_flood_on_the_new_message():
+    bot = FloodBot(method="send_message", allow=1, fail_edit=True)
+    d = await _draft(bot)
+    assert await d.finalize("итог") is True
+    assert "итог" in bot.sent[-1]
 
 
 async def test_finalize_never_raises_even_when_everything_fails():

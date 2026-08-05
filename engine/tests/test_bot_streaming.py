@@ -16,7 +16,9 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramRetryAfter
 
+from engine.adapters.telegram import bot as bot_module
 from engine.adapters.telegram.bot import TelegramBot
 from engine.adapters.telegram.router import SessionRouter
 from engine.core.agent import AskResult
@@ -41,11 +43,13 @@ class JournalBot:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
         self.markups: list[tuple[str, object]] = []
+        self.kwargs: list[dict] = []
         self._next_id = 100
 
     async def send_message(self, chat_id, text, **kw):
         self.calls.append(("send_message", text))
         self.markups.append(("send_message", kw.get("reply_markup")))
+        self.kwargs.append(kw)
         self._next_id += 1
         return SimpleNamespace(message_id=self._next_id)
 
@@ -287,6 +291,50 @@ async def test_engine_crash_keeps_the_shown_text(stand):
         await s.tg._on_text(_message())
     assert "delete_message" not in s.bot.methods
     assert "начало ответа" in s.bot.edits[-1].replace("\\", "")
+
+
+# ── FA1: 429 на обычной отправке ────────────────────────────────────────────
+
+
+@pytest.fixture
+def _no_flood_wait(monkeypatch):
+    """Ждать retry_after вживую тесту незачем — предмет проверки ветка, а не секунды."""
+    monkeypatch.setattr(bot_module, "FLOOD_PAD", 0.0)
+
+
+class FloodBot(JournalBot):
+    """Telegram отвечает 429 на первые `floods` отправок."""
+
+    def __init__(self, floods: int = 1):
+        super().__init__()
+        self.floods = floods
+
+    async def send_message(self, chat_id, text, **kw):
+        message = await super().send_message(chat_id, text, **kw)
+        if self.floods:
+            self.floods -= 1
+            raise TelegramRetryAfter(
+                method=None,  # type: ignore[arg-type]
+                message="Flood control exceeded",
+                retry_after=0,
+            )
+        return message
+
+
+async def test_send_waits_out_the_flood_and_keeps_the_markup(stand, _no_flood_wait):
+    """429 — «подожди», а не «разметка плохая»: повтор ТОЙ ЖЕ ступени, ответ не голым плейном."""
+    s = _build(stand, StreamCore(reply="краткий ответ", deltas=[]), bot=FloodBot())
+    await s.tg._on_text(_message())
+    assert len(s.bot.sent) == 2, f"один повтор после 429: {s.bot.sent}"
+    assert s.bot.kwargs[-1].get("parse_mode") == "MarkdownV2"
+    assert "краткий ответ" in s.bot.sent[-1].replace("\\", "")
+
+
+async def test_double_flood_still_delivers_the_answer(stand, _no_flood_wait):
+    """Бан не кончается — ответ всё равно уходит, пусть и без разметки."""
+    s = _build(stand, StreamCore(reply="краткий ответ", deltas=[]), bot=FloodBot(floods=2))
+    await s.tg._on_text(_message())
+    assert "краткий ответ" in s.bot.sent[-1].replace("\\", "")
 
 
 async def test_no_project_removes_the_draft_and_says_so(stand):
