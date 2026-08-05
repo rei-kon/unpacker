@@ -62,7 +62,7 @@ from engine.core.sendfile import (
     extract_send_files,
 )
 from engine.core.store import Store
-from engine.core.streaming import split_message
+from engine.core.streaming import split_for_delivery
 from engine.core.uploads import frame_attachment_prompt
 
 logger = logging.getLogger("unpacker.engine")
@@ -87,6 +87,9 @@ _UNSUPPORTED = (
     "Пришли текст, документ или фото — их разберу."
 )
 _REAPER_INTERVAL = 60.0
+# Пометка к показанному тексту, когда генерация упала совсем (A2): человек читал ответ —
+# он остаётся в чате, а не подменяется сухим «⚠️ сбой» на пустом месте.
+_ENGINE_FAILURE = "⚠️ Сбой на стороне движка — выше то, что успел написать."
 
 
 @dataclass(frozen=True)
@@ -485,17 +488,39 @@ class TelegramBot:
                 on_event=on_event,
             )
         except NoProjectError:
+            # Доставлять через черновик нечего — убираем его (дельт тут и не было).
+            await draft.finish()
             await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
             return
-        finally:
-            # Черновик убираем ДО финала: финал приходит отдельным аккуратным сообщением.
-            await draft.finish()
-        await self._deliver(chat_id, thread_id, render_result(result))
+        except Exception:
+            # Генерация упала: накопленный текст ядро выбросило, но показанный человеку —
+            # остаётся в чате с пометкой. Сообщение в чат пришлёт errors-handler.
+            await draft.abort(_ENGINE_FAILURE)
+            raise
+        text = render_result(result)
+        if result.outcome.kind == "ok":
+            await self._deliver(chat_id, thread_id, text, draft=draft)
+            return
+        # Не-ok: пометка дописывается к показанному тексту, а не подменяет его (§5.4).
+        if not await draft.abort(text, markup=self._keyboard()):
+            await self._send(chat_id, thread_id, text, self._keyboard())
 
     # ── доставка ответа: текст + вложения по маркеру (§9) ─────────────────────
 
-    async def _deliver(self, chat_id: int, thread_id: int | None, text: str) -> None:
-        """Отправить ответ: текст нарезкой, файлы по маркерам, ряд кнопок под последним."""
+    async def _deliver(
+        self,
+        chat_id: int,
+        thread_id: int | None,
+        text: str,
+        draft: DraftStreamer | None = None,
+    ) -> None:
+        """Отправить ответ: текст нарезкой, файлы по маркерам, ряд кнопок под последним.
+
+        Первый текстовый кусок отдаётся ЧЕРНОВИКУ (`draft.finalize`) — он и есть то самое
+        сообщение, которое печаталось. Хвост, файлы и объяснения уходят новыми сообщениями
+        после него. Черновика нет (дельт не было) или финальный edit не прошёл — всё едет
+        обычным путём, ответ не теряется.
+        """
         # Маркер вырезаем ВСЕГДА, даже при выключенной отдаче (K21): иначе человек получал
         # в чат служебную строку с абсолютным путём внутри
         # (`[SEND_FILE:/home/unpacker/agents/office/state/x.pdf]`) — непонятно и вдобавок
@@ -511,13 +536,20 @@ class TelegramBot:
         # Очередь типизирована union'ом, а не парой (str, object) с `type: ignore` (K2):
         # раньше «doc» и «text» различались строкой, и mypy не мог проверить, что в
         # send_document уходит Path, а в send_message — str.
-        items: list[Outgoing] = [OutText(c) for c in split_message(text) if c.strip()]
+        items: list[Outgoing] = [OutText(c) for c in split_for_delivery(text) if c.strip()]
         items += [OutDocument(p) for p in files]
         items += [OutText(n) for n in notes]
         if not items:  # ответ состоял из одного маркера, и тот не прошёл
             items = [OutText("…")]
 
         markup = self._keyboard()
+        if draft is not None and isinstance(items[0], OutText):
+            # Клавиатуру вешаем на edit только если доставлять больше нечего: правило
+            # «ряд под ПОСЛЕДНИМ элементом» от переезда финала в черновик не меняется.
+            only = len(items) == 1
+            if await draft.finalize(items[0].text, markup=markup if only else None):
+                items = items[1:]
+
         last = len(items) - 1
         for i, item in enumerate(items):
             reply_markup = markup if i == last else None
