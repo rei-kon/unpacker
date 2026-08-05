@@ -148,7 +148,3 @@ def _error_text(result: object) -> str:
     body = getattr(result, "result", None)
     parts = [str(p) for p in (errors, body) if p]
     return " ".join(parts)
-
-
-def is_auth_error(outcome: Outcome) -> bool:
-    return outcome.kind == "auth_error"

@@ -681,6 +681,73 @@ async def test_double_failure_clears_dead_session_id(store):
     await pool.close_all()
 
 
+class ResumeErrorFinalThenOk(FakeStreamClient):
+    """CLI не поднял прошлую сессию и сказал об этом ФИНАЛОМ, а не падением.
+
+    Форма, которую легко проглядеть: клиент жив, поток штатно дошёл до результата — просто
+    в результате написано «No conversation found». Ветка на этот случай в ядре есть, а
+    красного на неё до сих пор не было ни одного.
+    """
+
+    _created = 0
+
+    def __init__(self, options):
+        super().__init__(options)
+        type(self)._created += 1
+        self._first = type(self)._created == 1
+
+    async def receive_response(self):
+        if self._first:
+            result = FakeResult(
+                self._reply_session, subtype="error_during_execution", is_error=True
+            )
+            result.errors = ["No conversation found with session ID: old-id"]
+            yield result
+            return
+        yield FakeMessage("ответ агента", self._reply_session)
+        yield FakeResult(self._reply_session)
+
+
+async def test_resume_error_as_final_retried_without_resume(store):
+    ResumeErrorFinalThenOk._created = 0
+    core, pool, built, created = _core(store, client_cls=ResumeErrorFinalThenOk)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "ok"  # окно чата ожило
+    assert built["resume"] is None  # повтор пошёл с чистого листа
+    assert result.note  # и человеку об этом сказали
+    assert len(created) == 2
+    await pool.close_all()
+
+
+class AuthExceptionClient(FakeStreamClient):
+    """Протухший токен роняет заход исключением, до единого события в потоке."""
+
+    async def receive_response(self):
+        raise RuntimeError("API Error: 401 unauthorized")
+        yield
+
+
+async def test_auth_failure_keeps_resume(store):
+    """Протухший токен убивает заход так же рано, как мёртвый resume, — и по уликам они
+    неразличимы. Списать auth на историю значит сжечь её из-за проблемы, которая к ней
+    отношения не имеет: токен починят, а диалога уже не будет."""
+    core, pool, built, created = _core(store, client_cls=AuthExceptionClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "auth_error"
+    assert built["resume"] == "old-id"  # опции с resume=None не пересобирались
+    assert len(created) == 1  # и повтора не было: чинить нечего
+    assert store.sessions.get(sess.id).claude_session_id == "old-id"
+    await pool.close_all()
+
+
 class SilentDeathThenOk(BrokenResumeThenOk):
     """Клиент умер, не сказав ни слова — типовой симптом непонятого resume."""
 
@@ -895,6 +962,24 @@ async def test_usage_of_failed_attempt_is_not_lost(store):
 
     assert len(created) == 2  # повтор реально был
     assert abs(store.usage.session_cost(sess.id) - 0.06) < 1e-9
+    await pool.close_all()
+
+
+async def test_usage_write_failure_does_not_cost_the_answer(store):
+    """Учёт расхода — служебная запись. Уронить из-за неё готовый ответ значит обменять
+    строчку в статистике на работу, за которую человек уже заплатил."""
+    core, pool, _, _ = _core(store, client_cls=CostlyClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+
+    def boom(**kwargs):
+        raise RuntimeError("база расхода недоступна")
+
+    store.usage.add = boom
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "ok"
+    assert "ответ агента" in result.text
     await pool.close_all()
 
 
