@@ -165,6 +165,9 @@ def _callback(data, *, user_id=OWNER, chat="private"):
     )
 
     async def answer(text=None, **kw):
+        # У настоящего Bot API это сетевой вызов — он ОТПУСКАЕТ цикл. Дублёр без await
+        # проскакивал целиком, и гонки между двумя нажатиями в тестах не существовало.
+        await asyncio.sleep(0)
         answers.append(text)
 
     cb.answer = answer
@@ -216,6 +219,9 @@ def _build(stand, *, bot=None, core=None, buttons=True, uploads=True, send_file=
         if uploads
         else None,
         send_file=SendFilePolicy(state_root=stand.state) if send_file else None,
+        # Пауза между кусками доставки проверяется отдельно (test_bot_streaming.py);
+        # здесь она только жгла бы секунды на каждом многокусковом ответе.
+        delivery_pause=0.0,
     )
     return SimpleNamespace(tg=tg, bot=bot, core=core, router=router)
 
@@ -334,6 +340,24 @@ async def test_double_press_during_generation_runs_agent_once(stand):
     await first
 
     assert len(s.core.asks) == 1, "агент должен быть запущен один раз"
+    assert second.answers and any("работа" in (a or "").lower() for a in second.answers)
+
+
+async def test_two_taps_in_the_same_tick_run_the_agent_once(stand):
+    """FA11: занятость спрашивалась ДО первого await, а место в окне занималось после.
+
+    Два тапа подряд (палец дрогнул, связь моргнула) успевали проскочить оба: замок ниже
+    их сериализовал, но не отменял — человек платил подпиской за два одинаковых прогона.
+    """
+    s = _build(stand, core=SlowCore())
+    first = _callback(encode_trigger(0, BUTTONS[0]))
+    second = _callback(encode_trigger(0, BUTTONS[0]))
+    t1 = asyncio.create_task(s.tg._on_callback(first))
+    t2 = asyncio.create_task(s.tg._on_callback(second))
+    await asyncio.sleep(0.05)
+    s.core.release.set()
+    await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2.0)
+    assert len(s.core.asks) == 1, "второй тап обязан получить тост, а не второй прогон"
     assert second.answers and any("работа" in (a or "").lower() for a in second.answers)
 
 
@@ -752,6 +776,31 @@ async def test_attachment_without_project_is_explained(stand):
     doc = SimpleNamespace(file_id="D1", file_name="f.pdf", file_size=10)
     await s.tg._on_attachment(_message(document=doc))
     assert "проект" in s.bot.text.lower()
+
+
+# ── FA6: реакция снимается честно ────────────────────────────────────────────
+
+
+def _emojis(msg) -> list[list[str]]:
+    return [[r.emoji for r in items] for items in msg.reacted]
+
+
+async def test_reaction_is_taken_back_when_the_file_is_rejected(stand):
+    """Файл не приняли — «взял в работу» на сообщении остаётся враньём навсегда."""
+    s = _build(stand)
+    doc = SimpleNamespace(file_id="D1", file_name="big.zip", file_size=50 * 1024 * 1024)
+    msg = _message(document=doc)
+    await s.tg._on_attachment(msg)
+    assert _emojis(msg)[-1] == [], f"реакцию надо снять: {_emojis(msg)}"
+
+
+async def test_reaction_is_taken_back_when_there_is_no_project(stand):
+    stand.store.projects.disable("office")
+    s = _build(stand)
+    doc = SimpleNamespace(file_id="D1", file_name="f.pdf", file_size=10)
+    msg = _message(document=doc)
+    await s.tg._on_attachment(msg)
+    assert _emojis(msg)[-1] == [], f"реакцию надо снять: {_emojis(msg)}"
 
 
 async def test_verbose_one_shows_a_tool_status_once(stand):

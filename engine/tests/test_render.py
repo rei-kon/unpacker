@@ -1,6 +1,6 @@
 """Рендер результата в текст для Telegram — чистые функции (§5.4 UX ошибок)."""
 
-from engine.adapters.telegram.render import render_result
+from engine.adapters.telegram.render import NOTE_ONLY_KINDS, render_result
 from engine.core.agent import AskResult
 from engine.core.errors import Outcome
 
@@ -56,6 +56,32 @@ def test_overloaded_blames_provider_not_engine():
 def test_resume_error_explains_lost_context():
     out = render_result(_r("resume_error", ""))
     assert "контекст" in out.lower()
+
+
+# ── FB4: /stop — человек сам остановил задачу ────────────────────────────────
+
+
+def test_stopped_says_it_was_stopped_on_purpose():
+    """Сразу после честного «⏹ Прервал» получить «внутренняя ошибка» — вранье."""
+    out = render_result(_r("stopped", "написанное до стопа"))
+    assert "останов" in out.lower() or "прерв" in out.lower()
+    assert "ошибк" not in out.lower(), f"остановка по просьбе — не сбой: {out!r}"
+
+
+def test_stopped_does_not_repeat_the_written_text():
+    """Написанное человек уже видит в черновике: пометка дописывается К НЕМУ.
+
+    Вернуть текст ещё и сюда — тот самый дубль «показанный хвост + полный текст»,
+    который лечит FA4.
+    """
+    out = render_result(_r("stopped", "написанное до стопа"))
+    assert "написанное до стопа" not in out
+
+
+def test_stopped_is_note_only_for_the_adapter():
+    """Контракт с адаптером явный, а не «догадайся по тексту»: по этому списку бот решает,
+    дописать пометку к показанному или доставлять текст заново."""
+    assert "stopped" in NOTE_ONLY_KINDS
 
 
 def test_note_is_prepended_to_answer():

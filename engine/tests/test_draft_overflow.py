@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 
 from engine.adapters.telegram.draft import DraftStreamer, DraftTuning
-from engine.core.streaming import _utf16_units
+from engine.core.streaming import utf16_units
 
 
 class ChattyBot:
@@ -97,7 +97,7 @@ async def test_overflow_window_stays_within_the_limit():
     d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(max_units=200))
     d.on_delta("я" * 2000)
     await asyncio.sleep(0.05)
-    assert _utf16_units(bot.shown) <= 200, f"окно шире лимита: {_utf16_units(bot.shown)}"
+    assert utf16_units(bot.shown) <= 200, f"окно шире лимита: {utf16_units(bot.shown)}"
 
 
 async def test_overflow_does_not_throw_deltas_away():
@@ -119,6 +119,43 @@ async def test_finalize_after_overflow_shows_the_whole_answer():
     await asyncio.sleep(0.05)
     await d.finalize("полный ответ целиком")
     assert bot.edits[-1] == "полный ответ целиком"
+
+
+async def test_overflow_window_keeps_moving_with_the_threshold_on():
+    """FA5: порог прироста меряет ПОКАЗАННОЕ, а в режиме хвоста его длина константна.
+
+    Из-за этого grown всегда выходил нулём, показ откладывался «до следующего раза» — и
+    окно замирало до самого финала. Ровно та мёртвая картинка, ради которой окно и делали.
+    """
+    bot = ChattyBot()
+    d = DraftStreamer(
+        bot,
+        chat_id=1,
+        thread_id=None,
+        tuning=DraftTuning(interval=0.03, min_delta_units=60, max_units=200),
+    )
+    d.on_delta("а" * 400)
+    await asyncio.sleep(0.05)
+    d.on_delta("свежий хвост генерации" + "б" * 100)
+    await asyncio.sleep(0.06)
+    assert "свежий хвост генерации" in bot.shown, f"окно замерло: {bot.shown[-60:]!r}"
+
+
+async def test_overflow_still_skips_tiny_deltas():
+    """Порог не отменён: мелкая правка и в режиме хвоста не стоит вызова API."""
+    bot = ChattyBot()
+    d = DraftStreamer(
+        bot,
+        chat_id=1,
+        thread_id=None,
+        tuning=DraftTuning(interval=0.03, min_delta_units=60, max_units=200),
+    )
+    d.on_delta("а" * 400)
+    await asyncio.sleep(0.05)
+    before = len(bot.edits)
+    d.on_delta("+++")
+    await asyncio.sleep(0.06)
+    assert len(bot.edits) == before, "три символа не стоят правки сообщения"
 
 
 # ── A6: TextStart — переходная строка вместо немой подмены ──────────────────
@@ -158,6 +195,36 @@ async def test_transition_is_not_shown_when_new_text_came_at_once():
     d.on_delta("новый текст")
     await asyncio.sleep(0.05)
     assert "работаю дальше" not in " ".join(bot.edits)
+
+
+# ── FA9: служебные строки не приклеиваются к пометке ────────────────────────
+
+
+async def test_abort_after_overflow_drops_the_service_counter():
+    """«⚠️ Сбой» сразу после «…продолжаю, написано символов: 400» читается как часть ответа.
+
+    `_strip_tail` снимал только курсор и «…», а служебные строки оставались — человек не
+    понимает, где кончился текст агента и началась служебка движка.
+    """
+    bot = ChattyBot()
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(max_units=200))
+    d.on_delta("а" * 400)
+    await asyncio.sleep(0.05)
+    assert await d.abort("⚠️ Сбой.") is True
+    assert "продолжаю, написано" not in bot.edits[-1], f"служебка осталась: {bot.edits[-1]!r}"
+    assert "Сбой" in bot.edits[-1]
+
+
+async def test_abort_after_a_transition_drops_the_transition_line():
+    bot = ChattyBot()
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning())
+    d.on_delta("первый абзац")
+    await asyncio.sleep(0.05)
+    d.on_reset()
+    await asyncio.sleep(0.05)
+    await d.abort("⚠️ Сбой.")
+    assert "работаю дальше" not in bot.edits[-1], f"служебка осталась: {bot.edits[-1]!r}"
+    assert "первый абзац" in bot.edits[-1], "прочитанное остаётся"
 
 
 # ── A7: пульс typing до первой дельты ───────────────────────────────────────

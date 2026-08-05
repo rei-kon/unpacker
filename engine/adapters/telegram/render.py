@@ -6,12 +6,16 @@ from engine.core.agent import AskResult
 from engine.core.events import ToolStarted
 
 _PLACEHOLDER = "…"
+# Исходы, где текст ответа НЕ пересказываем: написанное человек уже читает в черновике, и
+# пометка дописывается К НЕМУ (`draft.abort`). Повтор дал бы ровно тот дубль «показанный
+# хвост + полный текст», который лечит доставка не-ok исходов нарезкой.
+NOTE_ONLY_KINDS = ("stopped",)
 
 
 def render_result(result: AskResult) -> str:
     """Превратить результат ask в текст сообщения пользователю по контракту §5.4."""
     body = _body(result)
-    note = getattr(result, "note", "")
+    note = result.note
     return f"{note}\n\n{body}".strip() if note else body
 
 
@@ -33,6 +37,10 @@ def _body(result: AskResult) -> str:
         return "⏳ Упёрлись в лимит запросов к модели. Подожди пару минут и повтори."
     if kind == "overloaded":
         return "⏳ Модель сейчас перегружена на стороне провайдера. Повтори через минуту."
+    if kind == "stopped":
+        # Остановка по просьбе человека — не сбой. Сказать здесь «внутренняя ошибка» сразу
+        # после честного «⏹ Прервал» значит соврать ему в его же ответ.
+        return "⏹ Остановил — задача прервана по твоей просьбе."
     if kind == "resume_error":
         return "⚠️ Прошлый контекст диалога не восстановился. Напиши ещё раз — начну заново."
     return "⚠️ Внутренняя ошибка, детали в логах."

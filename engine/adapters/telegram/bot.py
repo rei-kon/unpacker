@@ -22,12 +22,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import assert_never
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
@@ -40,7 +41,7 @@ from aiogram.types import (
 )
 
 from engine.adapters.telegram.attach import AttachmentIntake, attachment_from_message
-from engine.adapters.telegram.draft import DraftStreamer, DraftTuning
+from engine.adapters.telegram.draft import FLOOD_PAD, DraftStreamer, DraftTuning
 from engine.adapters.telegram.keyboard import (
     SystemAction,
     SystemActionName,
@@ -48,7 +49,7 @@ from engine.adapters.telegram.keyboard import (
     button_digest,
     parse_callback,
 )
-from engine.adapters.telegram.render import render_result, render_tool_status
+from engine.adapters.telegram.render import NOTE_ONLY_KINDS, render_result, render_tool_status
 from engine.adapters.telegram.router import NoProjectError, SessionRouter
 from engine.core.buttons import ButtonRegistry
 from engine.core.events import Event, TextDelta, TextStart, ToolStarted
@@ -92,12 +93,33 @@ _REAPER_INTERVAL = 60.0
 # Пометка к показанному тексту, когда генерация упала совсем (A2): человек читал ответ —
 # он остаётся в чате, а не подменяется сухим «⚠️ сбой» на пустом месте.
 _ENGINE_FAILURE = "⚠️ Сбой на стороне движка — выше то, что успел написать."
+# Прогон сняли на полпути (рестарт бота, отмена задачи). Текст остаётся человеку: он его
+# читал, и стереть прочитанное ради сухой пометки — та же потеря ответа.
+_CANCELLED = "⏹ Остановлено — выше то, что успел написать."
+# Задача прервана (лимит шагов, сбой): файл, обещанный маркером, не отдаём — он недоделан.
+_FILE_ABORTED = "📎 Файл не отправлен — задача прервана."
 # Темп черновика по умолчанию — модульная константа, а не вызов в дефолте аргумента:
 # DraftTuning заморожен, один экземпляр на процесс безопасен и читается как «дефолт движка».
 _DEFAULT_DRAFT = DraftTuning()
 # Реакции на исходном сообщении — единственный сигнал, который поднимает чат: финал теперь
 # правка черновика, а правка не пингует и не поднимает диалог в списке (§9, компенсация).
-_TAKEN, _DONE, _QUEUED = "👀", "✅", "✍️"
+# Набор Bot API фиксирован (setMessageReaction), и «✅» в него НЕ входит: Telegram отвечал
+# 400, а мы глотали его debug-логом — сигнал готовности был мёртв всё это время. «✍️» с
+# невидимым VS16 — тоже другая строка, в списке живёт голое «✍».
+_TAKEN, _DONE, _QUEUED = "👀", "👌", "✍"
+# Исходы, на которых «готово» — правда: ответ человек получил. max_turns несёт частичный
+# ответ, он тоже доставлен; rate_limited/other_error — не доставлен ничего, и галочка врёт.
+_DONE_KINDS = ("ok", "max_turns")
+# Очередь окна переполнена — промпт НЕ принят. Реакция вместо текста: лишнее сообщение в
+# чате грубо, а «🤔» из списка Bot API читается как «слишком много сразу».
+_OVERFLOW = "🤔"
+# Сколько промптов на окно живут одновременно (работающий + ждущие замка).
+_QUEUE_CAP = 3
+# Пауза между кусками одного ответа. Bot API держит примерно одно сообщение в секунду на
+# чат, а длинный ответ уходит очередью из трёх-пяти: без паузы САМА доставка ловит 429 и
+# теряет середину, а бан прилетает боту целиком — вместе с остальными людьми. Секунда
+# впритык — берём с запасом.
+_DELIVERY_PAUSE = 1.1
 # Падение мимо `ask` (баг адаптера, битый апдейт, отвалившийся Telegram) раньше не доходило
 # до человека НИКАК — бот просто замолкал.
 _HANDLER_FAILURE = "⚠️ Что-то сломалось на моей стороне — я уже сообщил владельцу."
@@ -123,10 +145,18 @@ Outgoing = OutText | OutDocument
 
 
 def make_owner_alert(bot: Bot, owner_id: int) -> Callable[[str], None]:
-    """Fire-and-forget алерт владельцу (§5.4): не блокирует ask, сеть висит — ask не ждёт."""
+    """Fire-and-forget алерт владельцу (§5.4): не блокирует ask, сеть висит — ask не ждёт.
+
+    Ссылку на задачу держим до её конца: asyncio хранит только слабую ссылку, и алерт,
+    отпущенный без владельца, сборщик мусора вправе снять посреди отправки — владелец не
+    узнает о деградации ровно тогда, когда это важнее всего.
+    """
+    pending: set[asyncio.Task[None]] = set()
 
     def alert(detail: str) -> None:
-        asyncio.create_task(_safe_send(bot, owner_id, f"⚠️ Движок деградировал: {detail}"))
+        task = asyncio.create_task(_safe_send(bot, owner_id, f"⚠️ Движок деградировал: {detail}"))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
 
     return alert
 
@@ -170,6 +200,7 @@ class TelegramBot:
         draft: DraftTuning | None = _DEFAULT_DRAFT,
         health: HealthMarker | None = None,
         on_alert: Callable[[str], None] | None = None,
+        delivery_pause: float = _DELIVERY_PAUSE,
     ):
         # Bot передаётся готовым (один на процесс): тот же объект шлёт алерты владельцу
         # (make_owner_alert) и ведёт polling — два Bot на один токен не нужны.
@@ -193,8 +224,15 @@ class TelegramBot:
         # падения генерации, снаружи оно должно быть видно так же (§5.4).
         self._health = health
         self._on_alert = on_alert
+        self._delivery_pause = delivery_pause
         # Окна (chat:thread), в которых прямо сейчас идёт генерация — см. _is_busy (ADV-13)
         self._busy: set[str] = set()
+        # Сколько промптов окна в работе или ждут замка — счётчик занимается СИНХРОННО,
+        # до первого await (см. _window_slot), иначе два тапа проскакивают оба.
+        self._queued: dict[str, int] = {}
+        # Фоновые задачи адаптера (статус тула) — asyncio держит на них только слабую
+        # ссылку, поэтому сильную держим сами до их завершения.
+        self._tasks: set[asyncio.Task[None]] = set()
         # Замок на ОКНО: генерацию и так сериализует session_lock ядра, но отпускается он до
         # доставки — и черновик второго сообщения успевал появиться раньше финала первого.
         self._locks: dict[str, asyncio.Lock] = {}
@@ -346,13 +384,18 @@ class TelegramBot:
         if not self._guard(message) or not message.text:
             return
         chat_id, thread_id, user_id = self._coords(message)
-        # Окно занято — не отказываем текстом (лишнее сообщение в чате и грубо), а показываем
-        # реакцией, что приняли: замок ниже сам подержит промпт до освобождения.
-        await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
-        await self._handle_prompt(
-            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=message.text
-        )
-        await self._react(message, _DONE)
+        with self._window_slot(chat_id, thread_id) as key:
+            if key is None:
+                await self._react(message, _OVERFLOW)
+                return
+            # Окно занято — не отказываем текстом (лишнее сообщение в чате и грубо), а
+            # показываем реакцией, что приняли: замок сам подержит промпт до освобождения.
+            await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
+            kind = await self._handle_prompt(
+                key, chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=message.text
+            )
+        if kind in _DONE_KINDS:
+            await self._react(message, _DONE)
 
     async def _on_attachment(self, message: Message) -> None:
         """Документ/фото: скачать в uploads инстанса и отдать агенту путь в рамке (§5.5, §8.2).
@@ -372,22 +415,35 @@ class TelegramBot:
         if self._intake is None:
             await self._send(chat_id, thread_id, "Приём файлов выключен в настройках движка.")
             return
-        await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
-        try:
-            sid = self._router.ensure_session(chat_id=chat_id, thread_id=thread_id, user_id=user_id)
-        except NoProjectError:
-            await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
-            return
+        with self._window_slot(chat_id, thread_id) as key:
+            if key is None:
+                await self._react(message, _OVERFLOW)
+                return
+            await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
+            try:
+                sid = self._router.ensure_session(
+                    chat_id=chat_id, thread_id=thread_id, user_id=user_id
+                )
+            except NoProjectError:
+                # Реакцию снимаем честно: «взял в работу» на сообщении, которое никто не
+                # берёт, висит навсегда — человек ждёт ответа, которого не будет.
+                await self._unreact(message)
+                await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
+                return
 
-        result = await self._intake.take(session_id=sid, attachment=attachment)
-        if result.path is None:
-            await self._send(chat_id, thread_id, result.error or "Файл не принят.")
-            return
-        prompt = frame_attachment_prompt(path=result.path, kind=attachment.kind, user_text=caption)
-        await self._handle_prompt(
-            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
-        )
-        await self._react(message, _DONE)
+            result = await self._intake.take(session_id=sid, attachment=attachment)
+            if result.path is None:
+                await self._unreact(message)
+                await self._send(chat_id, thread_id, result.error or "Файл не принят.")
+                return
+            prompt = frame_attachment_prompt(
+                path=result.path, kind=attachment.kind, user_text=caption
+            )
+            kind = await self._handle_prompt(
+                key, chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
+            )
+        if kind in _DONE_KINDS:
+            await self._react(message, _DONE)
 
     async def _on_unsupported(self, message: Message) -> None:
         """Тип сообщения, который движок пока не умеет (голос, видео, стикер, локация).
@@ -438,15 +494,17 @@ class TelegramBot:
         if button is None or button_digest(button) != action.digest:
             await self._answer_callback(callback, "Кнопка устарела — обновлю ряд под ответом.")
             return
-        if self._is_busy(chat_id, thread_id):
-            # ADV-13: второе нажатие = второй полный прогон агента и второй расход квоты
-            # подписки. Тост дешевле и честнее, чем удвоенный счёт.
-            await self._answer_callback(callback, "Уже работаю над этим — секунду.")
-            return
-        await self._answer_callback(callback, button.label)
-        await self._handle_prompt(
-            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=button.prompt
-        )
+        # Место в окне занимается СИНХРОННО, до первого await: ADV-13 второе нажатие = второй
+        # полный прогон агента и второй расход квоты подписки, а между проверкой занятости и
+        # первым await успевал проскочить второй тап. Тост дешевле и честнее удвоенного счёта.
+        with self._window_slot(chat_id, thread_id) as key:
+            if key is None or self._pending(key) > 1:
+                await self._answer_callback(callback, "Уже работаю над этим — секунду.")
+                return
+            await self._answer_callback(callback, button.label)
+            await self._handle_prompt(
+                key, chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=button.prompt
+            )
 
     async def _run_system_action(
         self, action: SystemActionName, chat_id: int, thread_id: int | None
@@ -476,27 +534,71 @@ class TelegramBot:
             logger.debug("callback.answer не прошёл", exc_info=True)
 
     async def _handle_prompt(
-        self, *, chat_id: int, thread_id: int | None, user_id: int, prompt: str
-    ) -> None:
+        self, key: str, *, chat_id: int, thread_id: int | None, user_id: int, prompt: str
+    ) -> str | None:
         """Единый путь промпта в сессию — для текста, для кнопки-триггера и для файла.
+
+        `key` — окно, место в котором уже занято вызывающим (`_window_slot`).
 
         Ровно один путь важен принципиально (§9, паттерн action_buttons): кнопка не должна
         получить «особую» обработку, иначе стриминг/ошибки/косметика начнут расходиться.
+
+        Возвращает исход (`Outcome.kind`) — по нему хендлер решает, честно ли ставить
+        реакцию «готово». None — ответа не было вовсе (нет проекта).
 
         Тут же отмечается «окно занято» — по этому признаку `_on_callback` отказывает
         повторному нажатию (ADV-13). Снимается в finally: упавший прогон не должен запирать
         окно навсегда.
         """
-        busy_key = self._router.surface_key(chat_id, thread_id)
-        lock = self._locks.setdefault(busy_key, asyncio.Lock())
+        lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
-            self._busy.add(busy_key)
+            self._busy.add(key)
             try:
-                await self._run_prompt(
+                return await self._run_prompt(
                     chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
                 )
             finally:
-                self._busy.discard(busy_key)
+                self._busy.discard(key)
+
+    @contextlib.contextmanager
+    def _window_slot(self, chat_id: int, thread_id: int | None) -> Iterator[str | None]:
+        """Занять место в очереди окна СИНХРОННО — до первого await. None — очередь полна.
+
+        Синхронность и есть смысл: `_is_busy` спрашивался до первого await, а «занято»
+        ставилось уже внутри замка — два тапа одной кнопки успевали проскочить оба.
+
+        Кап нужен по той же причине, что и замок: десять сообщений в занятое окно — это
+        десять прогонов агента в затылок друг другу и квота подписки на ветер, пока человек
+        давно ушёл. Отказ честнее растущей очереди.
+        """
+        key = self._router.surface_key(chat_id, thread_id)
+        if self._queued.get(key, 0) >= _QUEUE_CAP:
+            yield None
+            return
+        self._queued[key] = self._queued.get(key, 0) + 1
+        try:
+            yield key
+        finally:
+            left = self._queued[key] - 1
+            if left:
+                self._queued[key] = left
+            else:
+                del self._queued[key]
+                self._drop_lock_if_free(key)
+
+    def _pending(self, key: str) -> int:
+        """Сколько промптов этого окна уже в работе или ждут замка."""
+        return self._queued.get(key, 0)
+
+    def _drop_lock_if_free(self, key: str) -> None:
+        """Убрать замок окна, когда он никому не нужен.
+
+        Иначе `_locks` растёт по числу когда-либо виденных окон — тот же паттерн, что у
+        пула клиентов (`ClientPool._drop_lock_if_free`).
+        """
+        lock = self._locks.get(key)
+        if lock is not None and not lock.locked():
+            del self._locks[key]
 
     def _is_busy(self, chat_id: int, thread_id: int | None) -> bool:
         """Идёт ли прямо сейчас генерация в этом окне (chat:thread).
@@ -508,7 +610,7 @@ class TelegramBot:
 
     async def _run_prompt(
         self, *, chat_id: int, thread_id: int | None, user_id: int, prompt: str
-    ) -> None:
+    ) -> str | None:
         status = self._make_status_handler(chat_id, thread_id)
         draft = (
             DraftStreamer(self._bot, chat_id=chat_id, thread_id=thread_id, tuning=self._draft)
@@ -547,7 +649,13 @@ class TelegramBot:
             if draft is not None:
                 await draft.finish()
             await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
-            return
+            return None
+        except asyncio.CancelledError:
+            # Прогон сняли (рестарт бота, отмена задачи). Цикл черновика — фоновая задача:
+            # некому её остановить, кроме нас, иначе в чате навсегда остаётся курсор ▌.
+            if draft is not None:
+                await draft.abort(_CANCELLED)
+            raise
         except Exception:
             # Генерация упала: накопленный текст ядро выбросило, но показанный человеку —
             # остаётся в чате с пометкой. Сообщение в чат пришлёт errors-handler.
@@ -555,12 +663,30 @@ class TelegramBot:
                 await draft.abort(_ENGINE_FAILURE)
             raise
         text = render_result(result)
-        if result.outcome.kind == "ok":
+        kind = result.outcome.kind
+        if kind == "ok":
             await self._deliver(chat_id, thread_id, text, draft=draft)
-            return
-        # Не-ok: пометка дописывается к показанному тексту, а не подменяет его (§5.4).
+            return kind
+        note_only = kind in NOTE_ONLY_KINDS
+        if note_only and draft is not None and await draft.abort(text, markup=self._keyboard()):
+            # Человек сам остановил задачу (/stop): написанное он читает в черновике, туда и
+            # дописываем пометку. Прислать тот же текст заново — шум ровно там, где попросили
+            # тишины.
+            return kind
+        body = result.text.strip()
+        if body:
+            # Не-ok с текстом несёт ЧАСТИЧНЫЙ ОТВЕТ — такой же ответ: max_turns или
+            # остановленная задача, показать которую было негде (стриминг выключен, черновика
+            # нет). Доставляем нарезкой, как ok-путь: `abort` ужимал текст под лимит, отрезая
+            # ГОЛОВУ, а фолбэк слал простыню одним сообщением и получал 400. Файлы при этом
+            # не отдаём: задача прервана, отдавать недоделанное нельзя.
+            full = f"{body}\n\n{text}".strip() if note_only else text
+            await self._deliver(chat_id, thread_id, full, draft=draft, send_files=False)
+            return kind
+        # Текста нет — пометка дописывается к показанному тексту, а не подменяет его (§5.4).
         if draft is None or not await draft.abort(text, markup=self._keyboard()):
             await self._send(chat_id, thread_id, text, self._keyboard())
+        return kind
 
     # ── доставка ответа: текст + вложения по маркеру (§9) ─────────────────────
 
@@ -570,6 +696,8 @@ class TelegramBot:
         thread_id: int | None,
         text: str,
         draft: DraftStreamer | None = None,
+        *,
+        send_files: bool = True,
     ) -> None:
         """Отправить ответ: текст нарезкой, файлы по маркерам, ряд кнопок под последним.
 
@@ -577,16 +705,22 @@ class TelegramBot:
         сообщение, которое печаталось. Хвост, файлы и объяснения уходят новыми сообщениями
         после него. Черновика нет (дельт не было) или финальный edit не прошёл — всё едет
         обычным путём, ответ не теряется.
+
+        `send_files=False` — прерванная задача: текст доставляем (он написан), а файлы нет.
         """
         # Маркер вырезаем ВСЕГДА, даже при выключенной отдаче (K21): иначе человек получал
         # в чат служебную строку с абсолютным путём внутри
         # (`[SEND_FILE:/home/unpacker/agents/office/state/x.pdf]`) — непонятно и вдобавок
         # показывает раскладку каталогов сервера.
         text, paths = extract_send_files(text)
-        if self._send_file is None:
+        files: list[Path] = []
+        if not send_files:
+            # Молчать нельзя: файл человеку обещан текстом ответа, и без строки он будет
+            # ждать вложение, которого не будет.
+            notes = [_FILE_ABORTED] if paths else []
+        elif self._send_file is None:
             # но и делать вид, что файл ушёл, нельзя: объясняем словами
             notes = ["📎 Отдача файлов выключена в настройках движка."] if paths else []
-            files: list[Path] = []
         else:
             files, notes = self._resolve_send_files(chat_id, thread_id, paths)
 
@@ -600,15 +734,27 @@ class TelegramBot:
             items = [OutText("…")]
 
         markup = self._keyboard()
-        if draft is not None and isinstance(items[0], OutText):
-            # Клавиатуру вешаем на edit только если доставлять больше нечего: правило
-            # «ряд под ПОСЛЕДНИМ элементом» от переезда финала в черновик не меняется.
-            only = len(items) == 1
-            if await draft.finalize(items[0].text, markup=markup if only else None):
-                items = items[1:]
+        spoken = False  # ушёл ли уже кусок этого ответа — от этого зависит пауза
+        if draft is not None:
+            first = items[0]
+            if isinstance(first, OutText):
+                # Клавиатуру вешаем на edit только если доставлять больше нечего: правило
+                # «ряд под ПОСЛЕДНИМ элементом» от переезда финала в черновик не меняется.
+                only = len(items) == 1
+                if await draft.finalize(first.text, markup=markup if only else None):
+                    items = items[1:]
+                    spoken = True
+            else:
+                # Доставлять черновиком нечего (ответ — один файл): раньше он оставался
+                # висеть с вечным курсором ▌, а фоновый цикл продолжал крутиться.
+                await draft.finish()
 
         last = len(items) - 1
         for i, item in enumerate(items):
+            if i or spoken:
+                # Не после каждого куска, а ПЕРЕД каждым следующим: одиночный ответ
+                # (обычный случай) не ждёт ни секунды.
+                await asyncio.sleep(self._delivery_pause)
             reply_markup = markup if i == last else None
             if isinstance(item, OutDocument):
                 await self._send_document(chat_id, thread_id, item.path, reply_markup)
@@ -673,9 +819,13 @@ class TelegramBot:
         def handler(event: Event) -> None:
             if isinstance(event, ToolStarted) and not shown["done"]:
                 shown["done"] = True
-                asyncio.create_task(
+                # Ссылку держим до конца задачи: у asyncio она слабая, и статус мог
+                # исчезнуть под сборщиком мусора посреди отправки.
+                task = asyncio.create_task(
                     _safe_send(self._bot, chat_id, render_tool_status(event), thread_id)
                 )
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
 
         return handler
 
@@ -685,20 +835,28 @@ class TelegramBot:
         Раньше исключение в хендлере уходило в лог aiogram и НИКАК не доходило до человека —
         бот молча замолкал, а для ученика молчание неотличимо от «бот умер». Здесь три
         обязательных действия: сказать в чат, поднять флаг health и разбудить владельца.
+
+        Порядок обязателен: СНАЧАЛА человеку, потом health и алерт. Раньше первым шёл
+        `health.degraded` — голый I/O: на переполненном или read-only диске рубеж падал
+        раньше, чем успевал сказать хоть слово, ровно в момент реального сбоя.
         """
         logger.exception("необработанное исключение в хендлере", exc_info=event.exception)
-        if self._health is not None and self._health.degraded(f"handler: {event.exception}"):
+        target = _error_target(event)
+        if target is not None:  # None — апдейт без чата (my_chat_member и подобные)
+            chat_id, thread_id = target
+            with contextlib.suppress(Exception):
+                await self._send(chat_id, thread_id, _HANDLER_FAILURE)
+        with contextlib.suppress(Exception):
+            self._raise_alarm(f"сбой обработчика: {event.exception}")
+
+    def _raise_alarm(self, detail: str) -> None:
+        """Поднять флаг health и разбудить владельца — снаружи сбой обязан быть виден (§5.4)."""
+        if self._health is not None and not self._health.degraded(detail):
             # degraded() возвращает True только на ПЕРЕХОДЕ — иначе один битый апдейт,
             # повторяющийся polling'ом, засыпал бы владельца одинаковыми алертами.
-            if self._on_alert is not None:
-                self._on_alert(f"сбой обработчика: {event.exception}")
-        elif self._health is None and self._on_alert is not None:
-            self._on_alert(f"сбой обработчика: {event.exception}")
-        target = _error_target(event)
-        if target is None:
-            return  # апдейт без чата (my_chat_member и подобные) — писать некуда
-        chat_id, thread_id = target
-        await self._send(chat_id, thread_id, _HANDLER_FAILURE)
+            return
+        if self._on_alert is not None:
+            self._on_alert(detail)
 
     async def _typing_once(self, chat_id: int, thread_id: int | None) -> None:
         """Разовый «печатает…» — путь без черновика (стриминг выключен в .env)."""
@@ -708,7 +866,7 @@ class TelegramBot:
             logger.debug("typing не ушёл", exc_info=True)
 
     async def _react(self, message: Message, emoji: str) -> None:
-        """Реакция на исходном сообщении: 👀 взял → ✅ готово (или ✍️ «принял, в очереди»).
+        """Реакция на исходном сообщении: 👀 взял → 👌 готово (или ✍ «принял, в очереди»).
 
         Смена реакции — вся компенсация за то, что финал приходит правкой: правка не даёт
         уведомления, и человек, ушедший из чата на минуту, иначе не узнает, что бот закончил.
@@ -717,6 +875,13 @@ class TelegramBot:
             await message.react([ReactionTypeEmoji(emoji=emoji)])
         except Exception:  # noqa: BLE001 — реакция косметическая, не критична
             logger.debug("реакция не поставилась", exc_info=True)
+
+    async def _unreact(self, message: Message) -> None:
+        """Снять реакцию: работа не началась, и «взял в работу» на сообщении — ложный сигнал."""
+        try:
+            await message.react([])
+        except Exception:  # noqa: BLE001 — та же косметика
+            logger.debug("реакция не снялась", exc_info=True)
 
     async def _reply(self, message: Message, text: str) -> None:
         chat_id, thread_id, _ = self._coords(message)
@@ -736,24 +901,49 @@ class TelegramBot:
         важнее разметки.
         """
         md = to_telegram_markdown(text)
+        if md is not None and await self._send_once(
+            chat_id, thread_id, md, "MarkdownV2", reply_markup
+        ):
+            return
         if md is not None:
+            logger.warning("MarkdownV2 не отправился, плейн")
+        if not await self._send_once(chat_id, thread_id, text, None, reply_markup):
+            logger.error("не удалось ответить в чат %s", chat_id)
+
+    async def _send_once(
+        self,
+        chat_id: int,
+        thread_id: int | None,
+        text: str,
+        parse_mode: str | None,
+        reply_markup: InlineKeyboardMarkup | None,
+    ) -> bool:
+        """Одна попытка отправки с одним повтором после 429.
+
+        429 — это «подожди столько-то», а не «текст плохой»: раньше он ловился общим
+        `except` и читался как отказ разметки, после чего плейн-ступень стучалась в тот же
+        флуд-бан и ответ терялся молча.
+        """
+        for attempt in (0, 1):
             try:
                 await self._bot.send_message(
                     chat_id,
-                    md,
+                    text,
                     message_thread_id=thread_id,
-                    parse_mode="MarkdownV2",
+                    parse_mode=parse_mode,
                     reply_markup=reply_markup,
                 )
-                return
-            except Exception:  # noqa: BLE001 — при ошибке разметки шлём плейн, ответ не теряем
-                logger.warning("MarkdownV2 не отправился, плейн", exc_info=True)
-        try:
-            await self._bot.send_message(
-                chat_id, text, message_thread_id=thread_id, reply_markup=reply_markup
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("не удалось ответить в чат %s", chat_id)
+            except TelegramRetryAfter as exc:
+                if attempt:  # второй бан подряд — ждать дальше дороже, чем идти следующей ступенью
+                    logger.warning("отправка во флуд-бане второй раз (%s)", parse_mode or "плейн")
+                    return False
+                await asyncio.sleep(exc.retry_after + FLOOD_PAD)
+            except Exception:  # noqa: BLE001 — следующая ступень: ответ важнее разметки
+                logger.warning("отправка не прошла (%s)", parse_mode or "плейн", exc_info=True)
+                return False
+            else:
+                return True
+        return False
 
     async def _send_document(
         self,

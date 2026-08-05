@@ -204,3 +204,53 @@ def test_streaming_knobs_read_from_env(monkeypatch):
     assert s.stream_enabled is False
     assert s.stream_interval == 5.0
     assert s.stream_max_units == 1200
+
+
+# ── FA7: ручки черновика с границами (ученик правит .env руками) ─────────────
+
+
+def test_streaming_defaults_match_the_engine_defaults(monkeypatch):
+    """Дефолт .env и дефолт DraftTuning — одно число, а не два похожих.
+
+    Разъедутся — движок начнёт вести себя по-разному в зависимости от того, задал ли
+    ученик ручку вообще, и объяснить это ему будет нечем.
+    """
+    from engine.adapters.telegram.draft import DraftTuning
+
+    for k, v in _base_env().items():
+        monkeypatch.setenv(k, v)
+    s = _settings()
+    tuning = DraftTuning()
+    assert s.stream_interval == tuning.interval
+    assert s.stream_max_units == tuning.max_units
+
+
+def test_zero_interval_is_refused(monkeypatch):
+    """0 — не «быстро», а горячий цикл без сна: 100% CPU на инстансе ученика."""
+    for k, v in _base_env(STREAM_INTERVAL="0").items():
+        monkeypatch.setenv(k, v)
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_negative_interval_is_refused(monkeypatch):
+    for k, v in _base_env(STREAM_INTERVAL="-1").items():
+        monkeypatch.setenv(k, v)
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_window_wider_than_a_message_is_refused(monkeypatch):
+    """Окно шире лимита Telegram = 400 MESSAGE_TOO_LONG на КАЖДОМ тике черновика."""
+    for k, v in _base_env(STREAM_MAX_UNITS="4200").items():
+        monkeypatch.setenv(k, v)
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_window_narrower_than_the_counter_is_refused(monkeypatch):
+    """Окно меньше служебной строки-счётчика — человек видит пустоту вместо текста."""
+    for k, v in _base_env(STREAM_MAX_UNITS="50").items():
+        monkeypatch.setenv(k, v)
+    with pytest.raises(ValidationError):
+        _settings()

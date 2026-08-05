@@ -19,10 +19,14 @@ from engine.adapters.telegram.draft import DraftStreamer, DraftTuning
 
 
 class FlakyBot:
-    """Дублёр Bot, у которого edit отвечает заданным исключением."""
+    """Дублёр Bot, у которого edit отвечает заданным исключением.
 
-    def __init__(self, error: Exception | None = None):
+    `fail_times` ограничивает число отказов: None — всегда, число — первые N вызовов.
+    """
+
+    def __init__(self, error: Exception | None = None, *, fail_times: int | None = None):
         self.error = error
+        self.fail_times = fail_times
         self.sent: list[str] = []
         self.edits: list[str] = []
         self._next_id = 0
@@ -41,8 +45,11 @@ class FlakyBot:
 
     async def edit_message_text(self, text, chat_id=None, message_id=None, **kw):
         self.edits.append(text)
-        if self.error is not None:
-            raise self.error
+        if self.error is None or self.fail_times == 0:
+            return
+        if self.fail_times is not None:
+            self.fail_times -= 1
+        raise self.error
 
     async def delete_message(self, chat_id, message_id):
         pass
@@ -188,6 +195,28 @@ async def test_not_modified_during_streaming_is_treated_as_shown():
     d.on_delta(" добавка")
     await asyncio.sleep(0.2)
     assert len(bot.edits) == 1, f"повторы поверх «not modified»: {len(bot.edits)}"
+
+
+# ── FA10: человек удалил черновик руками ────────────────────────────────────
+
+
+async def test_draft_is_recreated_when_the_person_deleted_it():
+    """«message to edit not found» — черновика в чате больше нет.
+
+    Раньше этот 400 попадал в общую ветку «повторять бессмысленно», и текст замирал до
+    конца генерации: человек, случайно снёсший сообщение, дальше смотрел в пустоту.
+    """
+    bot = FlakyBot(
+        TelegramBadRequest(method=None, message="Bad Request: message to edit not found"),
+        fail_times=1,
+    )
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_fast())
+    d.on_delta("первый показ")
+    await asyncio.sleep(0.05)  # черновик создан
+    d.on_delta(" добавка")
+    await asyncio.sleep(0.15)  # edit не прошёл → следующий тик пересоздаёт
+    assert len(bot.sent) >= 2, f"черновик не пересоздан: sent={bot.sent}, edits={bot.edits}"
+    assert "добавка" in bot.sent[-1]
 
 
 async def test_shorter_text_after_reset_is_shown_immediately():

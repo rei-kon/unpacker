@@ -29,8 +29,7 @@ from aiogram.types import InlineKeyboardMarkup
 
 from engine.core.formatting import to_telegram_markdown
 from engine.core.sendfile import hide_partial_marker
-from engine.core.streaming import TELEGRAM_LIMIT, split_message, tail_by_units
-from engine.core.streaming import _utf16_units as _units
+from engine.core.streaming import TELEGRAM_LIMIT, split_message, tail_by_units, utf16_units
 
 logger = logging.getLogger("unpacker.engine")
 
@@ -44,7 +43,14 @@ _DEFAULT_MAX_UNITS = 3600
 _NOT_MODIFIED = "message is not modified"
 # Переходная строка на TextStart (текст → tool → текст) и счётчик при переполнении окна.
 _TRANSITION = "⚙️ работаю дальше"
-_COUNTER = "…продолжаю, написано символов: {chars}"
+_COUNTER_PREFIX = "…продолжаю, написано символов: "
+_COUNTER = _COUNTER_PREFIX + "{chars}"
+# Черновика в чате больше нет — человек снёс его руками. Повторять edit по мёртвому id
+# бессмысленно, а вот пересоздать сообщение можно и нужно.
+_NOT_FOUND = "message to edit not found"
+# Добавка к `retry_after` из 429: Telegram называет момент, когда бан снимется, а не момент,
+# когда можно стучаться. Секунда впритык — второй флуд-бан.
+FLOOD_PAD = 0.5
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,20 @@ class DraftTuning:
         return self.interval * 4
 
 
+@dataclass(frozen=True)
+class _Frame:
+    """Кадр черновика: что показать сейчас и чем это мерить.
+
+    `source_units` — длина ИСХОДНОГО текста за кадром: порог прироста считается по ней, а
+    не по длине показанного окна (в режиме хвоста та константна). `forced` — показать в
+    обход порога (переходная строка на TextStart).
+    """
+
+    shown: str
+    forced: bool = False
+    source_units: int = 0
+
+
 class DraftStreamer:
     def __init__(
         self,
@@ -100,6 +120,8 @@ class DraftStreamer:
         self._buf: list[str] = []
         self._dirty = False
         self._shown: str | None = None  # что реально висит в TG (дедуп «not modified»)
+        # Длина исходного текста на момент последнего показа — по ней меряется прирост.
+        self._shown_source = 0
         # Текст, который Telegram отверг как некорректный: повторять его бессмысленно —
         # 400 повторным edit того же текста не лечится, только жжёт квоту чата.
         self._rejected: str | None = None
@@ -246,41 +268,75 @@ class DraftStreamer:
         parse_mode: str | None = None,
         markup: InlineKeyboardMarkup | None = None,
     ) -> bool:
-        try:
-            await self._bot.edit_message_text(
-                text,
-                chat_id=self._chat_id,
-                message_id=self._message_id,
-                parse_mode=parse_mode,
-                reply_markup=markup,
-            )
-        except TelegramBadRequest as exc:
-            if _NOT_MODIFIED in str(exc):
+        """Одна ступень каскада. 429 — не отказ ступени: ждём и повторяем ЕЁ ЖЕ.
+
+        Раньше 429 ловился общим `except` и читался как «эта ступень не работает» — каскад
+        MarkdownV2 → плейн → delete+send прожигал четыре вызова подряд внутри флуд-бана,
+        каждый следующий получал тот же 429, и ответ терялся целиком.
+        """
+        for attempt in (0, 1):
+            try:
+                await self._bot.edit_message_text(
+                    text,
+                    chat_id=self._chat_id,
+                    message_id=self._message_id,
+                    parse_mode=parse_mode,
+                    reply_markup=markup,
+                )
+            except TelegramRetryAfter as exc:
+                if attempt:  # второй бан подряд — дальше ждать дороже, чем идти по каскаду
+                    logger.warning("финальный edit во флуд-бане второй раз (%s)", parse_mode)
+                    return False
+                await asyncio.sleep(exc.retry_after + FLOOD_PAD)
+            except TelegramBadRequest as exc:
+                if _NOT_MODIFIED in str(exc):
+                    self._shown = text
+                    return True
+                logger.warning("финальный edit отвергнут Telegram (%s)", parse_mode or "плейн")
+                return False
+            except Exception:  # noqa: BLE001 — сеть моргнула: следующая ступень каскада
+                logger.warning(
+                    "финальный edit не прошёл (%s)", parse_mode or "плейн", exc_info=True
+                )
+                return False
+            else:
                 self._shown = text
                 return True
-            logger.warning("финальный edit отвергнут Telegram (%s)", parse_mode or "плейн")
-            return False
-        except Exception:  # noqa: BLE001 — сеть моргнула: пробуем следующую ступень каскада
-            logger.warning("финальный edit не прошёл (%s)", parse_mode or "плейн", exc_info=True)
-            return False
-        self._shown = text
-        return True
+        return False
 
     async def _resend(self, text: str, markup: InlineKeyboardMarkup | None) -> bool:
-        """Последняя ступень каскада: черновика в чате больше нет (удалён руками) — шлём заново."""
-        try:
-            await self._bot.delete_message(self._chat_id, self._message_id)
-        except Exception:  # noqa: BLE001 — скорее всего его и нет; не мешает отправке
-            logger.debug("черновик не удалился перед пересылкой финала", exc_info=True)
-        self._message_id = None
-        try:
-            await self._bot.send_message(
-                self._chat_id, text, message_thread_id=self._thread_id, reply_markup=markup
-            )
-        except Exception:  # noqa: BLE001 — не смогли: пусть бот доставит своим путём
-            logger.warning("финал не ушёл новым сообщением", exc_info=True)
+        """Последняя ступень каскада: черновика в чате больше нет (удалён руками) — шлём заново.
+
+        Сначала send, и только после его успеха delete: обратный порядок стирал единственное,
+        что от ответа осталось, ещё до того, как выяснится, что новое сообщение не уходит.
+        """
+        if not await self._send_final(text, markup):
             return False
+        old, self._message_id = self._message_id, None
+        try:
+            await self._bot.delete_message(self._chat_id, old)
+        except Exception:  # noqa: BLE001 — скорее всего его и нет; ответ уже доставлен
+            logger.debug("черновик не удалился после пересылки финала", exc_info=True)
         return True
+
+    async def _send_final(self, text: str, markup: InlineKeyboardMarkup | None) -> bool:
+        """Финал новым сообщением, с одним повтором после 429."""
+        for attempt in (0, 1):
+            try:
+                await self._bot.send_message(
+                    self._chat_id, text, message_thread_id=self._thread_id, reply_markup=markup
+                )
+            except TelegramRetryAfter as exc:
+                if attempt:
+                    logger.warning("финал во флуд-бане второй раз — отдаём боту")
+                    return False
+                await asyncio.sleep(exc.retry_after + FLOOD_PAD)
+            except Exception:  # noqa: BLE001 — не смогли: пусть бот доставит своим путём
+                logger.warning("финал не ушёл новым сообщением", exc_info=True)
+                return False
+            else:
+                return True
+        return False
 
     # ── фоновая задача ───────────────────────────────────────────────────────
 
@@ -292,24 +348,21 @@ class DraftStreamer:
             await asyncio.sleep(self.interval)
 
     async def _flush(self) -> None:
-        shown, forced = self._compose()
-        if shown is None:
+        frame = self._compose()
+        if frame is None:
             return
-        if shown == self._shown or shown == self._rejected:
+        if frame.shown == self._shown or frame.shown == self._rejected:
             return
-        if not forced and not self._worth_showing(shown):
+        if not frame.forced and not self._worth_showing(frame):
             self._dirty = True  # копим дальше: покажем, когда наберётся ощутимый кусок
             return
         # Сеть — отдельной shield-задачей: cancel цикла (finish) не убьёт её посреди
         # send_message, поэтому _message_id гарантированно запишется и финал его найдёт.
-        self._inflight = asyncio.ensure_future(self._send_or_edit(shown))
+        self._inflight = asyncio.ensure_future(self._send_or_edit(frame))
         await asyncio.shield(self._inflight)
 
-    def _compose(self) -> tuple[str | None, bool]:
-        """Что показать сейчас: (текст, показывать ли в обход порога дельты).
-
-        None — показывать нечего: буфер пуст и подменять текст не на что.
-        """
+    def _compose(self) -> _Frame | None:
+        """Что показать сейчас. None — показывать нечего: буфер пуст и подменять нечем."""
         # Маркер `[SEND_FILE:]` из черновика убираем ВСЕГДА, включая недописанный хвост:
         # финал его вырежет, а до финала человек видел служебную строку с абсолютным путём
         # на сервере внутри — и через секунду она исчезала (residual-находка ревью).
@@ -318,10 +371,10 @@ class DraftStreamer:
             # TextStart пришёл, новых дельт ещё нет. Молча подменить абзац, который человек
             # читает, — выглядит как сбой; переходная строка читается как прогресс.
             if self._transition and self._shown:
-                return f"{_strip_tail(self._shown)}\n\n{_TRANSITION}", True
-            return None, False
+                return _Frame(f"{_strip_tail(self._shown)}\n\n{_TRANSITION}", forced=True)
+            return None
         self._transition = False
-        return self._window(text), False
+        return _Frame(self._window(text), forced=False, source_units=utf16_units(text))
 
     def _window(self, text: str) -> str:
         """Окно показа: голова, пока влезает, дальше — свежий хвост со счётчиком.
@@ -330,26 +383,32 @@ class DraftStreamer:
         длинном документе человек две минуты из трёх смотрел на мёртвый экран и не знал,
         жив ли бот. Окно едет за генерацией, счётчик говорит, сколько уже написано.
         """
-        if _units(text) <= self._max:
+        if utf16_units(text) <= self._max:
             return text + _CURSOR
         counter = _COUNTER.format(chars=len(text))
-        room = self._max - _units(counter) - _units(_ELLIPSIS) - 2  # 2 — пустая строка
+        room = self._max - utf16_units(counter) - utf16_units(_ELLIPSIS) - 2  # 2 — пустая строка
         return f"{_ELLIPSIS}{tail_by_units(text, room)}\n\n{counter}"
 
-    def _worth_showing(self, shown: str) -> bool:
+    def _worth_showing(self, frame: _Frame) -> bool:
         """Набралось ли достаточно нового текста, чтобы тратить вызов API.
 
-        Порог считает ПРИРОСТ, и только его. Два исключения обязательны:
+        Прирост считается по ИСХОДНОМУ тексту, а не по показанному окну: в режиме хвоста
+        длина окна константна, прирост по ней всегда ноль — и окно замирало до финала,
+        выбрасывая ровно те дельты, ради показа которых окно и заводили.
+
+        Два исключения обязательны:
           • первый показ — первые буквы человек должен увидеть сразу, даже если их пять;
-          • текст стал короче (после TextStart он другой, а не «чуть подправленный») —
+          • показанное стало короче (после TextStart это другой текст, а не подправленный) —
             держать вместо него старый абзац нельзя.
         """
         if self._shown is None:
             return True
-        grown = _units(shown) - _units(self._shown)
-        return grown < 0 or grown >= self._tuning.min_delta_units
+        if utf16_units(frame.shown) < utf16_units(self._shown):
+            return True
+        return frame.source_units - self._shown_source >= self._tuning.min_delta_units
 
-    async def _send_or_edit(self, shown: str) -> None:
+    async def _send_or_edit(self, frame: _Frame) -> None:
+        shown = frame.shown
         try:
             if self._message_id is None:
                 msg = await self._bot.send_message(
@@ -364,12 +423,19 @@ class DraftStreamer:
             # 429 блокирует бота ЦЕЛИКОМ, а не только этот чат: черновик одного человека
             # не смеет затыкать бота остальным. Ждём ровно столько, сколько сказал Telegram,
             # и пол интервала обратно не опускаем — второй флуд-бан дороже лишних секунд.
-            self._floor = max(self._floor, exc.retry_after + 0.5)
+            self._floor = max(self._floor, exc.retry_after + FLOOD_PAD)
             self._dirty = True
             logger.warning("черновик поймал 429, интервал поднят до %.1f с", self._floor)
         except TelegramBadRequest as exc:
             if _NOT_MODIFIED in str(exc):
-                self._shown = shown  # этот текст уже висит в чате — считаем показанным
+                self._remember(frame)  # этот текст уже висит в чате — считаем показанным
+                return
+            if _NOT_FOUND in str(exc):
+                # Человек снёс черновик руками: edit по мёртвому id не пройдёт уже никогда,
+                # и текст замирал до конца генерации. Следующий тик создаст сообщение заново.
+                self._message_id = None
+                self._dirty = True
+                logger.debug("черновик исчез из чата, пересоздаю")
                 return
             # Повторять отвергнутый текст бессмысленно: 400 повторным edit не лечится, а
             # раньше `_dirty` вставал обратно и цикл слал одно и то же до конца генерации.
@@ -379,12 +445,30 @@ class DraftStreamer:
             self._dirty = True  # не терять кусок: следующий тик цикла ретрайнет (троттлинг тот же)
             logger.debug("черновик не отправился/не отредактировался", exc_info=True)
         else:
-            self._shown = shown
+            self._remember(frame)
+
+    def _remember(self, frame: _Frame) -> None:
+        """Запомнить показанное — вместе с длиной исходного текста за ним (см. _worth_showing)."""
+        self._shown = frame.shown
+        self._shown_source = frame.source_units
 
 
 def _strip_tail(shown: str) -> str:
-    """Убрать служебный хвост черновика — курсор или «…» переполнения."""
-    return shown.removesuffix(_CURSOR).removesuffix(_ELLIPSIS).rstrip()
+    """Убрать служебный хвост черновика: курсор, «…», счётчик переполнения, переходную строку.
+
+    Пометка, приклеенная к «…продолжаю, написано символов: 900», читается как часть ответа:
+    человек не понимает, где кончился текст агента и началась служебка движка.
+    """
+    text = shown.removesuffix(_CURSOR).removesuffix(_ELLIPSIS).rstrip()
+    lines = text.split("\n")
+    while lines and _is_service_line(lines[-1]):
+        lines.pop()
+    return "\n".join(lines).rstrip()
+
+
+def _is_service_line(line: str) -> bool:
+    """Строка от движка, а не от агента: счётчик переполнения, переход, пустая."""
+    return line.startswith(_COUNTER_PREFIX) or line.strip() in ("", _TRANSITION)
 
 
 def _fit_limit(text: str) -> str:
