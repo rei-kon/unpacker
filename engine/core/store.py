@@ -196,6 +196,11 @@ class SessionStore(_SubStore):
         # Сериализацию двух окон одной сессии обеспечивает per-session lock движка (§5.1).
         self._touch(session_id, "claude_session_id", claude_session_id)
 
+    def clear_claude_session_id(self, session_id: str) -> None:
+        """Забыть handle сессии CLI: зовётся, когда прошлый оказался мёртв и новый не приехал —
+        держать битый id значит гарантированно упереться в него следующим сообщением."""
+        self._touch(session_id, "claude_session_id", None)
+
     def set_status(self, session_id: str, status: str) -> None:
         if status not in _SESSION_STATUSES:
             raise ValueError(f"недопустимый статус: {status!r}")

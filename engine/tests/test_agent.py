@@ -382,3 +382,253 @@ async def test_ok_result_keeps_warm_client(store):
     assert pool.get_live(sess.id) is not None
     assert len(created) == 1
     await pool.close_all()
+
+
+# ── B4: лимит/перегруз — один повтор, но С паузой ────────────────────────────
+
+
+class _Sleeper:
+    """Дублёр asyncio.sleep: запоминает паузы, чтобы тест не ждал их по-настоящему."""
+
+    def __init__(self):
+        self.slept = []
+
+    async def __call__(self, seconds):
+        self.slept.append(seconds)
+
+
+class RateLimitedThenOk(FakeStreamClient):
+    _created = 0
+
+    def __init__(self, options):
+        super().__init__(options)
+        type(self)._created += 1
+        self._first = type(self)._created == 1
+
+    async def receive_response(self):
+        if self._first:
+            yield FakeResult(self._reply_session, is_error=True, api_error_status=429)
+            return
+        yield FakeMessage("ответ агента", self._reply_session)
+        yield FakeResult(self._reply_session)
+
+
+async def test_rate_limited_retried_once_after_pause(store):
+    """Мгновенный повтор влетает в тот же лимит — ретрай обязан быть с паузой."""
+    RateLimitedThenOk._created = 0
+    sleeper = _Sleeper()
+    core, pool, _, created = _core(
+        store, client_cls=RateLimitedThenOk, sleep=sleeper, retry_backoff=2.5
+    )
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    result = await core.ask(sess.id, "привет")
+    assert result.outcome.kind == "ok"
+    assert sleeper.slept == [2.5]
+    assert len(created) == 2
+    await pool.close_all()
+
+
+class AlwaysRateLimited(FakeStreamClient):
+    async def receive_response(self):
+        yield FakeResult(self._reply_session, is_error=True, api_error_status=429)
+
+
+async def test_rate_limited_gives_up_honestly(store):
+    sleeper = _Sleeper()
+    core, pool, _, created = _core(
+        store, client_cls=AlwaysRateLimited, sleep=sleeper, retry_backoff=1.0
+    )
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    result = await core.ask(sess.id, "привет")
+    assert result.outcome.kind == "rate_limited"
+    assert len(created) == 2  # ровно один повтор, не бесконечность
+    assert len(sleeper.slept) == 1
+    await pool.close_all()
+
+
+class OverloadedThenOk(RateLimitedThenOk):
+    _created = 0
+
+    async def receive_response(self):
+        if self._first:
+            yield FakeResult(self._reply_session, is_error=True, api_error_status=529)
+            return
+        yield FakeMessage("ответ агента", self._reply_session)
+        yield FakeResult(self._reply_session)
+
+
+async def test_overloaded_retried_after_pause(store):
+    OverloadedThenOk._created = 0
+    sleeper = _Sleeper()
+    core, pool, _, _ = _core(store, client_cls=OverloadedThenOk, sleep=sleeper, retry_backoff=3.0)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    result = await core.ask(sess.id, "привет")
+    assert result.outcome.kind == "ok"
+    assert sleeper.slept == [3.0]
+    await pool.close_all()
+
+
+class RateLimitExceptionThenOk(RateLimitedThenOk):
+    """Живой баг SDK #812: 429 прилетает исключением и роняет клиента."""
+
+    _created = 0
+
+    async def receive_response(self):
+        if self._first:
+            raise RuntimeError("API Error: rate_limit_error")
+        yield FakeMessage("ответ агента", self._reply_session)
+        yield FakeResult(self._reply_session)
+
+
+async def test_rate_limit_exception_also_retried(store):
+    RateLimitExceptionThenOk._created = 0
+    sleeper = _Sleeper()
+    core, pool, _, created = _core(
+        store, client_cls=RateLimitExceptionThenOk, sleep=sleeper, retry_backoff=2.0
+    )
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    result = await core.ask(sess.id, "привет")
+    assert result.outcome.kind == "ok"
+    assert sleeper.slept == [2.0]
+    assert len(created) == 2
+    await pool.close_all()
+
+
+async def test_exec_error_retry_has_no_pause(store):
+    """Сломанный мозг/MCP чинится пересозданием клиента — ждать тут незачем."""
+    ExecErrorThenOk._created = 0
+    sleeper = _Sleeper()
+    core, pool, _, _ = _core(store, client_cls=ExecErrorThenOk, sleep=sleeper)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    result = await core.ask(sess.id, "привет")
+    assert result.outcome.kind == "ok"
+    assert sleeper.slept == []
+    await pool.close_all()
+
+
+# ── B2: не поднялась прошлая сессия — окно чата не умирает навсегда ───────────
+
+
+class BrokenResumeThenOk(FakeStreamClient):
+    """Первый клиент падает так, как падает CLI с мёртвым --resume, второй работает."""
+
+    _created = 0
+
+    def __init__(self, options):
+        super().__init__(options)
+        type(self)._created += 1
+        self._first = type(self)._created == 1
+
+    async def receive_response(self):
+        if self._first:
+            raise RuntimeError("No conversation found with session ID: old-id")
+        yield FakeMessage("ответ агента", self._reply_session)
+        yield FakeResult(self._reply_session)
+
+
+async def test_broken_resume_retried_without_resume(store):
+    BrokenResumeThenOk._created = 0
+    core, pool, built, created = _core(store, client_cls=BrokenResumeThenOk)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "ok"  # окно чата ожило, а не умерло навсегда
+    assert built["resume"] is None  # повтор пошёл с чистого листа
+    assert len(created) == 2
+    assert result.note  # человеку сказали, что контекст потерян
+    await pool.close_all()
+
+
+async def test_broken_resume_rewrites_stored_session_id(store):
+    """Битый id не должен остаться в базе — иначе следующее сообщение снова упрётся в него."""
+    BrokenResumeThenOk._created = 0
+    core, pool, _, _ = _core(store, client_cls=BrokenResumeThenOk)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+
+    await core.ask(sess.id, "привет")
+
+    assert store.sessions.get(sess.id).claude_session_id == "claude-generated-id"
+    await pool.close_all()
+
+
+class SilentDeathThenOk(BrokenResumeThenOk):
+    """Клиент умер, не сказав ни слова — типовой симптом непонятого resume."""
+
+    _created = 0
+
+    async def receive_response(self):
+        if self._first:
+            raise RuntimeError("Command failed with exit code 1")
+        yield FakeMessage("ответ агента", self._reply_session)
+        yield FakeResult(self._reply_session)
+
+
+async def test_silent_failure_with_resume_retries_without_it(store):
+    SilentDeathThenOk._created = 0
+    core, pool, built, created = _core(store, client_cls=SilentDeathThenOk)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "ok"
+    assert built["resume"] is None
+    assert len(created) == 2
+    await pool.close_all()
+
+
+class DiesAfterFirstWord(FakeStreamClient):
+    """Сбой ПОСРЕДИ генерации: контекст жив, resume сбрасывать нельзя."""
+
+    async def receive_response(self):
+        yield FakeMessage("успел написать", self._reply_session)
+        raise RuntimeError("Command failed with exit code 1")
+
+
+async def test_midstream_failure_keeps_resume(store):
+    core, pool, _, created = _core(store, client_cls=DiesAfterFirstWord)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "other_error"
+    assert len(created) == 1  # повтора нет: терять живой контекст на пустом месте нельзя
+    assert store.sessions.get(sess.id).claude_session_id == "claude-generated-id"
+    await pool.close_all()
+
+
+async def test_failure_without_resume_is_not_retried(store):
+    """Резюмировать нечего — второй заход бессмыслен, не жжём бюджет впустую."""
+    core, pool, _, created = _core(store, client_cls=ExplodingClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    result = await core.ask(sess.id, "привет")
+    assert result.outcome.kind == "other_error"
+    assert len(created) == 1
+    await pool.close_all()
+
+
+# ── B6: обрыв потока без Final не должен стирать контекст ────────────────────
+
+
+class TruncatedClient(FakeStreamClient):
+    """Поток кончился без ResultMessage — CLI умер после первых слов."""
+
+    async def receive_response(self):
+        yield FakeMessage("успел написать", self._reply_session)
+
+
+async def test_truncated_stream_saves_session_id(store):
+    core, pool, _, _ = _core(store, client_cls=TruncatedClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "other_error"  # исход честный
+    assert pool.get_live(sess.id) is None  # клиент выкинут
+    # сессия CLI на диске уже создана — её handle сохраняем, иначе диалог теряет кусок истории
+    assert store.sessions.get(sess.id).claude_session_id == "claude-generated-id"
+    await pool.close_all()

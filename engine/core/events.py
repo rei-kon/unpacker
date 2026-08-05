@@ -10,8 +10,9 @@ verbose 0 обслуживает collect_response_with_session (только ф�
   • TextDelta  — кусок текста по мере генерации (include_partial_messages);
   • Final — финал: текст последнего содержательного сообщения + session_id + Outcome (§5.4)
     + расход (cost/usage/num_turns) и сырой is_error;
-  • StreamEnded — поток кончился без финала (CLI умер): отдаёт увиденный session_id, чтобы
-    ядро сохранило контекст диалога вместо молчаливой потери.
+
+Поток, оборвавшийся без ResultMessage, просто заканчивается без Final — улики такого обрыва
+(session_id, был ли прогресс) снимает AgentCore с сырых сообщений, до разбора в события.
 
 Дельты субагентов (parent_tool_use_id) не эмитятся — в черновик владельца чужая болтовня
 не течёт. Duck-typing, как в streaming.py — классы SDK не импортируем.
@@ -58,16 +59,7 @@ class Final:
     num_turns: int | None = None
 
 
-@dataclass(frozen=True)
-class StreamEnded:
-    """Поток кончился без ResultMessage (CLI умер). Несёт session_id, который успел приехать:
-    сессия на диске уже создана, и терять её handle нельзя — иначе после обрыва диалог
-    продолжится с прошлого турна (ревью SDK-ядра, §2)."""
-
-    session_id: str | None
-
-
-Event = ToolStarted | TextStart | TextDelta | Final | StreamEnded
+Event = ToolStarted | TextStart | TextDelta | Final
 
 
 async def stream_events(messages: AsyncIterator[Any]) -> AsyncIterator[Event]:
@@ -111,9 +103,6 @@ async def stream_events(messages: AsyncIterator[Any]) -> AsyncIterator[Event]:
         chunk = extract_text(message)
         if chunk and chunk.strip():
             last_text = chunk
-
-    # сюда попадаем только если поток кончился без результата — сообщаем то, что успели узнать
-    yield StreamEnded(session_id)
 
 
 def _final(text: str, session_id: str | None, result: Any) -> Final:

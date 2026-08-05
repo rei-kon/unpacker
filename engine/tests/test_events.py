@@ -180,25 +180,11 @@ async def test_final_of_ok_result_is_not_error():
     assert final.is_error is False
 
 
-async def test_stream_ended_without_final_reports_seen_session_id():
-    """Поток оборвался без Final: session_id, который успел приехать, не должен пропасть —
-    иначе после рестарта диалог теряет контекст (B6)."""
-    from engine.core.events import StreamEnded
+async def test_truncated_stream_yields_no_final():
+    """Поток без результата не выдумывает финал — обрыв разбирает ядро (AgentCore)."""
 
     async def gen():
         yield Msg([Text("успел написать")], session_id="s12")
 
     events = await _collect(stream_events(gen()))
-    assert isinstance(events[-1], StreamEnded)
-    assert events[-1].session_id == "s12"
     assert not any(isinstance(e, Final) for e in events)
-
-
-async def test_no_stream_ended_after_final():
-    """Штатный финал — ровно один Final и никакого StreamEnded следом."""
-
-    async def gen():
-        yield Result("s13")
-
-    events = await _collect(stream_events(gen()))
-    assert isinstance(events[-1], Final)
