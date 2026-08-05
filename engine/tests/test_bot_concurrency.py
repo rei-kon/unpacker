@@ -3,7 +3,7 @@
 Три находки, у которых один общий корень — человек не понимает, что происходит:
 
   • правка сообщения не поднимает чат и не даёт уведомления, а финал теперь именно правка:
-    ушедший из чата на минуту не узнает, что бот закончил (реакция 👀 → ✅ — дешёвая
+    ушедший из чата на минуту не узнает, что бот закончил (реакция 👀 → 👌 — дешёвая
     компенсация в один вызов API);
   • `_busy` проверялся только для нажатий кнопок, а `_on_text` его не спрашивал вовсе: два
     сообщения подряд = два параллельных прогона и перепутанный порядок доставки;
@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from engine.adapters.telegram import bot as bot_module
 from engine.adapters.telegram.bot import TelegramBot
 from engine.adapters.telegram.router import SessionRouter
 from engine.core.agent import AskResult
@@ -149,16 +150,54 @@ def _build(stand, core=None, *, health=None, alert=None):
     return SimpleNamespace(tg=tg, bot=bot, core=core)
 
 
-# ── A8: 👀 → ✅ ──────────────────────────────────────────────────────────────
+# ── A8/FA6: 👀 → 👌 ──────────────────────────────────────────────────────────────
 
 
-async def test_reaction_turns_into_a_checkmark_when_the_answer_is_ready(stand):
+# Разрешённый Bot API набор реакций (setMessageReaction). Он ФИКСИРОВАННЫЙ: эмодзи вне
+# списка Telegram отвергает 400-й, а мы этот 400 глотали debug-логом — фича умирала молча,
+# и «✅», которое движок ставил год, в списке нет вовсе.
+BOT_API_REACTIONS = set(
+    "👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 "
+    "🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 "
+    "☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡".split()
+)
+
+
+def test_every_reaction_the_engine_uses_is_allowed_by_bot_api():
+    """Реакция вне списка = молчаливо мёртвая косметика: 400 уходит в debug-лог."""
+    for emoji in (bot_module._TAKEN, bot_module._DONE, bot_module._QUEUED):
+        assert emoji in BOT_API_REACTIONS, f"{emoji!r} Telegram не принимает"
+
+
+def test_reactions_carry_no_variation_selector():
+    """«✍️» с VS16 — уже другая строка: Bot API знает ровно «✍»."""
+    for emoji in (bot_module._TAKEN, bot_module._DONE, bot_module._QUEUED):
+        assert "️" not in emoji, f"невидимый VS16 в {emoji!r}"
+
+
+async def test_reaction_turns_into_done_when_the_answer_is_ready(stand):
     """Правка сообщения не пингует чат — сигнал готовности даёт смена реакции."""
     s = _build(stand)
     msg = _message()
     await s.tg._on_text(msg)
-    assert msg.reacted[0] == ["👀"], "в начале — «взял в работу»"
-    assert msg.reacted[-1] == ["✅"], f"по готовности реакция обязана смениться: {msg.reacted}"
+    assert msg.reacted[0] == [bot_module._TAKEN], "в начале — «взял в работу»"
+    assert msg.reacted[-1] == [bot_module._DONE], f"реакция обязана смениться: {msg.reacted}"
+
+
+async def test_no_done_reaction_when_the_answer_did_not_happen(stand):
+    """«Готово» на упёршемся лимите провайдера — вранье: ответа человек не получил."""
+    s = _build(stand, FakeCore(outcome="rate_limited"))
+    msg = _message()
+    await s.tg._on_text(msg)
+    assert [bot_module._DONE] not in msg.reacted, f"реакция врёт: {msg.reacted}"
+
+
+async def test_partial_answer_still_gets_the_done_reaction(stand):
+    """max_turns несёт частичный ответ — он доставлен, и сказать об этом честно."""
+    s = _build(stand, FakeCore(outcome="max_turns"))
+    msg = _message()
+    await s.tg._on_text(msg)
+    assert msg.reacted[-1] == [bot_module._DONE]
 
 
 async def test_failed_answer_does_not_claim_success(stand):
@@ -166,7 +205,7 @@ async def test_failed_answer_does_not_claim_success(stand):
     msg = _message()
     with pytest.raises(RuntimeError):
         await s.tg._on_text(msg)
-    assert ["✅"] not in msg.reacted, "галочка на упавшем прогоне — вранье"
+    assert [bot_module._DONE] not in msg.reacted, "«готово» на упавшем прогоне — вранье"
 
 
 async def test_reaction_failure_still_does_not_block_the_answer(stand):
@@ -205,7 +244,7 @@ async def test_second_message_gets_a_soft_signal_not_a_refusal(stand):
     waiting = _message("второй")
     second = asyncio.create_task(s.tg._on_text(waiting))
     await asyncio.sleep(0.05)
-    assert ["✍️"] in waiting.reacted, f"мягкий сигнал «принял, отвечу следом»: {waiting.reacted}"
+    assert [bot_module._QUEUED] in waiting.reacted, f"мягкий сигнал: {waiting.reacted}"
     assert "подожд" not in s.bot.text.lower() and "занят" not in s.bot.text.lower()
     s.core.release.set()
     await asyncio.wait_for(asyncio.gather(first, second), timeout=2.0)

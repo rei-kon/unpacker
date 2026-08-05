@@ -103,7 +103,13 @@ _FILE_ABORTED = "📎 Файл не отправлен — задача прер
 _DEFAULT_DRAFT = DraftTuning()
 # Реакции на исходном сообщении — единственный сигнал, который поднимает чат: финал теперь
 # правка черновика, а правка не пингует и не поднимает диалог в списке (§9, компенсация).
-_TAKEN, _DONE, _QUEUED = "👀", "✅", "✍️"
+# Набор Bot API фиксирован (setMessageReaction), и «✅» в него НЕ входит: Telegram отвечал
+# 400, а мы глотали его debug-логом — сигнал готовности был мёртв всё это время. «✍️» с
+# невидимым VS16 — тоже другая строка, в списке живёт голое «✍».
+_TAKEN, _DONE, _QUEUED = "👀", "👌", "✍"
+# Исходы, на которых «готово» — правда: ответ человек получил. max_turns несёт частичный
+# ответ, он тоже доставлен; rate_limited/other_error — не доставлен ничего, и галочка врёт.
+_DONE_KINDS = ("ok", "max_turns")
 # Падение мимо `ask` (баг адаптера, битый апдейт, отвалившийся Telegram) раньше не доходило
 # до человека НИКАК — бот просто замолкал.
 _HANDLER_FAILURE = "⚠️ Что-то сломалось на моей стороне — я уже сообщил владельцу."
@@ -355,10 +361,11 @@ class TelegramBot:
         # Окно занято — не отказываем текстом (лишнее сообщение в чате и грубо), а показываем
         # реакцией, что приняли: замок ниже сам подержит промпт до освобождения.
         await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
-        await self._handle_prompt(
+        kind = await self._handle_prompt(
             chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=message.text
         )
-        await self._react(message, _DONE)
+        if kind in _DONE_KINDS:
+            await self._react(message, _DONE)
 
     async def _on_attachment(self, message: Message) -> None:
         """Документ/фото: скачать в uploads инстанса и отдать агенту путь в рамке (§5.5, §8.2).
@@ -382,18 +389,23 @@ class TelegramBot:
         try:
             sid = self._router.ensure_session(chat_id=chat_id, thread_id=thread_id, user_id=user_id)
         except NoProjectError:
+            # Реакцию снимаем честно: «взял в работу» на сообщении, которое никто не берёт,
+            # висит навсегда — человек ждёт ответа, которого не будет.
+            await self._unreact(message)
             await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
             return
 
         result = await self._intake.take(session_id=sid, attachment=attachment)
         if result.path is None:
+            await self._unreact(message)
             await self._send(chat_id, thread_id, result.error or "Файл не принят.")
             return
         prompt = frame_attachment_prompt(path=result.path, kind=attachment.kind, user_text=caption)
-        await self._handle_prompt(
+        kind = await self._handle_prompt(
             chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
         )
-        await self._react(message, _DONE)
+        if kind in _DONE_KINDS:
+            await self._react(message, _DONE)
 
     async def _on_unsupported(self, message: Message) -> None:
         """Тип сообщения, который движок пока не умеет (голос, видео, стикер, локация).
@@ -483,11 +495,14 @@ class TelegramBot:
 
     async def _handle_prompt(
         self, *, chat_id: int, thread_id: int | None, user_id: int, prompt: str
-    ) -> None:
+    ) -> str | None:
         """Единый путь промпта в сессию — для текста, для кнопки-триггера и для файла.
 
         Ровно один путь важен принципиально (§9, паттерн action_buttons): кнопка не должна
         получить «особую» обработку, иначе стриминг/ошибки/косметика начнут расходиться.
+
+        Возвращает исход (`Outcome.kind`) — по нему хендлер решает, честно ли ставить
+        реакцию «готово». None — ответа не было вовсе (нет проекта).
 
         Тут же отмечается «окно занято» — по этому признаку `_on_callback` отказывает
         повторному нажатию (ADV-13). Снимается в finally: упавший прогон не должен запирать
@@ -498,7 +513,7 @@ class TelegramBot:
         async with lock:
             self._busy.add(busy_key)
             try:
-                await self._run_prompt(
+                return await self._run_prompt(
                     chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
                 )
             finally:
@@ -514,7 +529,7 @@ class TelegramBot:
 
     async def _run_prompt(
         self, *, chat_id: int, thread_id: int | None, user_id: int, prompt: str
-    ) -> None:
+    ) -> str | None:
         status = self._make_status_handler(chat_id, thread_id)
         draft = (
             DraftStreamer(self._bot, chat_id=chat_id, thread_id=thread_id, tuning=self._draft)
@@ -553,7 +568,7 @@ class TelegramBot:
             if draft is not None:
                 await draft.finish()
             await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
-            return
+            return None
         except asyncio.CancelledError:
             # Прогон сняли (рестарт бота, отмена задачи). Цикл черновика — фоновая задача:
             # некому её остановить, кроме нас, иначе в чате навсегда остаётся курсор ▌.
@@ -567,19 +582,21 @@ class TelegramBot:
                 await draft.abort(_ENGINE_FAILURE)
             raise
         text = render_result(result)
-        if result.outcome.kind == "ok":
+        kind = result.outcome.kind
+        if kind == "ok":
             await self._deliver(chat_id, thread_id, text, draft=draft)
-            return
+            return kind
         if result.text.strip():
             # Не-ok с текстом (типично max_turns) несёт ЧАСТИЧНЫЙ ОТВЕТ — такой же ответ.
             # Доставляем его нарезкой, как ok-путь: `abort` ужимал текст под лимит, отрезая
             # ГОЛОВУ, а фолбэк слал простыню одним сообщением и получал 400. Файлы при этом
             # не отдаём: задача прервана, отдавать недоделанное нельзя.
             await self._deliver(chat_id, thread_id, text, draft=draft, send_files=False)
-            return
+            return kind
         # Текста нет — пометка дописывается к показанному тексту, а не подменяет его (§5.4).
         if draft is None or not await draft.abort(text, markup=self._keyboard()):
             await self._send(chat_id, thread_id, text, self._keyboard())
+        return kind
 
     # ── доставка ответа: текст + вложения по маркеру (§9) ─────────────────────
 
@@ -741,7 +758,7 @@ class TelegramBot:
             logger.debug("typing не ушёл", exc_info=True)
 
     async def _react(self, message: Message, emoji: str) -> None:
-        """Реакция на исходном сообщении: 👀 взял → ✅ готово (или ✍️ «принял, в очереди»).
+        """Реакция на исходном сообщении: 👀 взял → 👌 готово (или ✍ «принял, в очереди»).
 
         Смена реакции — вся компенсация за то, что финал приходит правкой: правка не даёт
         уведомления, и человек, ушедший из чата на минуту, иначе не узнает, что бот закончил.
@@ -750,6 +767,13 @@ class TelegramBot:
             await message.react([ReactionTypeEmoji(emoji=emoji)])
         except Exception:  # noqa: BLE001 — реакция косметическая, не критична
             logger.debug("реакция не поставилась", exc_info=True)
+
+    async def _unreact(self, message: Message) -> None:
+        """Снять реакцию: работа не началась, и «взял в работу» на сообщении — ложный сигнал."""
+        try:
+            await message.react([])
+        except Exception:  # noqa: BLE001 — та же косметика
+            logger.debug("реакция не снялась", exc_info=True)
 
     async def _reply(self, message: Message, text: str) -> None:
         chat_id, thread_id, _ = self._coords(message)

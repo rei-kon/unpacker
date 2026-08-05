@@ -754,6 +754,31 @@ async def test_attachment_without_project_is_explained(stand):
     assert "проект" in s.bot.text.lower()
 
 
+# ── FA6: реакция снимается честно ────────────────────────────────────────────
+
+
+def _emojis(msg) -> list[list[str]]:
+    return [[r.emoji for r in items] for items in msg.reacted]
+
+
+async def test_reaction_is_taken_back_when_the_file_is_rejected(stand):
+    """Файл не приняли — «взял в работу» на сообщении остаётся враньём навсегда."""
+    s = _build(stand)
+    doc = SimpleNamespace(file_id="D1", file_name="big.zip", file_size=50 * 1024 * 1024)
+    msg = _message(document=doc)
+    await s.tg._on_attachment(msg)
+    assert _emojis(msg)[-1] == [], f"реакцию надо снять: {_emojis(msg)}"
+
+
+async def test_reaction_is_taken_back_when_there_is_no_project(stand):
+    stand.store.projects.disable("office")
+    s = _build(stand)
+    doc = SimpleNamespace(file_id="D1", file_name="f.pdf", file_size=10)
+    msg = _message(document=doc)
+    await s.tg._on_attachment(msg)
+    assert _emojis(msg)[-1] == [], f"реакцию надо снять: {_emojis(msg)}"
+
+
 async def test_verbose_one_shows_a_tool_status_once(stand):
     """verbose=1: ровно одно статус-сообщение на запрос, а не на каждый ToolStarted."""
     from engine.core.events import ToolStarted
