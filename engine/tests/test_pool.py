@@ -259,3 +259,48 @@ async def test_semaphore_concurrency_value():
     assert custom.concurrency == 2
     await pool.close_all()
     await custom.close_all()
+
+
+# ── B5: опции сессии изменились — тёплый клиент собран под старые ────────────
+
+
+async def test_lease_rebuilds_client_when_fingerprint_changes():
+    """SDK не меняет модель у уже поднятого коннекта, а `_acquire` возвращал тёплого клиента
+    независимо от опций. Отпечаток опций — то, по чему пул понимает, что клиент устарел."""
+    created = []
+
+    def factory(options):
+        c = FakeClient(options)
+        created.append(c)
+        return c
+
+    pool = ClientPool(factory=factory, ceiling=5, idle_timeout=1800, time_fn=lambda: 0.0)
+    async with pool.lease("s1", {"model": "sonnet"}, fingerprint="sonnet") as first:
+        pass
+    async with pool.lease("s1", {"model": "haiku"}, fingerprint="haiku") as second:
+        pass
+
+    assert first is not second
+    assert second.options == {"model": "haiku"}
+    assert first.disconnected  # старый клиент честно отключён, а не брошен
+    assert len(created) == 2
+    await pool.close_all()
+
+
+async def test_lease_keeps_client_when_fingerprint_same():
+    created = []
+
+    def factory(options):
+        c = FakeClient(options)
+        created.append(c)
+        return c
+
+    pool = ClientPool(factory=factory, ceiling=5, idle_timeout=1800, time_fn=lambda: 0.0)
+    async with pool.lease("s1", {"model": "sonnet"}, fingerprint="sonnet") as first:
+        pass
+    async with pool.lease("s1", {"model": "sonnet"}, fingerprint="sonnet") as second:
+        pass
+
+    assert first is second
+    assert len(created) == 1
+    await pool.close_all()

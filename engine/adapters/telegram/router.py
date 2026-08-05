@@ -113,12 +113,16 @@ class SessionRouter:
             # никуда) — но отвечаем словами, а не трейсбеком в лицо.
             logger.warning("биндинг %s указывает на несуществующую сессию %s", sk, sid)
             return "Сессия потерялась — напиши что-нибудь, начну новую."
+        # Расход — оценка SDK, а не биллинг (так сказано в доках самого SDK): показываем как
+        # ориентир «сколько нажёг этот диалог», а не как счёт.
+        cost = self._store.usage.session_cost(sid)
         return (
             f"Проект: {s.project_slug}\n"
             f"Сессия: {s.id}\n"
             f"Модель: {s.model or 'по умолчанию'}\n"
             f"Verbose: {s.verbose}\n"
-            f"Статус: {s.status}"
+            f"Статус: {s.status}\n"
+            f"Расход сессии: ~${cost:.4f}"
         )
 
     async def stop(self, chat_id: int, thread_id: int | None) -> str:

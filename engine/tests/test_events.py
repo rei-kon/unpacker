@@ -134,3 +134,57 @@ async def test_non_text_deltas_are_ignored():
 
     events = await _collect(stream_events(gen()))
     assert not any(isinstance(e, TextDelta) for e in events)
+
+
+# ── B3/B1/B6: финал несёт расход, флаг ошибки; обрыв потока не теряет session_id ─
+
+
+class RichResult(Result):
+    """ResultMessage с полями расхода — то, что SDK кладёт в каждый финал (C4)."""
+
+    def __init__(self, session_id, **kw):
+        super().__init__(session_id, **kw)
+        self.total_cost_usd = 0.017
+        self.num_turns = 3
+        self.usage = {"input_tokens": 1200, "output_tokens": 340}
+
+
+async def test_final_carries_cost_usage_and_turns():
+    """Расход приезжает в каждом ResultMessage бесплатно — ядро обязано его донести."""
+
+    async def gen():
+        yield Msg([Text("ответ")], session_id="s9")
+        yield RichResult("s9")
+
+    final = (await _collect(stream_events(gen())))[-1]
+    assert final.total_cost_usd == 0.017
+    assert final.num_turns == 3
+    assert final.usage == {"input_tokens": 1200, "output_tokens": 340}
+
+
+async def test_final_marks_error_result():
+    """is_error проходит насквозь: после ошибочного результата CLI мёртв — ядру это знать."""
+
+    async def gen():
+        yield Result("s10", subtype="error_max_turns", is_error=True)
+
+    final = (await _collect(stream_events(gen())))[-1]
+    assert final.is_error is True
+
+
+async def test_final_of_ok_result_is_not_error():
+    async def gen():
+        yield Result("s11")
+
+    final = (await _collect(stream_events(gen())))[-1]
+    assert final.is_error is False
+
+
+async def test_truncated_stream_yields_no_final():
+    """Поток без результата не выдумывает финал — обрыв разбирает ядро (AgentCore)."""
+
+    async def gen():
+        yield Msg([Text("успел написать")], session_id="s12")
+
+    events = await _collect(stream_events(gen()))
+    assert not any(isinstance(e, Final) for e in events)

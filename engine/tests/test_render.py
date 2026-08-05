@@ -36,3 +36,34 @@ def test_exec_error_message():
 def test_other_error_generic():
     out = render_result(_r("other_error", "boom"))
     assert "ошибк" in out.lower()
+
+
+# ── B4/B2: перегруз и потерянный контекст — говорим правду, а не «внутренняя ошибка» ─
+
+
+def test_rate_limited_names_the_limit():
+    out = render_result(_r("rate_limited", "429"))
+    assert "лимит" in out.lower()
+    assert "внутренняя ошибка" not in out.lower()
+
+
+def test_overloaded_blames_provider_not_engine():
+    out = render_result(_r("overloaded", "529"))
+    assert "перегру" in out.lower()
+    assert "внутренняя ошибка" not in out.lower()
+
+
+def test_resume_error_explains_lost_context():
+    out = render_result(_r("resume_error", ""))
+    assert "контекст" in out.lower()
+
+
+def test_note_is_prepended_to_answer():
+    """Пометка «прошлый контекст не восстановился» едет вместе с обычным ответом:
+    иначе человек не узнает, что диалог начался с чистого листа."""
+    result = AskResult(
+        text="вот ответ", outcome=Outcome("ok", ""), note="Прошлый контекст не восстановился."
+    )
+    out = render_result(result)
+    assert out.startswith("Прошлый контекст не восстановился.")
+    assert "вот ответ" in out
