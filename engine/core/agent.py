@@ -66,6 +66,9 @@ _RETRY_BACKOFF = 3.0
 _RESUME_LOST_NOTE = "ℹ️ Прошлый контекст не восстановился — продолжаю с чистого листа."
 # Исходы, на которых повтор имеет смысл только с паузой (проблема на стороне провайдера).
 _BACKOFF_KINDS = ("rate_limited", "overloaded")
+# Исходы, которые заведомо НЕ про мёртвый resume: чужой лимит и протухший токен убивают
+# заход одинаково рано, но история диалога здесь ни при чём (см. _resume_looks_dead).
+_NOT_RESUME_FAULT = ("auth_error", *_BACKOFF_KINDS)
 
 
 def detect_ram_bytes() -> int:
@@ -93,15 +96,25 @@ class _GenerationFailed(Exception):
         self.progressed = progressed
 
 
-def _resume_looks_dead(outcome: Outcome, resume: str | None, progressed: bool) -> bool:
+def _resume_looks_dead(
+    outcome: Outcome, resume: str | None, progressed: bool, cause: BaseException | None = None
+) -> bool:
     """Похоже ли, что заход упал именно из-за непонятого `--resume`.
 
     Два признака. Явный: CLI прямым текстом сказал «No conversation found …» (outcome
     resume_error). Косвенный: заход с непустым resume умер, не отдав НИ ОДНОГО события —
     так выглядит клиент, который не поднялся вовсе. Если поток успел что-то отдать, resume
     заведомо жив, и сбрасывать его нельзя: это стоило бы человеку истории диалога.
+
+    Косвенный признак — улика, а не приговор, и у него есть двойники: перегруз провайдера
+    (429/529 прилетает и исключением — баг SDK #812) и таймаут ответа тоже убивают заход
+    до первого события. Форма одна, причина разная, а цена ошибки несимметрична: за чужой
+    лимит человек заплатил бы всей историей диалога. Поэтому такие исходы из эвристики
+    исключены — по ним чинят паузой, а не забвением.
     """
-    if not resume or outcome.kind == "auth_error":
+    if not resume or outcome.kind in _NOT_RESUME_FAULT:
+        return False
+    if isinstance(cause, TimeoutError):
         return False
     return outcome.kind == "resume_error" or not progressed
 
@@ -177,14 +190,18 @@ class AgentCore:
                     # есть, и терять её handle нельзя — иначе следующий resume уедет на
                     # предыдущий турн, незаметно съев кусок истории
                     self._remember_session(session_id, failed.session_id)
-                    if attempt == 0 and _resume_looks_dead(outcome, resume, failed.progressed):
+                    if attempt == 0 and outcome.kind in _BACKOFF_KINDS:
+                        # порядок веток тут несущий: перегруз провайдера внешне выглядит как
+                        # мёртвый resume, и решить это первым — значит сжечь историю зря
+                        await self._sleep(self._retry_backoff)
+                        continue
+                    if attempt == 0 and _resume_looks_dead(
+                        outcome, resume, failed.progressed, failed.cause
+                    ):
                         options = self._build_options(
                             cwd=project.brain_path, resume=None, model=session.model
                         )
                         resume, note = None, _RESUME_LOST_NOTE
-                        continue
-                    if attempt == 0 and outcome.kind in _BACKOFF_KINDS:
-                        await self._sleep(self._retry_backoff)
                         continue
                     if outcome.kind == "auth_error":
                         self._flag_unhealthy(outcome)

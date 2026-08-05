@@ -494,6 +494,60 @@ async def test_rate_limit_exception_also_retried(store):
     await pool.close_all()
 
 
+class OverloadExceptionThenOk(RateLimitedThenOk):
+    """Тот же баг SDK, но с перегрузом: 529 приезжает исключением, а не результатом."""
+
+    _created = 0
+
+    async def receive_response(self):
+        if self._first:
+            raise RuntimeError("API Error: overloaded_error")
+        yield FakeMessage("ответ агента", self._reply_session)
+        yield FakeResult(self._reply_session)
+
+
+@pytest.mark.parametrize("client_cls", [RateLimitExceptionThenOk, OverloadExceptionThenOk])
+async def test_provider_failure_before_first_event_keeps_resume(store, client_cls):
+    """Перегруз провайдера ИСКЛЮЧЕНИЕМ до первого события неотличим по форме от «не
+    поднялась прошлая сессия»: событий нет, поток мёртв. Но цена ошибки разная — сброс
+    resume стоит человеку всей истории диалога за чужой лимит, да ещё и мгновенный повтор
+    влетает в тот же лимит. Значит: пауза и повтор С ТЕМ ЖЕ resume."""
+    client_cls._created = 0
+    sleeper = _Sleeper()
+    core, pool, built, created = _core(
+        store, client_cls=client_cls, sleep=sleeper, retry_backoff=2.0
+    )
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "ok"
+    assert built["resume"] == "old-id"  # опции с resume=None не пересобирались
+    assert sleeper.slept == [2.0]  # повтор после паузы, а не мгновенный
+    assert result.note == ""  # истории не теряли — и не врали, что потеряли
+    assert len(created) == 2
+    await pool.close_all()
+
+
+async def test_response_timeout_keeps_resume(store):
+    """Таймаут ответа — про «долго», а не про «сессия не поднялась». Событий он тоже не
+    оставляет, но лечить его забвением истории нельзя: следующее сообщение должно уйти
+    в тот же диалог."""
+    core, pool, built, created = _core(store, client_cls=HangingClient, response_timeout=0.1)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "other_error"
+    assert built["resume"] == "old-id"  # опции с resume=None не пересобирались
+    assert result.note == ""
+    assert len(created) == 1  # ждать второй таймаут — минута молчания в чате впустую
+    assert store.sessions.get(sess.id).claude_session_id == "old-id"
+    await pool.close_all()
+
+
 async def test_exec_error_retry_has_no_pause(store):
     """Сломанный мозг/MCP чинится пересозданием клиента — ждать тут незачем."""
     ExecErrorThenOk._created = 0
