@@ -319,6 +319,32 @@ async def test_error_handler_alerts_the_owner(stand):
     assert alerts, "владелец обязан узнать о падении"
 
 
+async def test_error_handler_speaks_even_when_health_is_broken(stand):
+    """FA8: рубеж последней надежды сам был не защищён.
+
+    `health.degraded` — голый I/O ПЕРЕД отправкой: на переполненном или read-only диске
+    хендлер падал раньше, чем успевал сказать человеку хоть слово. Молчание бота для
+    ученика неотличимо от «бот умер», а тут оно ещё и в момент реального сбоя.
+    """
+
+    class DeadHealth:
+        def degraded(self, detail):
+            raise OSError("read-only file system")
+
+    s = _build(stand, health=DeadHealth())
+    await s.tg._on_error(_error_event(RuntimeError("ядро упало")))
+    assert s.bot.messages, "сломанный диск не отменяет сообщение человеку"
+
+
+async def test_error_handler_speaks_even_when_the_alert_fails(stand):
+    def boom(detail):
+        raise RuntimeError("телеграм лежит")
+
+    s = _build(stand, alert=boom)
+    await s.tg._on_error(_error_event(RuntimeError("ядро упало")))
+    assert s.bot.messages
+
+
 async def test_error_handler_survives_an_update_without_a_chat(stand):
     """Апдейт без чата (например, my_chat_member) — писать некуда, падать нельзя."""
     s = _build(stand)

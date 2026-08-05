@@ -735,20 +735,28 @@ class TelegramBot:
         Раньше исключение в хендлере уходило в лог aiogram и НИКАК не доходило до человека —
         бот молча замолкал, а для ученика молчание неотличимо от «бот умер». Здесь три
         обязательных действия: сказать в чат, поднять флаг health и разбудить владельца.
+
+        Порядок обязателен: СНАЧАЛА человеку, потом health и алерт. Раньше первым шёл
+        `health.degraded` — голый I/O: на переполненном или read-only диске рубеж падал
+        раньше, чем успевал сказать хоть слово, ровно в момент реального сбоя.
         """
         logger.exception("необработанное исключение в хендлере", exc_info=event.exception)
-        if self._health is not None and self._health.degraded(f"handler: {event.exception}"):
+        target = _error_target(event)
+        if target is not None:  # None — апдейт без чата (my_chat_member и подобные)
+            chat_id, thread_id = target
+            with contextlib.suppress(Exception):
+                await self._send(chat_id, thread_id, _HANDLER_FAILURE)
+        with contextlib.suppress(Exception):
+            self._raise_alarm(f"сбой обработчика: {event.exception}")
+
+    def _raise_alarm(self, detail: str) -> None:
+        """Поднять флаг health и разбудить владельца — снаружи сбой обязан быть виден (§5.4)."""
+        if self._health is not None and not self._health.degraded(detail):
             # degraded() возвращает True только на ПЕРЕХОДЕ — иначе один битый апдейт,
             # повторяющийся polling'ом, засыпал бы владельца одинаковыми алертами.
-            if self._on_alert is not None:
-                self._on_alert(f"сбой обработчика: {event.exception}")
-        elif self._health is None and self._on_alert is not None:
-            self._on_alert(f"сбой обработчика: {event.exception}")
-        target = _error_target(event)
-        if target is None:
-            return  # апдейт без чата (my_chat_member и подобные) — писать некуда
-        chat_id, thread_id = target
-        await self._send(chat_id, thread_id, _HANDLER_FAILURE)
+            return
+        if self._on_alert is not None:
+            self._on_alert(detail)
 
     async def _typing_once(self, chat_id: int, thread_id: int | None) -> None:
         """Разовый «печатает…» — путь без черновика (стриминг выключен в .env)."""
