@@ -44,7 +44,11 @@ _DEFAULT_MAX_UNITS = 3600
 _NOT_MODIFIED = "message is not modified"
 # Переходная строка на TextStart (текст → tool → текст) и счётчик при переполнении окна.
 _TRANSITION = "⚙️ работаю дальше"
-_COUNTER = "…продолжаю, написано символов: {chars}"
+_COUNTER_PREFIX = "…продолжаю, написано символов: "
+_COUNTER = _COUNTER_PREFIX + "{chars}"
+# Черновика в чате больше нет — человек снёс его руками. Повторять edit по мёртвому id
+# бессмысленно, а вот пересоздать сообщение можно и нужно.
+_NOT_FOUND = "message to edit not found"
 # Добавка к `retry_after` из 429: Telegram называет момент, когда бан снимется, а не момент,
 # когда можно стучаться. Секунда впритык — второй флуд-бан.
 FLOOD_PAD = 0.5
@@ -427,6 +431,13 @@ class DraftStreamer:
             if _NOT_MODIFIED in str(exc):
                 self._remember(frame)  # этот текст уже висит в чате — считаем показанным
                 return
+            if _NOT_FOUND in str(exc):
+                # Человек снёс черновик руками: edit по мёртвому id не пройдёт уже никогда,
+                # и текст замирал до конца генерации. Следующий тик создаст сообщение заново.
+                self._message_id = None
+                self._dirty = True
+                logger.debug("черновик исчез из чата, пересоздаю")
+                return
             # Повторять отвергнутый текст бессмысленно: 400 повторным edit не лечится, а
             # раньше `_dirty` вставал обратно и цикл слал одно и то же до конца генерации.
             self._rejected = shown
@@ -444,8 +455,21 @@ class DraftStreamer:
 
 
 def _strip_tail(shown: str) -> str:
-    """Убрать служебный хвост черновика — курсор или «…» переполнения."""
-    return shown.removesuffix(_CURSOR).removesuffix(_ELLIPSIS).rstrip()
+    """Убрать служебный хвост черновика: курсор, «…», счётчик переполнения, переходную строку.
+
+    Пометка, приклеенная к «…продолжаю, написано символов: 900», читается как часть ответа:
+    человек не понимает, где кончился текст агента и началась служебка движка.
+    """
+    text = shown.removesuffix(_CURSOR).removesuffix(_ELLIPSIS).rstrip()
+    lines = text.split("\n")
+    while lines and _is_service_line(lines[-1]):
+        lines.pop()
+    return "\n".join(lines).rstrip()
+
+
+def _is_service_line(line: str) -> bool:
+    """Строка от движка, а не от агента: счётчик переполнения, переход, пустая."""
+    return line.startswith(_COUNTER_PREFIX) or line.strip() in ("", _TRANSITION)
 
 
 def _fit_limit(text: str) -> str:

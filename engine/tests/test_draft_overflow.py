@@ -197,6 +197,36 @@ async def test_transition_is_not_shown_when_new_text_came_at_once():
     assert "работаю дальше" not in " ".join(bot.edits)
 
 
+# ── FA9: служебные строки не приклеиваются к пометке ────────────────────────
+
+
+async def test_abort_after_overflow_drops_the_service_counter():
+    """«⚠️ Сбой» сразу после «…продолжаю, написано символов: 400» читается как часть ответа.
+
+    `_strip_tail` снимал только курсор и «…», а служебные строки оставались — человек не
+    понимает, где кончился текст агента и началась служебка движка.
+    """
+    bot = ChattyBot()
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(max_units=200))
+    d.on_delta("а" * 400)
+    await asyncio.sleep(0.05)
+    assert await d.abort("⚠️ Сбой.") is True
+    assert "продолжаю, написано" not in bot.edits[-1], f"служебка осталась: {bot.edits[-1]!r}"
+    assert "Сбой" in bot.edits[-1]
+
+
+async def test_abort_after_a_transition_drops_the_transition_line():
+    bot = ChattyBot()
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning())
+    d.on_delta("первый абзац")
+    await asyncio.sleep(0.05)
+    d.on_reset()
+    await asyncio.sleep(0.05)
+    await d.abort("⚠️ Сбой.")
+    assert "работаю дальше" not in bot.edits[-1], f"служебка осталась: {bot.edits[-1]!r}"
+    assert "первый абзац" in bot.edits[-1], "прочитанное остаётся"
+
+
 # ── A7: пульс typing до первой дельты ───────────────────────────────────────
 
 
