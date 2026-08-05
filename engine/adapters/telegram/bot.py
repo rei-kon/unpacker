@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import assert_never
@@ -110,6 +110,11 @@ _TAKEN, _DONE, _QUEUED = "👀", "👌", "✍"
 # Исходы, на которых «готово» — правда: ответ человек получил. max_turns несёт частичный
 # ответ, он тоже доставлен; rate_limited/other_error — не доставлен ничего, и галочка врёт.
 _DONE_KINDS = ("ok", "max_turns")
+# Очередь окна переполнена — промпт НЕ принят. Реакция вместо текста: лишнее сообщение в
+# чате грубо, а «🤔» из списка Bot API читается как «слишком много сразу».
+_OVERFLOW = "🤔"
+# Сколько промптов на окно живут одновременно (работающий + ждущие замка).
+_QUEUE_CAP = 3
 # Падение мимо `ask` (баг адаптера, битый апдейт, отвалившийся Telegram) раньше не доходило
 # до человека НИКАК — бот просто замолкал.
 _HANDLER_FAILURE = "⚠️ Что-то сломалось на моей стороне — я уже сообщил владельцу."
@@ -207,6 +212,9 @@ class TelegramBot:
         self._on_alert = on_alert
         # Окна (chat:thread), в которых прямо сейчас идёт генерация — см. _is_busy (ADV-13)
         self._busy: set[str] = set()
+        # Сколько промптов окна в работе или ждут замка — счётчик занимается СИНХРОННО,
+        # до первого await (см. _window_slot), иначе два тапа проскакивают оба.
+        self._queued: dict[str, int] = {}
         # Замок на ОКНО: генерацию и так сериализует session_lock ядра, но отпускается он до
         # доставки — и черновик второго сообщения успевал появиться раньше финала первого.
         self._locks: dict[str, asyncio.Lock] = {}
@@ -358,12 +366,16 @@ class TelegramBot:
         if not self._guard(message) or not message.text:
             return
         chat_id, thread_id, user_id = self._coords(message)
-        # Окно занято — не отказываем текстом (лишнее сообщение в чате и грубо), а показываем
-        # реакцией, что приняли: замок ниже сам подержит промпт до освобождения.
-        await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
-        kind = await self._handle_prompt(
-            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=message.text
-        )
+        with self._window_slot(chat_id, thread_id) as key:
+            if key is None:
+                await self._react(message, _OVERFLOW)
+                return
+            # Окно занято — не отказываем текстом (лишнее сообщение в чате и грубо), а
+            # показываем реакцией, что приняли: замок сам подержит промпт до освобождения.
+            await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
+            kind = await self._handle_prompt(
+                key, chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=message.text
+            )
         if kind in _DONE_KINDS:
             await self._react(message, _DONE)
 
@@ -385,25 +397,33 @@ class TelegramBot:
         if self._intake is None:
             await self._send(chat_id, thread_id, "Приём файлов выключен в настройках движка.")
             return
-        await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
-        try:
-            sid = self._router.ensure_session(chat_id=chat_id, thread_id=thread_id, user_id=user_id)
-        except NoProjectError:
-            # Реакцию снимаем честно: «взял в работу» на сообщении, которое никто не берёт,
-            # висит навсегда — человек ждёт ответа, которого не будет.
-            await self._unreact(message)
-            await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
-            return
+        with self._window_slot(chat_id, thread_id) as key:
+            if key is None:
+                await self._react(message, _OVERFLOW)
+                return
+            await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
+            try:
+                sid = self._router.ensure_session(
+                    chat_id=chat_id, thread_id=thread_id, user_id=user_id
+                )
+            except NoProjectError:
+                # Реакцию снимаем честно: «взял в работу» на сообщении, которое никто не
+                # берёт, висит навсегда — человек ждёт ответа, которого не будет.
+                await self._unreact(message)
+                await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
+                return
 
-        result = await self._intake.take(session_id=sid, attachment=attachment)
-        if result.path is None:
-            await self._unreact(message)
-            await self._send(chat_id, thread_id, result.error or "Файл не принят.")
-            return
-        prompt = frame_attachment_prompt(path=result.path, kind=attachment.kind, user_text=caption)
-        kind = await self._handle_prompt(
-            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
-        )
+            result = await self._intake.take(session_id=sid, attachment=attachment)
+            if result.path is None:
+                await self._unreact(message)
+                await self._send(chat_id, thread_id, result.error or "Файл не принят.")
+                return
+            prompt = frame_attachment_prompt(
+                path=result.path, kind=attachment.kind, user_text=caption
+            )
+            kind = await self._handle_prompt(
+                key, chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
+            )
         if kind in _DONE_KINDS:
             await self._react(message, _DONE)
 
@@ -456,15 +476,17 @@ class TelegramBot:
         if button is None or button_digest(button) != action.digest:
             await self._answer_callback(callback, "Кнопка устарела — обновлю ряд под ответом.")
             return
-        if self._is_busy(chat_id, thread_id):
-            # ADV-13: второе нажатие = второй полный прогон агента и второй расход квоты
-            # подписки. Тост дешевле и честнее, чем удвоенный счёт.
-            await self._answer_callback(callback, "Уже работаю над этим — секунду.")
-            return
-        await self._answer_callback(callback, button.label)
-        await self._handle_prompt(
-            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=button.prompt
-        )
+        # Место в окне занимается СИНХРОННО, до первого await: ADV-13 второе нажатие = второй
+        # полный прогон агента и второй расход квоты подписки, а между проверкой занятости и
+        # первым await успевал проскочить второй тап. Тост дешевле и честнее удвоенного счёта.
+        with self._window_slot(chat_id, thread_id) as key:
+            if key is None or self._pending(key) > 1:
+                await self._answer_callback(callback, "Уже работаю над этим — секунду.")
+                return
+            await self._answer_callback(callback, button.label)
+            await self._handle_prompt(
+                key, chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=button.prompt
+            )
 
     async def _run_system_action(
         self, action: SystemActionName, chat_id: int, thread_id: int | None
@@ -494,9 +516,11 @@ class TelegramBot:
             logger.debug("callback.answer не прошёл", exc_info=True)
 
     async def _handle_prompt(
-        self, *, chat_id: int, thread_id: int | None, user_id: int, prompt: str
+        self, key: str, *, chat_id: int, thread_id: int | None, user_id: int, prompt: str
     ) -> str | None:
         """Единый путь промпта в сессию — для текста, для кнопки-триггера и для файла.
+
+        `key` — окно, место в котором уже занято вызывающим (`_window_slot`).
 
         Ровно один путь важен принципиально (§9, паттерн action_buttons): кнопка не должна
         получить «особую» обработку, иначе стриминг/ошибки/косметика начнут расходиться.
@@ -508,16 +532,55 @@ class TelegramBot:
         повторному нажатию (ADV-13). Снимается в finally: упавший прогон не должен запирать
         окно навсегда.
         """
-        busy_key = self._router.surface_key(chat_id, thread_id)
-        lock = self._locks.setdefault(busy_key, asyncio.Lock())
+        lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
-            self._busy.add(busy_key)
+            self._busy.add(key)
             try:
                 return await self._run_prompt(
                     chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
                 )
             finally:
-                self._busy.discard(busy_key)
+                self._busy.discard(key)
+
+    @contextlib.contextmanager
+    def _window_slot(self, chat_id: int, thread_id: int | None) -> Iterator[str | None]:
+        """Занять место в очереди окна СИНХРОННО — до первого await. None — очередь полна.
+
+        Синхронность и есть смысл: `_is_busy` спрашивался до первого await, а «занято»
+        ставилось уже внутри замка — два тапа одной кнопки успевали проскочить оба.
+
+        Кап нужен по той же причине, что и замок: десять сообщений в занятое окно — это
+        десять прогонов агента в затылок друг другу и квота подписки на ветер, пока человек
+        давно ушёл. Отказ честнее растущей очереди.
+        """
+        key = self._router.surface_key(chat_id, thread_id)
+        if self._queued.get(key, 0) >= _QUEUE_CAP:
+            yield None
+            return
+        self._queued[key] = self._queued.get(key, 0) + 1
+        try:
+            yield key
+        finally:
+            left = self._queued[key] - 1
+            if left:
+                self._queued[key] = left
+            else:
+                del self._queued[key]
+                self._drop_lock_if_free(key)
+
+    def _pending(self, key: str) -> int:
+        """Сколько промптов этого окна уже в работе или ждут замка."""
+        return self._queued.get(key, 0)
+
+    def _drop_lock_if_free(self, key: str) -> None:
+        """Убрать замок окна, когда он никому не нужен.
+
+        Иначе `_locks` растёт по числу когда-либо виденных окон — тот же паттерн, что у
+        пула клиентов (`ClientPool._drop_lock_if_free`).
+        """
+        lock = self._locks.get(key)
+        if lock is not None and not lock.locked():
+            del self._locks[key]
 
     def _is_busy(self, chat_id: int, thread_id: int | None) -> bool:
         """Идёт ли прямо сейчас генерация в этом окне (chat:thread).

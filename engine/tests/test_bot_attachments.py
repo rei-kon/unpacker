@@ -165,6 +165,9 @@ def _callback(data, *, user_id=OWNER, chat="private"):
     )
 
     async def answer(text=None, **kw):
+        # У настоящего Bot API это сетевой вызов — он ОТПУСКАЕТ цикл. Дублёр без await
+        # проскакивал целиком, и гонки между двумя нажатиями в тестах не существовало.
+        await asyncio.sleep(0)
         answers.append(text)
 
     cb.answer = answer
@@ -334,6 +337,24 @@ async def test_double_press_during_generation_runs_agent_once(stand):
     await first
 
     assert len(s.core.asks) == 1, "агент должен быть запущен один раз"
+    assert second.answers and any("работа" in (a or "").lower() for a in second.answers)
+
+
+async def test_two_taps_in_the_same_tick_run_the_agent_once(stand):
+    """FA11: занятость спрашивалась ДО первого await, а место в окне занималось после.
+
+    Два тапа подряд (палец дрогнул, связь моргнула) успевали проскочить оба: замок ниже
+    их сериализовал, но не отменял — человек платил подпиской за два одинаковых прогона.
+    """
+    s = _build(stand, core=SlowCore())
+    first = _callback(encode_trigger(0, BUTTONS[0]))
+    second = _callback(encode_trigger(0, BUTTONS[0]))
+    t1 = asyncio.create_task(s.tg._on_callback(first))
+    t2 = asyncio.create_task(s.tg._on_callback(second))
+    await asyncio.sleep(0.05)
+    s.core.release.set()
+    await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2.0)
+    assert len(s.core.asks) == 1, "второй тап обязан получить тост, а не второй прогон"
     assert second.answers and any("работа" in (a or "").lower() for a in second.answers)
 
 

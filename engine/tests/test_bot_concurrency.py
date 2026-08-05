@@ -150,7 +150,7 @@ def _build(stand, core=None, *, health=None, alert=None):
     return SimpleNamespace(tg=tg, bot=bot, core=core)
 
 
-# ── A8/FA6: 👀 → 👌 ──────────────────────────────────────────────────────────────
+# ── A8/FA6: 👀 → 👌 ─────────────────────────────────────────────────────────
 
 
 # Разрешённый Bot API набор реакций (setMessageReaction). Он ФИКСИРОВАННЫЙ: эмодзи вне
@@ -163,15 +163,23 @@ BOT_API_REACTIONS = set(
 )
 
 
+_ENGINE_REACTIONS = (
+    bot_module._TAKEN,
+    bot_module._DONE,
+    bot_module._QUEUED,
+    bot_module._OVERFLOW,
+)
+
+
 def test_every_reaction_the_engine_uses_is_allowed_by_bot_api():
     """Реакция вне списка = молчаливо мёртвая косметика: 400 уходит в debug-лог."""
-    for emoji in (bot_module._TAKEN, bot_module._DONE, bot_module._QUEUED):
+    for emoji in _ENGINE_REACTIONS:
         assert emoji in BOT_API_REACTIONS, f"{emoji!r} Telegram не принимает"
 
 
 def test_reactions_carry_no_variation_selector():
     """«✍️» с VS16 — уже другая строка: Bot API знает ровно «✍»."""
-    for emoji in (bot_module._TAKEN, bot_module._DONE, bot_module._QUEUED):
+    for emoji in _ENGINE_REACTIONS:
         assert "️" not in emoji, f"невидимый VS16 в {emoji!r}"
 
 
@@ -248,6 +256,34 @@ async def test_second_message_gets_a_soft_signal_not_a_refusal(stand):
     assert "подожд" not in s.bot.text.lower() and "занят" not in s.bot.text.lower()
     s.core.release.set()
     await asyncio.wait_for(asyncio.gather(first, second), timeout=2.0)
+
+
+async def test_window_queue_has_a_cap(stand):
+    """FA11: очередь окна не бесконечная.
+
+    Десять сообщений подряд в занятое окно — это десять прогонов агента в затылок друг
+    другу и квота подписки на ветер: пока они отработают, человек давно ушёл. Честный
+    отказ реакцией дешевле и понятнее.
+    """
+    s = _build(stand, SlowCore())
+    first = asyncio.create_task(s.tg._on_text(_message("первый")))
+    await s.core.started.wait()
+    waiting = [_message(f"№{i}") for i in range(5)]
+    tasks = [asyncio.create_task(s.tg._on_text(m)) for m in waiting]
+    await asyncio.sleep(0.05)
+    refused = [m for m in waiting if m.reacted and m.reacted[-1] == [bot_module._OVERFLOW]]
+    assert refused, "переполненная очередь обязана отказывать, а не копить"
+    s.core.release.set()
+    await asyncio.wait_for(asyncio.gather(first, *tasks), timeout=2.0)
+    assert len(s.core.prompts) <= bot_module._QUEUE_CAP, f"копили очередь: {s.core.prompts}"
+
+
+async def test_queue_cap_frees_up_after_the_window_is_done(stand):
+    """Кап — про одновременность, а не про «больше трёх сообщений в день»."""
+    s = _build(stand)
+    for i in range(5):
+        await s.tg._on_text(_message(f"№{i}"))
+    assert len(s.core.prompts) == 5, "освободившееся окно снова принимает сообщения"
 
 
 async def test_busy_window_does_not_lock_another_topic(stand):
