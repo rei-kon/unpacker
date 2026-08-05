@@ -51,3 +51,60 @@ async def test_collect_reads_real_stream():
     text, session_id = await collect_response_with_session(stream())
     assert text == "финальный ответ"
     assert session_id == "sess-42"
+
+
+async def test_stream_events_reads_real_stream_event():
+    """Живой контракт партиалов: настоящий StreamEvent пина 0.2.121 через разбор ядра.
+
+    Все остальные тесты стриминга гоняются по нашему дублёру StreamEvent — они докажут лишь
+    согласованность с нашим представлением. Здесь — с самим SDK: сменится форма события,
+    и черновик «печатает…» замолчит у ученика на VPS, а не в CI.
+    """
+    from claude_agent_sdk import StreamEvent
+
+    from engine.core.events import Final, TextDelta, TextStart, stream_events
+
+    async def stream():
+        yield StreamEvent(uuid="u1", session_id="sess-7", event={"type": "message_start"})
+        yield StreamEvent(
+            uuid="u2",
+            session_id="sess-7",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "при"},
+            },
+        )
+        yield AssistantMessage(content=[TextBlock("привет")], model="m")
+        yield _result(session_id="sess-7")
+
+    events = [ev async for ev in stream_events(stream())]
+    assert isinstance(events[0], TextStart)
+    assert [e.text for e in events if isinstance(e, TextDelta)] == ["при"]
+    final = events[-1]
+    assert isinstance(final, Final)
+    assert final.text == "привет"
+    assert final.session_id == "sess-7"
+
+
+async def test_final_reads_cost_from_real_result_message():
+    """Поля расхода читаются с НАСТОЯЩЕГО ResultMessage, а не только с нашего дублёра."""
+    from claude_agent_sdk import ResultMessage
+
+    from engine.core.events import stream_events
+
+    async def stream():
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=10,
+            duration_api_ms=8,
+            is_error=False,
+            num_turns=2,
+            session_id="sess-8",
+            total_cost_usd=0.017,
+            usage={"input_tokens": 11, "output_tokens": 22},
+        )
+
+    final = [ev async for ev in stream_events(stream())][-1]
+    assert final.total_cost_usd == 0.017
+    assert final.num_turns == 2
+    assert final.usage == {"input_tokens": 11, "output_tokens": 22}

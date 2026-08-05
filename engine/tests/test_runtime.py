@@ -51,6 +51,14 @@ def test_options_builder_internal_contour(tmp_path):
     assert opts.model == "sonnet"
 
 
+def test_options_builder_pins_partial_messages(tmp_path):
+    """Замок на Велс-трюк: без include_partial_messages стриминга нет вовсе, а удаление
+    этой строки не ловилось ни одним из 686 тестов — бот молчал бы до самого финала."""
+    settings = _settings(tmp_path)
+    opts = _options_builder(settings)(cwd="/b", resume=None, model=None)
+    assert opts.include_partial_messages is True
+
+
 def test_options_builder_omits_empty(tmp_path):
     settings = _settings(tmp_path)
     build = _options_builder(settings)
