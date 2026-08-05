@@ -65,3 +65,73 @@ def test_classify_exception_no_false_auth_on_bare_401():
 def test_outcome_is_frozen():
     o = Outcome(kind="ok", detail="")
     assert o.kind == "ok"
+
+
+# ── B4: перегруз провайдера ≠ поломка движка ─────────────────────────────────
+
+
+def test_rate_limited_by_api_status():
+    """429 SDK кладёт в api_error_status при subtype=success — это лимит, а не наша ошибка."""
+    o = classify_result(FakeResult(subtype="success", is_error=True, api_error_status=429))
+    assert o.kind == "rate_limited"
+
+
+def test_overloaded_by_api_status():
+    for status in (500, 529):
+        o = classify_result(FakeResult(subtype="success", is_error=True, api_error_status=status))
+        assert o.kind == "overloaded", status
+
+
+def test_rate_limit_wins_over_generic_error_text():
+    o = classify_result(
+        FakeResult(subtype="success", is_error=True, api_error_status=429, errors=["boom"])
+    )
+    assert o.kind == "rate_limited"
+
+
+def test_classify_exception_rate_limited():
+    """Живой баг SDK #812: настоящий 429 прилетает исключением, а не результатом."""
+    exc = ProcessError("command failed", exit_code=1, stderr="API Error: rate_limit_error")
+    assert classify_exception(exc).kind == "rate_limited"
+
+
+def test_classify_exception_overloaded():
+    exc = ProcessError("command failed", exit_code=1, stderr="529 overloaded_error")
+    assert classify_exception(exc).kind == "overloaded"
+
+
+def test_classify_exception_no_false_rate_limit_on_bare_429():
+    """Голое «429» в постороннем тексте — не лимит (та же дисциплина, что с 401)."""
+    for text in ("Error at line 429", "path /tmp/run529/out", "counter 5000"):
+        assert classify_exception(RuntimeError(text)).kind == "other_error", text
+
+
+# ── B2: не поднялась прошлая сессия ──────────────────────────────────────────
+
+
+def test_classify_exception_broken_resume():
+    """Дословный текст CLI при мёртвом resume: `No conversation found with session ID: ...`."""
+    exc = ProcessError(
+        "command failed",
+        exit_code=1,
+        stderr="No conversation found with session ID: abc-123",
+    )
+    assert classify_exception(exc).kind == "resume_error"
+
+
+def test_classify_result_broken_resume():
+    o = classify_result(
+        FakeResult(
+            subtype="error_during_execution",
+            is_error=True,
+            errors=["No conversation found with session ID: abc-123"],
+        )
+    )
+    assert o.kind == "resume_error"
+
+
+def test_ordinary_exec_error_is_not_resume_error():
+    o = classify_result(
+        FakeResult(subtype="error_during_execution", is_error=True, errors=["MCP упал"])
+    )
+    assert o.kind == "exec_error"
