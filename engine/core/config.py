@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from engine.core.uploads import MAX_UPLOAD_BYTES
@@ -65,9 +65,12 @@ class Settings(BaseSettings):
     # у которого бот стоит в живой группе, не мог ни притушить черновик, ни выключить его —
     # только править код движка. STREAM_INTERVAL — быстрая ступень лестницы (см. DraftTuning),
     # остальные ступени считаются от неё.
+    # Границы — не педантизм: ручку правит ученик руками в .env. STREAM_INTERVAL=0 даёт
+    # цикл без сна (100% CPU на его же VPS), окно шире 4096 — 400 MESSAGE_TOO_LONG на
+    # каждом тике, а окно мельче служебной строки-счётчика показывает пустоту вместо текста.
     stream_enabled: bool = True
-    stream_interval: float = 1.2
-    stream_max_units: int = 3600
+    stream_interval: float = Field(default=1.2, ge=0.2)
+    stream_max_units: int = Field(default=3600, ge=200, le=4000)
 
     @property
     def owner_user_id(self) -> int | None:
