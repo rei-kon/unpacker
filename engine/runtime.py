@@ -142,4 +142,8 @@ def build_bot(settings: Settings) -> TelegramBot:
         intake=intake,
         send_file=send_file,
         draft=draft,
+        # Тот же health и тот же алерт, что у ядра: для человека снаружи «упала генерация»
+        # и «упал адаптер» — одинаково мёртвый бот, и видно это должно быть одинаково.
+        health=health,
+        on_alert=alert,
     )

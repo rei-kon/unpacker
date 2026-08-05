@@ -31,6 +31,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
+    ErrorEvent,
     FSInputFile,
     InaccessibleMessage,
     InlineKeyboardMarkup,
@@ -52,6 +53,7 @@ from engine.adapters.telegram.router import NoProjectError, SessionRouter
 from engine.core.buttons import ButtonRegistry
 from engine.core.events import Event, TextDelta, TextStart, ToolStarted
 from engine.core.formatting import to_telegram_markdown
+from engine.core.health import HealthMarker
 from engine.core.pool import ClientPool
 from engine.core.security import AllowList
 from engine.core.sendfile import (
@@ -93,6 +95,12 @@ _ENGINE_FAILURE = "⚠️ Сбой на стороне движка — выше
 # Темп черновика по умолчанию — модульная константа, а не вызов в дефолте аргумента:
 # DraftTuning заморожен, один экземпляр на процесс безопасен и читается как «дефолт движка».
 _DEFAULT_DRAFT = DraftTuning()
+# Реакции на исходном сообщении — единственный сигнал, который поднимает чат: финал теперь
+# правка черновика, а правка не пингует и не поднимает диалог в списке (§9, компенсация).
+_TAKEN, _DONE, _QUEUED = "👀", "✅", "✍️"
+# Падение мимо `ask` (баг адаптера, битый апдейт, отвалившийся Telegram) раньше не доходило
+# до человека НИКАК — бот просто замолкал.
+_HANDLER_FAILURE = "⚠️ Что-то сломалось на моей стороне — я уже сообщил владельцу."
 
 
 @dataclass(frozen=True)
@@ -123,6 +131,23 @@ def make_owner_alert(bot: Bot, owner_id: int) -> Callable[[str], None]:
     return alert
 
 
+def _error_target(event: ErrorEvent) -> tuple[int, int | None] | None:
+    """Куда отвечать на упавший апдейт: чат сообщения или чат нажатой кнопки.
+
+    getattr, а не строгий разбор моделей: сюда прилетает ЛЮБОЙ тип апдейта, включая те, у
+    которых чата нет вовсе — и хендлер последнего рубежа не смеет падать сам.
+    """
+    update = getattr(event, "update", None)
+    source = getattr(update, "message", None)
+    if source is None:
+        callback = getattr(update, "callback_query", None)
+        source = getattr(callback, "message", None)
+    chat = getattr(source, "chat", None)
+    if chat is None:
+        return None
+    return chat.id, getattr(source, "message_thread_id", None)
+
+
 async def _safe_send(bot: Bot, chat_id: int, text: str, thread_id: int | None = None) -> None:
     try:
         await bot.send_message(chat_id, text, message_thread_id=thread_id)
@@ -143,6 +168,8 @@ class TelegramBot:
         intake: AttachmentIntake | None = None,
         send_file: SendFilePolicy | None = None,
         draft: DraftTuning | None = _DEFAULT_DRAFT,
+        health: HealthMarker | None = None,
+        on_alert: Callable[[str], None] | None = None,
     ):
         # Bot передаётся готовым (один на процесс): тот же объект шлёт алерты владельцу
         # (make_owner_alert) и ведёт polling — два Bot на один токен не нужны.
@@ -162,8 +189,15 @@ class TelegramBot:
         # Та же конвенция для черновика: объект темпа есть — стриминг включён, None —
         # выключен из .env, и тогда DraftStreamer не создаётся вовсе.
         self._draft = draft
+        # Здоровье и алерт владельцу — те же, что у ядра: падение адаптера ничем не лучше
+        # падения генерации, снаружи оно должно быть видно так же (§5.4).
+        self._health = health
+        self._on_alert = on_alert
         # Окна (chat:thread), в которых прямо сейчас идёт генерация — см. _is_busy (ADV-13)
         self._busy: set[str] = set()
+        # Замок на ОКНО: генерацию и так сериализует session_lock ядра, но отпускается он до
+        # доставки — и черновик второго сообщения успевал появиться раньше финала первого.
+        self._locks: dict[str, asyncio.Lock] = {}
         self._register()
 
     @property
@@ -192,6 +226,9 @@ class TelegramBot:
         # обещает приём файлов. Честный отказ дешевле паники и письма автору.
         self._dp.message()(self._on_unsupported)
         self._dp.callback_query()(self._on_callback)
+        # Последний рубеж: всё, что упало мимо `ask`, обязано доехать до человека и до
+        # health-маркера. Без него исключение в хендлере = тишина в чате (A10).
+        self._dp.errors()(self._on_error)
 
     def _guard(self, message: Message) -> bool:
         uid = message.from_user.id if message.from_user else None
@@ -309,10 +346,13 @@ class TelegramBot:
         if not self._guard(message) or not message.text:
             return
         chat_id, thread_id, user_id = self._coords(message)
-        await self._react(message)
+        # Окно занято — не отказываем текстом (лишнее сообщение в чате и грубо), а показываем
+        # реакцией, что приняли: замок ниже сам подержит промпт до освобождения.
+        await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
         await self._handle_prompt(
             chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=message.text
         )
+        await self._react(message, _DONE)
 
     async def _on_attachment(self, message: Message) -> None:
         """Документ/фото: скачать в uploads инстанса и отдать агенту путь в рамке (§5.5, §8.2).
@@ -332,7 +372,7 @@ class TelegramBot:
         if self._intake is None:
             await self._send(chat_id, thread_id, "Приём файлов выключен в настройках движка.")
             return
-        await self._react(message)
+        await self._react(message, _QUEUED if self._is_busy(chat_id, thread_id) else _TAKEN)
         try:
             sid = self._router.ensure_session(chat_id=chat_id, thread_id=thread_id, user_id=user_id)
         except NoProjectError:
@@ -347,6 +387,7 @@ class TelegramBot:
         await self._handle_prompt(
             chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
         )
+        await self._react(message, _DONE)
 
     async def _on_unsupported(self, message: Message) -> None:
         """Тип сообщения, который движок пока не умеет (голос, видео, стикер, локация).
@@ -447,13 +488,15 @@ class TelegramBot:
         окно навсегда.
         """
         busy_key = self._router.surface_key(chat_id, thread_id)
-        self._busy.add(busy_key)
-        try:
-            await self._run_prompt(
-                chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
-            )
-        finally:
-            self._busy.discard(busy_key)
+        lock = self._locks.setdefault(busy_key, asyncio.Lock())
+        async with lock:
+            self._busy.add(busy_key)
+            try:
+                await self._run_prompt(
+                    chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
+                )
+            finally:
+                self._busy.discard(busy_key)
 
     def _is_busy(self, chat_id: int, thread_id: int | None) -> bool:
         """Идёт ли прямо сейчас генерация в этом окне (chat:thread).
@@ -636,6 +679,27 @@ class TelegramBot:
 
         return handler
 
+    async def _on_error(self, event: ErrorEvent) -> None:
+        """Последний рубеж (A10): всё, что упало мимо `ask`.
+
+        Раньше исключение в хендлере уходило в лог aiogram и НИКАК не доходило до человека —
+        бот молча замолкал, а для ученика молчание неотличимо от «бот умер». Здесь три
+        обязательных действия: сказать в чат, поднять флаг health и разбудить владельца.
+        """
+        logger.exception("необработанное исключение в хендлере", exc_info=event.exception)
+        if self._health is not None and self._health.degraded(f"handler: {event.exception}"):
+            # degraded() возвращает True только на ПЕРЕХОДЕ — иначе один битый апдейт,
+            # повторяющийся polling'ом, засыпал бы владельца одинаковыми алертами.
+            if self._on_alert is not None:
+                self._on_alert(f"сбой обработчика: {event.exception}")
+        elif self._health is None and self._on_alert is not None:
+            self._on_alert(f"сбой обработчика: {event.exception}")
+        target = _error_target(event)
+        if target is None:
+            return  # апдейт без чата (my_chat_member и подобные) — писать некуда
+        chat_id, thread_id = target
+        await self._send(chat_id, thread_id, _HANDLER_FAILURE)
+
     async def _typing_once(self, chat_id: int, thread_id: int | None) -> None:
         """Разовый «печатает…» — путь без черновика (стриминг выключен в .env)."""
         try:
@@ -643,11 +707,16 @@ class TelegramBot:
         except Exception:  # noqa: BLE001 — typing косметический, не должен рвать обработку
             logger.debug("typing не ушёл", exc_info=True)
 
-    async def _react(self, message: Message) -> None:
+    async def _react(self, message: Message, emoji: str) -> None:
+        """Реакция на исходном сообщении: 👀 взял → ✅ готово (или ✍️ «принял, в очереди»).
+
+        Смена реакции — вся компенсация за то, что финал приходит правкой: правка не даёт
+        уведомления, и человек, ушедший из чата на минуту, иначе не узнает, что бот закончил.
+        """
         try:
-            await message.react([ReactionTypeEmoji(emoji="👀")])
+            await message.react([ReactionTypeEmoji(emoji=emoji)])
         except Exception:  # noqa: BLE001 — реакция косметическая, не критична
-            pass
+            logger.debug("реакция не поставилась", exc_info=True)
 
     async def _reply(self, message: Message, text: str) -> None:
         chat_id, thread_id, _ = self._coords(message)

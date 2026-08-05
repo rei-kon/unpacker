@@ -179,3 +179,10 @@ def test_streaming_can_be_switched_off_completely(tmp_path):
     """K10: выключенная косметика не существует как объект — черновика просто нет."""
     bot = build_bot(_settings(tmp_path, stream_enabled=False))
     assert bot._draft is None
+
+
+def test_health_and_alert_reach_the_adapter(tmp_path):
+    """A10: падение мимо ask обязано быть видно снаружи так же, как падение генерации."""
+    bot = build_bot(_settings(tmp_path))
+    assert bot._health is not None, "errors-handler без health-маркера ничего не пометит"
+    assert bot._on_alert is not None, "владелец должен узнавать о сбоях адаптера"
