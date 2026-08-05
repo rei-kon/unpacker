@@ -42,6 +42,9 @@ _DEFAULT_MAX_UNITS = 3600
 # Telegram на повторный edit тем же текстом отвечает 400 — это УСПЕХ (нужный текст уже
 # висит), а не повод удалять сообщение и слать заново.
 _NOT_MODIFIED = "message is not modified"
+# Переходная строка на TextStart (текст → tool → текст) и счётчик при переполнении окна.
+_TRANSITION = "⚙️ работаю дальше"
+_COUNTER = "…продолжаю, написано символов: {chars}"
 
 
 @dataclass(frozen=True)
@@ -100,11 +103,14 @@ class DraftStreamer:
         # Текст, который Telegram отверг как некорректный: повторять его бессмысленно —
         # 400 повторным edit того же текста не лечится, только жжёт квоту чата.
         self._rejected: str | None = None
+        # Пришёл TextStart, новых дельт ещё нет — на ближайшем тике показываем переход.
+        self._transition = False
         self._message_id: int | None = None
         self._task: asyncio.Task[None] | None = None
         # In-flight сетевая операция: cancel цикла НЕ должен ронять её посреди send —
         # иначе сообщение уже создано в TG, а _message_id не записан → черновик-сирота.
         self._inflight: asyncio.Task[None] | None = None
+        self._typing: asyncio.Task[None] | None = None
         self._stopped = False
 
     @property
@@ -127,7 +133,31 @@ class DraftStreamer:
         if self._stopped:
             return
         self._buf.clear()
+        self._transition = True
         self._dirty = True
+
+    def begin(self) -> None:
+        """Запустить пульс typing — до первой дельты человек не видит НИЧЕГО.
+
+        Индикатор Telegram живёт ~5 секунд, а между промптом и первой дельтой у агента
+        проходит чтение файлов, скиллы и MCP-вызовы; статус тула появляется только при
+        verbose ≥ 1, то есть по умолчанию не появляется вовсе.
+        """
+        if self._typing is None and not self._stopped:
+            self._typing = asyncio.create_task(self._typing_pulse())
+
+    async def _typing_pulse(self) -> None:
+        for _ in range(self._tuning.typing_max):
+            if self._stopped or self._message_id is not None:
+                return  # черновик виден — «печатает…» больше ничего не добавляет
+            try:
+                await self._bot.send_chat_action(
+                    self._chat_id, "typing", message_thread_id=self._thread_id
+                )
+            except Exception:  # noqa: BLE001 — самая дешёвая косметика: молчим и выходим
+                logger.debug("typing не ушёл", exc_info=True)
+                return
+            await asyncio.sleep(self._tuning.typing_every)
 
     # ── завершение ───────────────────────────────────────────────────────────
 
@@ -139,6 +169,11 @@ class DraftStreamer:
         финальный edit ушёл бы в никуда.
         """
         self._stopped = True
+        if self._typing is not None:
+            self._typing.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._typing
+            self._typing = None
         if self._task is not None:
             self._task.cancel()
             # CancelledError — BaseException: глушим и её (штатная отмена), и Exception
@@ -257,23 +292,49 @@ class DraftStreamer:
             await asyncio.sleep(self.interval)
 
     async def _flush(self) -> None:
-        # Маркер `[SEND_FILE:]` из черновика убираем ВСЕГДА, включая недописанный хвост:
-        # финал его вырежет, а до финала человек видел служебную строку с абсолютным путём
-        # на сервере внутри — и через секунду она исчезала (residual-находка ревью).
-        text = hide_partial_marker("".join(self._buf))
-        if not text.strip():
+        shown, forced = self._compose()
+        if shown is None:
             return
-        first = split_message(text, self._max)[0]
-        shown = first + (_ELLIPSIS if len(first) < len(text) else _CURSOR)
         if shown == self._shown or shown == self._rejected:
             return
-        if not self._worth_showing(shown):
+        if not forced and not self._worth_showing(shown):
             self._dirty = True  # копим дальше: покажем, когда наберётся ощутимый кусок
             return
         # Сеть — отдельной shield-задачей: cancel цикла (finish) не убьёт её посреди
         # send_message, поэтому _message_id гарантированно запишется и финал его найдёт.
         self._inflight = asyncio.ensure_future(self._send_or_edit(shown))
         await asyncio.shield(self._inflight)
+
+    def _compose(self) -> tuple[str | None, bool]:
+        """Что показать сейчас: (текст, показывать ли в обход порога дельты).
+
+        None — показывать нечего: буфер пуст и подменять текст не на что.
+        """
+        # Маркер `[SEND_FILE:]` из черновика убираем ВСЕГДА, включая недописанный хвост:
+        # финал его вырежет, а до финала человек видел служебную строку с абсолютным путём
+        # на сервере внутри — и через секунду она исчезала (residual-находка ревью).
+        text = hide_partial_marker("".join(self._buf))
+        if not text.strip():
+            # TextStart пришёл, новых дельт ещё нет. Молча подменить абзац, который человек
+            # читает, — выглядит как сбой; переходная строка читается как прогресс.
+            if self._transition and self._shown:
+                return f"{_strip_tail(self._shown)}\n\n{_TRANSITION}", True
+            return None, False
+        self._transition = False
+        return self._window(text), False
+
+    def _window(self, text: str) -> str:
+        """Окно показа: голова, пока влезает, дальше — свежий хвост со счётчиком.
+
+        Раньше после `max_units` черновик замирал навсегда, а дельты выбрасывались: на
+        длинном документе человек две минуты из трёх смотрел на мёртвый экран и не знал,
+        жив ли бот. Окно едет за генерацией, счётчик говорит, сколько уже написано.
+        """
+        if _units(text) <= self._max:
+            return text + _CURSOR
+        counter = _COUNTER.format(chars=len(text))
+        room = self._max - _units(counter) - _units(_ELLIPSIS) - 2  # 2 — пустая строка
+        return f"{_ELLIPSIS}{tail_by_units(text, room)}\n\n{counter}"
 
     def _worth_showing(self, shown: str) -> bool:
         """Набралось ли достаточно нового текста, чтобы тратить вызов API.

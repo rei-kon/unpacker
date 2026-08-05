@@ -466,17 +466,16 @@ class TelegramBot:
     async def _run_prompt(
         self, *, chat_id: int, thread_id: int | None, user_id: int, prompt: str
     ) -> None:
-        try:
-            await self._bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
-        except Exception:  # noqa: BLE001 — typing косметический, не должен рвать обработку
-            pass
-
         status = self._make_status_handler(chat_id, thread_id)
         draft = (
             DraftStreamer(self._bot, chat_id=chat_id, thread_id=thread_id, tuning=self._draft)
             if self._draft is not None
             else None
         )
+        if draft is not None:
+            draft.begin()  # пульс typing до первой дельты живёт внутри черновика (A7)
+        else:
+            await self._typing_once(chat_id, thread_id)
 
         def on_event(event: Event) -> None:
             # Велс-трюк §9: текст «печатается» черновиком; статусы тулов — как раньше.
@@ -636,6 +635,13 @@ class TelegramBot:
                 )
 
         return handler
+
+    async def _typing_once(self, chat_id: int, thread_id: int | None) -> None:
+        """Разовый «печатает…» — путь без черновика (стриминг выключен в .env)."""
+        try:
+            await self._bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+        except Exception:  # noqa: BLE001 — typing косметический, не должен рвать обработку
+            logger.debug("typing не ушёл", exc_info=True)
 
     async def _react(self, message: Message) -> None:
         try:

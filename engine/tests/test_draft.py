@@ -95,19 +95,6 @@ async def test_throttle_batches_edits():
     assert len(bot.edits) <= 3
 
 
-async def test_long_text_freezes_with_ellipsis():
-    bot = FakeBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(0.03, max_units=100))
-    d.on_delta("а" * 500)
-    await _drain(0.06)
-    d.on_delta("б" * 500)
-    await _drain(0.06)
-    await d.finish()
-    shown = (bot.edits or bot.sent)[-1]
-    assert len(shown) <= 110  # обрезан по max_units + маркер
-    assert shown.endswith("…")
-
-
 class SlowBot(FakeBot):
     """send_message с задержкой — окно для гонки finish() во время in-flight send."""
 
