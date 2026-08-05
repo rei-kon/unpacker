@@ -20,14 +20,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
+from dataclasses import dataclass
 from typing import Any
 
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup
 
 from engine.core.formatting import to_telegram_markdown
 from engine.core.sendfile import hide_partial_marker
 from engine.core.streaming import TELEGRAM_LIMIT, split_message, tail_by_units
+from engine.core.streaming import _utf16_units as _units
 
 logger = logging.getLogger("unpacker.engine")
 
@@ -41,6 +44,38 @@ _DEFAULT_MAX_UNITS = 3600
 _NOT_MODIFIED = "message is not modified"
 
 
+@dataclass(frozen=True)
+class DraftTuning:
+    """Темп черновика. Ручки живут ЗДЕСЬ, а не числами в bot.py.
+
+    Лестница интервалов растёт от возраста генерации: первые буквы человек должен увидеть
+    сразу, а ответ на три минуты не обязан жечь квоту чата ради дёрганья текста. Считается
+    от одной ручки (`interval`), потому что настраивать три числа в .env ученику незачем:
+    дефолт 1.2 даёт 1.2 → 2.4 → 4.8 секунды, и всё это с запасом под потолок Telegram
+    (≈20 правок в минуту на чат, и он общий с реакциями, статусами и финальной доставкой).
+    """
+
+    interval: float = 1.2
+    max_units: int = _DEFAULT_MAX_UNITS
+    # Мельче порога сеть не дёргаем: мелкая правка читается как дёрганье и стоит столько же,
+    # сколько крупная. Первый показ порогом не режется — см. `_flush`.
+    min_delta_units: int = 60
+    fast_until: float = 10.0
+    mid_until: float = 60.0
+    # Пульс typing: индикатор Telegram живёт ~5 секунд, а до первой дельты может пройти
+    # минута чтения файлов и MCP-вызовов — всё это время человек не видит ничего.
+    typing_every: float = 4.0
+    typing_max: int = 10
+
+    def interval_for(self, age: float) -> float:
+        """Интервал по возрасту генерации в секундах."""
+        if age < self.fast_until:
+            return self.interval
+        if age < self.mid_until:
+            return self.interval * 2
+        return self.interval * 4
+
+
 class DraftStreamer:
     def __init__(
         self,
@@ -48,18 +83,23 @@ class DraftStreamer:
         *,
         chat_id: int,
         thread_id: int | None,
-        interval: float = 3.0,
-        max_units: int = _DEFAULT_MAX_UNITS,
+        tuning: DraftTuning | None = None,
     ):
         self._bot = bot
         self._chat_id = chat_id
         self._thread_id = thread_id
-        self._interval = interval
-        self._max = max_units
+        self._tuning = tuning or DraftTuning()
+        self._max = self._tuning.max_units
+        # Пол интервала: поднимается на 429 (Telegram сам сказал, сколько ждать) и обратно
+        # уже не опускается — на живом чате второй флуд-бан дороже пары лишних секунд.
+        self._floor = 0.0
+        self._started = time.monotonic()
         self._buf: list[str] = []
         self._dirty = False
-        self._frozen = False  # текст перерос max_units — едиты прекращаем до reset
         self._shown: str | None = None  # что реально висит в TG (дедуп «not modified»)
+        # Текст, который Telegram отверг как некорректный: повторять его бессмысленно —
+        # 400 повторным edit того же текста не лечится, только жжёт квоту чата.
+        self._rejected: str | None = None
         self._message_id: int | None = None
         self._task: asyncio.Task[None] | None = None
         # In-flight сетевая операция: cancel цикла НЕ должен ронять её посреди send —
@@ -67,10 +107,15 @@ class DraftStreamer:
         self._inflight: asyncio.Task[None] | None = None
         self._stopped = False
 
+    @property
+    def interval(self) -> float:
+        """Текущий интервал: лестница по возрасту генерации, но не ниже пола после 429."""
+        return max(self._tuning.interval_for(time.monotonic() - self._started), self._floor)
+
     # ── sync-приём из on_event (лёгкий, без сети) ────────────────────────────
 
     def on_delta(self, text: str) -> None:
-        if self._stopped or self._frozen:
+        if self._stopped:
             return
         self._buf.append(text)
         self._dirty = True
@@ -82,7 +127,6 @@ class DraftStreamer:
         if self._stopped:
             return
         self._buf.clear()
-        self._frozen = False
         self._dirty = True
 
     # ── завершение ───────────────────────────────────────────────────────────
@@ -210,7 +254,7 @@ class DraftStreamer:
             if self._dirty:
                 self._dirty = False
                 await self._flush()
-            await asyncio.sleep(self._interval)
+            await asyncio.sleep(self.interval)
 
     async def _flush(self) -> None:
         # Маркер `[SEND_FILE:]` из черновика убираем ВСЕГДА, включая недописанный хвост:
@@ -220,17 +264,29 @@ class DraftStreamer:
         if not text.strip():
             return
         first = split_message(text, self._max)[0]
-        if len(first) < len(text):  # перерос лимит черновика — замораживаемся
-            self._frozen = True
-            shown = first + _ELLIPSIS
-        else:
-            shown = first + _CURSOR
-        if shown == self._shown:
+        shown = first + (_ELLIPSIS if len(first) < len(text) else _CURSOR)
+        if shown == self._shown or shown == self._rejected:
+            return
+        if not self._worth_showing(shown):
+            self._dirty = True  # копим дальше: покажем, когда наберётся ощутимый кусок
             return
         # Сеть — отдельной shield-задачей: cancel цикла (finish) не убьёт её посреди
-        # send_message, поэтому _message_id гарантированно запишется и finish его удалит.
+        # send_message, поэтому _message_id гарантированно запишется и финал его найдёт.
         self._inflight = asyncio.ensure_future(self._send_or_edit(shown))
         await asyncio.shield(self._inflight)
+
+    def _worth_showing(self, shown: str) -> bool:
+        """Набралось ли достаточно нового текста, чтобы тратить вызов API.
+
+        Порог считает ПРИРОСТ, и только его. Два исключения обязательны:
+          • первый показ — первые буквы человек должен увидеть сразу, даже если их пять;
+          • текст стал короче (после TextStart он другой, а не «чуть подправленный») —
+            держать вместо него старый абзац нельзя.
+        """
+        if self._shown is None:
+            return True
+        grown = _units(shown) - _units(self._shown)
+        return grown < 0 or grown >= self._tuning.min_delta_units
 
     async def _send_or_edit(self, shown: str) -> None:
         try:
@@ -243,10 +299,26 @@ class DraftStreamer:
                 await self._bot.edit_message_text(
                     shown, chat_id=self._chat_id, message_id=self._message_id
                 )
-            self._shown = shown
+        except TelegramRetryAfter as exc:
+            # 429 блокирует бота ЦЕЛИКОМ, а не только этот чат: черновик одного человека
+            # не смеет затыкать бота остальным. Ждём ровно столько, сколько сказал Telegram,
+            # и пол интервала обратно не опускаем — второй флуд-бан дороже лишних секунд.
+            self._floor = max(self._floor, exc.retry_after + 0.5)
+            self._dirty = True
+            logger.warning("черновик поймал 429, интервал поднят до %.1f с", self._floor)
+        except TelegramBadRequest as exc:
+            if _NOT_MODIFIED in str(exc):
+                self._shown = shown  # этот текст уже висит в чате — считаем показанным
+                return
+            # Повторять отвергнутый текст бессмысленно: 400 повторным edit не лечится, а
+            # раньше `_dirty` вставал обратно и цикл слал одно и то же до конца генерации.
+            self._rejected = shown
+            logger.warning("черновик отвергнут Telegram: %s", exc)
         except Exception:  # noqa: BLE001 — черновик косметический: сбой сети не рвёт генерацию
             self._dirty = True  # не терять кусок: следующий тик цикла ретрайнет (троттлинг тот же)
             logger.debug("черновик не отправился/не отредактировался", exc_info=True)
+        else:
+            self._shown = shown
 
 
 def _strip_tail(shown: str) -> str:

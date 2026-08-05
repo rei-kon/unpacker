@@ -182,3 +182,25 @@ def test_upload_limit_cannot_exceed_bot_api_cap(monkeypatch):
         monkeypatch.setenv(k, v)
     with pytest.raises(ValidationError):
         _settings()
+
+
+# ── A4: ручки черновика «печатает…» ──────────────────────────────────────────
+
+
+def test_streaming_defaults_are_sane(monkeypatch):
+    for k, v in _base_env().items():
+        monkeypatch.setenv(k, v)
+    s = _settings()
+    assert s.stream_enabled is True
+    assert 0 < s.stream_interval <= 3.0, "интервал впритык к потолку Telegram — не дефолт"
+    assert s.stream_max_units < 4096, "окно черновика обязано быть ниже лимита сообщения"
+
+
+def test_streaming_knobs_read_from_env(monkeypatch):
+    env = _base_env(STREAM_ENABLED="false", STREAM_INTERVAL="5", STREAM_MAX_UNITS="1200")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    s = _settings()
+    assert s.stream_enabled is False
+    assert s.stream_interval == 5.0
+    assert s.stream_max_units == 1200

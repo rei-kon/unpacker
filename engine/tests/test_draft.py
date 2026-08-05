@@ -6,7 +6,16 @@ DraftStreamer — sync-приём дельт (on_event зовётся синхр
 
 import asyncio
 
-from engine.adapters.telegram.draft import DraftStreamer
+from engine.adapters.telegram.draft import DraftStreamer, DraftTuning
+
+
+def _tuning(interval: float = 0.05, **kw) -> DraftTuning:
+    """Темп для тестов механики: без порога дельты и с коротким интервалом.
+
+    Порог дельты (A4) проверяется отдельно в test_draft_pacing.py — здесь он только мешал
+    бы увидеть, что send/edit/финал вообще происходят на коротких строках.
+    """
+    return DraftTuning(interval=interval, min_delta_units=0, **kw)
 
 
 class FakeBot:
@@ -40,7 +49,7 @@ async def _drain(seconds: float) -> None:
 
 async def test_draft_sends_then_edits_then_deletes():
     bot = FakeBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.05)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(0.05))
     d.on_delta("Прив")
     await _drain(0.08)  # первая отправка черновика
     d.on_delta("ет, ")
@@ -55,7 +64,7 @@ async def test_draft_sends_then_edits_then_deletes():
 
 async def test_no_deltas_no_draft():
     bot = FakeBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.05)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(0.05))
     await _drain(0.08)
     await d.finish()
     assert not bot.sent and not bot.deleted
@@ -63,7 +72,7 @@ async def test_no_deltas_no_draft():
 
 async def test_reset_clears_buffer():
     bot = FakeBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.05)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(0.05))
     d.on_delta("промежуточная болтовня")
     await _drain(0.08)
     d.on_reset()  # новое assistant-сообщение → черновик начинается заново
@@ -76,7 +85,7 @@ async def test_reset_clears_buffer():
 
 async def test_throttle_batches_edits():
     bot = FakeBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.2)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(0.2))
     for i in range(50):
         d.on_delta(f"кусок{i} ")
     await _drain(0.25)
@@ -88,7 +97,7 @@ async def test_throttle_batches_edits():
 
 async def test_long_text_freezes_with_ellipsis():
     bot = FakeBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.03, max_units=100)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(0.03, max_units=100))
     d.on_delta("а" * 500)
     await _drain(0.06)
     d.on_delta("б" * 500)
@@ -109,7 +118,7 @@ class SlowBot(FakeBot):
 
 async def test_finish_during_inflight_send_still_deletes_draft():
     bot = SlowBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.01)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(0.01))
     d.on_delta("быстрый ответ")
     await _drain(0.02)  # send в полёте, message_id ещё не записан
     await d.finish()
@@ -119,7 +128,7 @@ async def test_finish_during_inflight_send_still_deletes_draft():
 
 async def test_finish_survives_dead_task_with_exception():
     bot = FakeBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.01)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(0.01))
 
     async def boom():
         raise ValueError("умер внутри цикла")
@@ -145,7 +154,7 @@ class FlakyBot(FakeBot):
 
 async def test_failed_send_retries_on_next_tick():
     bot = FlakyBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.03)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(0.03))
     d.on_delta("не потеряй меня")
     await _drain(0.12)  # первый flush упал, dirty восстановлен → второй тик дошлёт
     await d.finish()

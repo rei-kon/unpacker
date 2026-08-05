@@ -15,7 +15,12 @@ import asyncio
 
 from aiogram.exceptions import TelegramBadRequest
 
-from engine.adapters.telegram.draft import DraftStreamer
+from engine.adapters.telegram.draft import DraftStreamer, DraftTuning
+
+
+def _tuning() -> DraftTuning:
+    """Быстрый темп без порога дельты: здесь предмет теста — финал, а не троттлинг."""
+    return DraftTuning(interval=0.03, min_delta_units=0)
 
 
 class JournalBot:
@@ -72,7 +77,7 @@ class JournalBot:
 
 
 async def _draft(bot, **kw) -> DraftStreamer:
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.03, **kw)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(), **kw)
     d.on_delta("начало ответа")
     await asyncio.sleep(0.05)  # черновик успел родиться
     return d
@@ -100,7 +105,7 @@ async def test_finalized_draft_has_no_cursor():
 async def test_finalize_without_draft_says_so():
     """Дельт не было (модель ответила одним куском) — бот идёт обычным путём _deliver."""
     bot = JournalBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.03)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning())
     assert await d.finalize("ответ без стрима") is False
     assert bot.calls == []
 
@@ -183,7 +188,7 @@ async def test_abort_removes_the_cursor():
 async def test_abort_without_draft_says_so():
     """Черновика нет — пометку доставит бот обычным сообщением."""
     bot = JournalBot()
-    d = DraftStreamer(bot, chat_id=1, thread_id=None, interval=0.03)
+    d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning())
     assert await d.abort("⚠️ Сбой.") is False
     assert bot.calls == []
 

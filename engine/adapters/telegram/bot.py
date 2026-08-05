@@ -39,7 +39,7 @@ from aiogram.types import (
 )
 
 from engine.adapters.telegram.attach import AttachmentIntake, attachment_from_message
-from engine.adapters.telegram.draft import DraftStreamer
+from engine.adapters.telegram.draft import DraftStreamer, DraftTuning
 from engine.adapters.telegram.keyboard import (
     SystemAction,
     SystemActionName,
@@ -90,6 +90,9 @@ _REAPER_INTERVAL = 60.0
 # Пометка к показанному тексту, когда генерация упала совсем (A2): человек читал ответ —
 # он остаётся в чате, а не подменяется сухим «⚠️ сбой» на пустом месте.
 _ENGINE_FAILURE = "⚠️ Сбой на стороне движка — выше то, что успел написать."
+# Темп черновика по умолчанию — модульная константа, а не вызов в дефолте аргумента:
+# DraftTuning заморожен, один экземпляр на процесс безопасен и читается как «дефолт движка».
+_DEFAULT_DRAFT = DraftTuning()
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,7 @@ class TelegramBot:
         buttons: ButtonRegistry | None = None,
         intake: AttachmentIntake | None = None,
         send_file: SendFilePolicy | None = None,
+        draft: DraftTuning | None = _DEFAULT_DRAFT,
     ):
         # Bot передаётся готовым (один на процесс): тот же объект шлёт алерты владельцу
         # (make_owner_alert) и ведёт polling — два Bot на один токен не нужны.
@@ -155,6 +159,9 @@ class TelegramBot:
         self._buttons = buttons
         self._intake = intake
         self._send_file = send_file
+        # Та же конвенция для черновика: объект темпа есть — стриминг включён, None —
+        # выключен из .env, и тогда DraftStreamer не создаётся вовсе.
+        self._draft = draft
         # Окна (chat:thread), в которых прямо сейчас идёт генерация — см. _is_busy (ADV-13)
         self._busy: set[str] = set()
         self._register()
@@ -465,7 +472,11 @@ class TelegramBot:
             pass
 
         status = self._make_status_handler(chat_id, thread_id)
-        draft = DraftStreamer(self._bot, chat_id=chat_id, thread_id=thread_id)
+        draft = (
+            DraftStreamer(self._bot, chat_id=chat_id, thread_id=thread_id, tuning=self._draft)
+            if self._draft is not None
+            else None
+        )
 
         def on_event(event: Event) -> None:
             # Велс-трюк §9: текст «печатается» черновиком; статусы тулов — как раньше.
@@ -473,9 +484,11 @@ class TelegramBot:
             # второго может появиться раньше финала первого (session_lock отпускается до
             # отправки финала) — данные не теряются, строгий порядок не гарантируем.
             if isinstance(event, TextDelta):
-                draft.on_delta(event.text)
+                if draft is not None:
+                    draft.on_delta(event.text)
             elif isinstance(event, TextStart):
-                draft.on_reset()
+                if draft is not None:
+                    draft.on_reset()
             elif status is not None:
                 status(event)
 
@@ -489,20 +502,22 @@ class TelegramBot:
             )
         except NoProjectError:
             # Доставлять через черновик нечего — убираем его (дельт тут и не было).
-            await draft.finish()
+            if draft is not None:
+                await draft.finish()
             await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
             return
         except Exception:
             # Генерация упала: накопленный текст ядро выбросило, но показанный человеку —
             # остаётся в чате с пометкой. Сообщение в чат пришлёт errors-handler.
-            await draft.abort(_ENGINE_FAILURE)
+            if draft is not None:
+                await draft.abort(_ENGINE_FAILURE)
             raise
         text = render_result(result)
         if result.outcome.kind == "ok":
             await self._deliver(chat_id, thread_id, text, draft=draft)
             return
         # Не-ok: пометка дописывается к показанному тексту, а не подменяет его (§5.4).
-        if not await draft.abort(text, markup=self._keyboard()):
+        if draft is None or not await draft.abort(text, markup=self._keyboard()):
             await self._send(chat_id, thread_id, text, self._keyboard())
 
     # ── доставка ответа: текст + вложения по маркеру (§9) ─────────────────────

@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     # движок обещал бы то, чего Telegram не даст, — тихий отказ вместо честного сообщения.
     max_upload_bytes: int = MAX_UPLOAD_BYTES
     send_file_enabled: bool = True
+    # Черновик «печатает…» (§9). Раньше интервал и окно были зашиты в bot.py: ученик,
+    # у которого бот стоит в живой группе, не мог ни притушить черновик, ни выключить его —
+    # только править код движка. STREAM_INTERVAL — быстрая ступень лестницы (см. DraftTuning),
+    # остальные ступени считаются от неё.
+    stream_enabled: bool = True
+    stream_interval: float = 1.2
+    stream_max_units: int = 3600
 
     @property
     def owner_user_id(self) -> int | None:

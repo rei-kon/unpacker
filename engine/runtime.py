@@ -18,6 +18,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 from engine.adapters.telegram.attach import AttachmentIntake
 from engine.adapters.telegram.bot import TelegramBot, make_owner_alert
+from engine.adapters.telegram.draft import DraftTuning
 from engine.adapters.telegram.router import SessionRouter
 from engine.core.agent import AgentCore, OptionsBuilder, detect_ram_bytes
 from engine.core.buttons import ButtonRegistry
@@ -123,6 +124,13 @@ def build_bot(settings: Settings) -> TelegramBot:
         if settings.send_file_enabled
         else None
     )
+    # Темп черновика — из .env: в живой группе стриминг можно притушить или выключить,
+    # не правя код движка (§6.1, та же конвенция «нет объекта — нет фичи»).
+    draft = (
+        DraftTuning(interval=settings.stream_interval, max_units=settings.stream_max_units)
+        if settings.stream_enabled
+        else None
+    )
 
     return TelegramBot(
         bot=bot,
@@ -133,4 +141,5 @@ def build_bot(settings: Settings) -> TelegramBot:
         buttons=buttons,
         intake=intake,
         send_file=send_file,
+        draft=draft,
     )

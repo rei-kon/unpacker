@@ -157,3 +157,25 @@ def test_state_root_follows_state_dir_setting(tmp_path):
     bot = build_bot(_settings(tmp_path, state_dir=str(tmp_path / "явный" / "state")))
     assert bot._send_file is not None
     assert bot._send_file.state_root == (tmp_path / "явный" / "state").resolve()
+
+
+# ── A4: черновик настраивается из .env, а не числами в bot.py ────────────────
+
+
+def test_streaming_is_wired_on_by_default(tmp_path):
+    bot = build_bot(_settings(tmp_path))
+    assert bot._draft is not None, "черновик «печатает…» включён по умолчанию"
+
+
+def test_streaming_interval_comes_from_settings(tmp_path):
+    """Ученик, у которого бот стоит в живой группе, обязан уметь притушить черновик."""
+    bot = build_bot(_settings(tmp_path, stream_interval=4.0, stream_max_units=1000))
+    assert bot._draft is not None
+    assert bot._draft.interval == 4.0
+    assert bot._draft.max_units == 1000
+
+
+def test_streaming_can_be_switched_off_completely(tmp_path):
+    """K10: выключенная косметика не существует как объект — черновика просто нет."""
+    bot = build_bot(_settings(tmp_path, stream_enabled=False))
+    assert bot._draft is None
