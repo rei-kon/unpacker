@@ -30,6 +30,7 @@ from engine.core.pool import ClientPool
 from engine.core.security import AllowList
 from engine.core.sendfile import SendFilePolicy
 from engine.core.store import Store
+from engine.core.streaming import TELEGRAM_LIMIT, _utf16_units
 
 OWNER = 111
 BUTTONS = [ButtonSpec(label="Создать КП", prompt="Собери КП")]
@@ -308,6 +309,59 @@ async def test_failed_outcome_keeps_the_shown_text_and_explains(stand):
     last = s.bot.edits[-1].replace("\\", "")
     assert "начало ответа" in last, f"показанный текст пропал: {last!r}"
     assert "Сбой" in last or "сбой" in last
+
+
+async def test_max_turns_delivers_the_whole_partial_answer(stand):
+    """max_turns несёт ЧАСТИЧНЫЙ ОТВЕТ — это такой же ответ, терять его нельзя.
+
+    Раньше он уезжал в `draft.abort`, а тот ужимал текст под лимит, отрезая ГОЛОВУ:
+    от часовой работы агента человек получал последние 4096 символов.
+    """
+    s = _build(stand, StreamCore(reply="Абзац текста.\n\n" * 700, outcome="max_turns"))
+    await s.tg._on_text(_message())
+    delivered = s.bot.text.replace("\\", "").replace("\n", "").replace(" ", "")
+    assert delivered.count("Абзацтекста.") == 700, "часть частичного ответа потерялась"
+
+
+async def test_max_turns_never_sends_over_the_telegram_limit(stand):
+    """Фолбэк слал длинный не-ok текст одним сообщением: 400 от Telegram = потеря целиком."""
+    s = _build(stand, StreamCore(reply="Абзац текста.\n\n" * 700, outcome="max_turns"))
+    await s.tg._on_text(_message())
+    pieces = [t for m, t in s.bot.calls if m in ("send_message", "edit_message_text")]
+    # без эскейпа MarkdownV2: разметка при переполнении честно откатывается в плейн,
+    # а вот сам кусок текста больше лимита — это потеря куска целиком
+    assert all(_utf16_units(t.replace("\\", "")) <= TELEGRAM_LIMIT for t in pieces)
+
+
+async def test_max_turns_does_not_duplicate_the_shown_text(stand):
+    """abort склеивал показанный хвост с полным текстом — человек читал ответ дважды."""
+    core = StreamCore(reply="полный ответ", outcome="max_turns", deltas=["полный ", "ответ"])
+    s = _build(stand, core)
+    await s.tg._on_text(_message())
+    final = s.bot.edits[-1].replace("\\", "")
+    assert final.count("полный ответ") == 1, f"ответ продублирован: {final!r}"
+
+
+async def test_max_turns_ends_with_the_note(stand):
+    s = _build(stand, StreamCore(reply="полный ответ", outcome="max_turns"))
+    await s.tg._on_text(_message())
+    last = s.bot.calls[-1][1].replace("\\", "").lower()
+    assert "лимит" in last or "продолж" in last, f"пометка потерялась: {last!r}"
+
+
+async def test_send_file_marker_never_leaks_on_a_failed_outcome(stand):
+    """K21: серверный путь в чат не уезжает НИ НА ОДНОМ пути, включая не-ok."""
+    s = _build(stand, StreamCore(reply="Готово [SEND_FILE:kp.pdf]", outcome="max_turns"))
+    await s.tg._on_text(_message())
+    assert "SEND_FILE" not in s.bot.text.replace("\\", "")
+
+
+async def test_file_is_not_sent_on_a_failed_outcome_but_it_is_said_out_loud(stand):
+    """Задача прервана — файл не отдаём, но и молчать нельзя: агент его человеку обещал."""
+    s = _build(stand, StreamCore(reply="Готово [SEND_FILE:kp.pdf]", outcome="max_turns"))
+    await s.tg._on_text(_message())
+    assert "send_document" not in s.bot.methods, "файл прерванной задачи уехал человеку"
+    assert "не отправлен" in s.bot.text.replace("\\", "").lower()
 
 
 async def test_failed_outcome_without_draft_still_explains(stand):
