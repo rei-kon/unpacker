@@ -188,8 +188,10 @@ class AgentCore:
                     await self._pool.evict(session_id)
                     # поток мог успеть отдать session_id до падения: сессия CLI на диске уже
                     # есть, и терять её handle нельзя — иначе следующий resume уедет на
-                    # предыдущий турн, незаметно съев кусок истории
-                    self._remember_session(session_id, failed.session_id)
+                    # предыдущий турн, незаметно съев кусок истории. Обратная сторона: если
+                    # мы уже сбросили resume (note), а новый id так и не приехал — старый в
+                    # базе оставлять нельзя, иначе «чистый лист» обещан только на словах
+                    self._remember_session(session_id, failed.session_id, cleared=note != "")
                     if attempt == 0 and outcome.kind in _BACKOFF_KINDS:
                         # порядок веток тут несущий: перегруз провайдера внешне выглядит как
                         # мёртвый resume, и решить это первым — значит сжечь историю зря
@@ -293,50 +295,58 @@ class AgentCore:
         Любой сбой заворачивается в _GenerationFailed вместе с уликами потока (что успел
         сказать SDK) — по ним `ask` отличает «не поднялась прошлая сессия» от «сломалось
         посреди живого ответа», где сбрасывать resume нельзя.
+
+        «Любой» включает и подъём клиента: connect живёт внутри lease и падает не реже
+        генерации (протух токен, не стартовал CLI, wedged-коннект добрал таймаут). Оставить
+        его снаружи значит пустить сырое исключение сквозь `ask` — и обещание «фасад не
+        бросает» держалось бы ровно до первого неудачного старта.
         """
         seen_session_id: str | None = None
         progressed = False
-        async with self._pool.lease(session_id, options, fingerprint) as client:
-            async with self._pool.semaphore:
-                final: Final | None = None
+        try:
+            async with self._pool.lease(session_id, options, fingerprint) as client:
+                async with self._pool.semaphore:
+                    final: Final | None = None
 
-                async def _watch(messages: AsyncIterator[Any]) -> AsyncIterator[Any]:
-                    """Улики снимаем с СЫРЫХ сообщений, а не с событий: целое assistant-сообщение
-                    событий не порождает вовсе, а session_id нужен даже когда поток оборвался
-                    посреди итерации (тогда до конца stream_events дело не доходит)."""
-                    nonlocal seen_session_id, progressed
-                    async for message in messages:
-                        progressed = True
-                        sid = getattr(message, "session_id", None)
-                        if isinstance(sid, str) and sid:
-                            seen_session_id = sid
-                        yield message
+                    async def _watch(messages: AsyncIterator[Any]) -> AsyncIterator[Any]:
+                        """Улики снимаем с СЫРЫХ сообщений, а не с событий: целое
+                        assistant-сообщение событий не порождает вовсе, а session_id нужен даже
+                        когда поток оборвался посреди итерации (тогда до конца stream_events
+                        дело не доходит)."""
+                        nonlocal seen_session_id, progressed
+                        async for message in messages:
+                            progressed = True
+                            sid = getattr(message, "session_id", None)
+                            if isinstance(sid, str) and sid:
+                                seen_session_id = sid
+                            yield message
 
-                async def _drain() -> None:
-                    nonlocal final
-                    async for event in stream_events(_watch(client.receive_response())):
-                        if isinstance(event, Final):
-                            final = event  # присваиваем ДО callback: рендер не должен терять ответ
-                        if on_event is not None:
-                            try:
-                                on_event(event)
-                            except Exception:  # noqa: BLE001 — сбой рендера не роняет генерацию
-                                logger.warning("on_event упал", exc_info=True)
+                    async def _drain() -> None:
+                        nonlocal final
+                        async for event in stream_events(_watch(client.receive_response())):
+                            if isinstance(event, Final):
+                                final = event  # ДО callback: рендер не должен терять ответ
+                            if on_event is not None:
+                                try:
+                                    on_event(event)
+                                except Exception:  # noqa: BLE001 — сбой рендера не роняет ответ
+                                    logger.warning("on_event упал", exc_info=True)
 
-                try:
                     await asyncio.wait_for(client.query(prompt), timeout=self._query_timeout)
                     await asyncio.wait_for(_drain(), timeout=self._response_timeout)
-                except Exception as exc:  # noqa: BLE001 — заворачиваем с уликами, не глушим
-                    raise _GenerationFailed(
-                        exc, session_id=seen_session_id, progressed=progressed
-                    ) from exc
-                if final is None:
-                    raise _GenerationFailed(
-                        RuntimeError("поток завершился без Final"),
-                        session_id=seen_session_id,
-                        progressed=progressed,
-                    )
-                return final
+                    if final is None:
+                        raise _GenerationFailed(
+                            RuntimeError("поток завершился без Final"),
+                            session_id=seen_session_id,
+                            progressed=progressed,
+                        )
+                    return final
+        except _GenerationFailed:
+            raise  # уже с уликами — заворачивать второй раз незачем
+        except Exception as exc:  # noqa: BLE001 — заворачиваем с уликами, не глушим
+            raise _GenerationFailed(
+                exc, session_id=seen_session_id, progressed=progressed
+            ) from exc
 
     def _flag_unhealthy(self, outcome: Outcome) -> None:
         """Пометить degraded и алертить владельца — ТОЛЬКО на переходе (дедуп) и изолированно.

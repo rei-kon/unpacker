@@ -560,6 +560,53 @@ async def test_exec_error_retry_has_no_pause(store):
     await pool.close_all()
 
 
+# ── FB2: подъём клиента (connect) — тоже ошибка SDK, а не повод бросить ───────
+
+
+class ConnectFailsClient(FakeStreamClient):
+    """Клиент не поднимается вовсе: CLI не стартовал, порт занят, диск кончился."""
+
+    async def connect(self):
+        raise RuntimeError("Command failed: не смог запустить CLI")
+
+
+async def test_connect_failure_does_not_escape_ask(store):
+    """Контракт «ask не бросает на ошибках SDK» держится и на подъёме клиента: иначе
+    исключение летит сквозь фасад в адаптер, и окно чата залипает без ответа."""
+    core, pool, _, _ = _core(store, client_cls=ConnectFailsClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "other_error"
+    assert pool.get_live(sess.id) is None
+    await pool.close_all()
+
+
+class AuthFailsOnConnectClient(FakeStreamClient):
+    """Протухший OAuth виден уже на connect — до единого сообщения в потоке."""
+
+    async def connect(self):
+        raise RuntimeError("authentication_failed: OAuth token expired")
+
+
+async def test_auth_failure_on_connect_flags_health_and_alerts(store, tmp_path):
+    """Токен протух — владелец обязан узнать, даже если развалилось на подъёме клиента."""
+    health = HealthMarker(str(tmp_path / "health.json"))
+    alerts = []
+    core, pool, _, _ = _core(
+        store, client_cls=AuthFailsOnConnectClient, health=health, on_alert=alerts.append
+    )
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "auth_error"
+    assert health.read()["status"] == "degraded"
+    assert len(alerts) == 1
+    await pool.close_all()
+
+
 # ── B2: не поднялась прошлая сессия — окно чата не умирает навсегда ───────────
 
 
@@ -605,6 +652,32 @@ async def test_broken_resume_rewrites_stored_session_id(store):
     await core.ask(sess.id, "привет")
 
     assert store.sessions.get(sess.id).claude_session_id == "claude-generated-id"
+    await pool.close_all()
+
+
+class AlwaysBrokenResume(FakeStreamClient):
+    """Оба захода падают так, как падает CLI с мёртвым `--resume`."""
+
+    async def receive_response(self):
+        raise RuntimeError("No conversation found with session ID: old-id")
+        yield
+
+
+async def test_double_failure_clears_dead_session_id(store):
+    """Сказали «начинаю с чистого листа» — значит и в базе чисто.
+
+    Иначе мёртвый id живёт дальше: каждое следующее сообщение сперва упирается в него,
+    жжёт лишнюю попытку и заново «теряет контекст», который потерян давно.
+    """
+    core, pool, _, created = _core(store, client_cls=AlwaysBrokenResume)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.note  # человеку сказали, что контекст потерян
+    assert len(created) == 2  # второй заход был — уже без resume
+    assert store.sessions.get(sess.id).claude_session_id is None
     await pool.close_all()
 
 
