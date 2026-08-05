@@ -64,6 +64,10 @@ _QUERY_TIMEOUT = 60.0
 # он не «ретрай», а второй счёт за ту же ошибку.
 _RETRY_BACKOFF = 3.0
 _RESUME_LOST_NOTE = "ℹ️ Прошлый контекст не восстановился — продолжаю с чистого листа."
+# Исход «убили по просьбе». Отдельный от ошибок намеренно: снаружи /stop и падение выглядят
+# одинаково (оборванный поток), а вести себя обязаны противоположно — остановленное не
+# перезапускают и историю за него не сжигают.
+_STOPPED = Outcome("stopped", "остановлено по просьбе человека")
 # Исходы, на которых повтор имеет смысл только с паузой (проблема на стороне провайдера).
 _BACKOFF_KINDS = ("rate_limited", "overloaded")
 # Исходы, которые заведомо НЕ про мёртвый resume: чужой лимит и протухший токен убивают
@@ -152,11 +156,17 @@ class AgentCore:
         self._on_alert = on_alert
         self._retry_backoff = retry_backoff
         self._sleep = sleep  # инъекция ради тестов: пауза не должна стоить тесту секунд
+        # Сессии, которые человек прервал вручную. Control-plane пишет, data-plane читает:
+        # по самому сбою «остановили» и «сломалось» неразличимы (см. _STOPPED).
+        self._stopped: set[str] = set()
 
     async def ask(self, session_id: str, prompt: str, on_event: EventFn | None = None) -> AskResult:
         """Обработать сообщение сессии. Возвращает AskResult(text, outcome) — не бросает на
         ошибках SDK (чат не должен залипать), только на отсутствии сессии (LookupError)."""
         async with self._pool.session_lock(session_id):
+            # новый турн начинается с чистой пометки: висящий флаг от прошлого /stop (когда
+            # генерация всё же дошла до конца) не должен объяснять чужой сбой
+            self._stopped.discard(session_id)
             session = self._store.sessions.get(session_id)
             if session is None:
                 raise LookupError(f"нет сессии: {session_id!r}")
@@ -172,6 +182,7 @@ class AgentCore:
             )
 
             note = ""
+            stopped = False
             last: Final | None = None
             for attempt in (0, 1):
                 try:
@@ -192,6 +203,9 @@ class AgentCore:
                     # мы уже сбросили resume (note), а новый id так и не приехал — старый в
                     # базе оставлять нельзя, иначе «чистый лист» обещан только на словах
                     self._remember_session(session_id, failed.session_id, cleared=note != "")
+                    if self._take_stop_flag(session_id):
+                        # человек нажал «стоп» — этот обрыв объясняется им, а не поломкой
+                        return AskResult("", _STOPPED, note=note)
                     if attempt == 0 and outcome.kind in _BACKOFF_KINDS:
                         # порядок веток тут несущий: перегруз провайдера внешне выглядит как
                         # мёртвый resume, и решить это первым — значит сжечь историю зря
@@ -215,6 +229,9 @@ class AgentCore:
                     # кодом — тёплый клиент в пуле уже мёртв. Не выселить его значит съесть
                     # следующее сообщение человека впустую (ровно после «напиши "продолжи"»).
                     await self._pool.evict(session_id)
+                    if self._take_stop_flag(session_id):
+                        stopped = True
+                        break  # остановленное не перезапускаем
                 if outcome.kind == "auth_error":
                     await self._pool.evict(session_id)
                     self._flag_unhealthy(outcome)
@@ -241,6 +258,10 @@ class AgentCore:
             # resume должен вести на неё, а не на предыдущий турн (ревью SDK-ядра, §2).
             self._remember_session(session_id, last.session_id, cleared=note != "")
             self._record_usage(session_id, session.model, last)
+            if stopped:
+                # текст отдаём как есть: написанное до «стопа» — работа, за которую уже
+                # заплачено, и прятать её от человека не за что
+                return AskResult(last.text, _STOPPED, note=note)
             if outcome.kind in ("ok", "max_turns"):
                 # обе ветки означают живой токен: health ok. health.ok() пишет файл только на
                 # переходе degraded→ok (дедуп в HealthMarker).
@@ -374,11 +395,24 @@ class AgentCore:
             except Exception:  # noqa: BLE001
                 logger.warning("health.ok упал", exc_info=True)
 
+    def _take_stop_flag(self, session_id: str) -> bool:
+        """Снять пометку «прервано человеком», если она есть. Одноразовая: объясняет ровно
+        тот сбой, который случился следом, и не переезжает на следующие сообщения."""
+        if session_id not in self._stopped:
+            return False
+        self._stopped.discard(session_id)
+        return True
+
     async def interrupt(self, session_id: str) -> None:
-        """Control-plane: прервать идущую генерацию сессии. МИМО session-lock. Безопасный no-op."""
+        """Control-plane: прервать идущую генерацию сессии. МИМО session-lock. Безопасный no-op.
+
+        Пометку ставим ДО вызова: клиент рвёт поток мгновенно, и `ask` успеет разобрать
+        падение раньше, чем мы вернёмся из `interrupt`.
+        """
         client = self._pool.get_live(session_id)
         if client is None:
             return
+        self._stopped.add(session_id)
         try:
             await client.interrupt()
         except Exception:  # noqa: BLE001 — interrupt по вытесняемому клиенту = no-op

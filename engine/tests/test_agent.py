@@ -738,6 +738,60 @@ async def test_failure_without_resume_is_not_retried(store):
     await pool.close_all()
 
 
+# ── FB4: «стоп» — это просьба человека, а не поломка ─────────────────────────
+
+
+async def test_stop_before_first_event_keeps_history_and_does_not_restart(store):
+    """`/stop` сразу после отправки: событий не было, поток мёртв — по форме неотличимо
+    от не поднявшейся сессии. Разбираться «по форме» тут стоит дорого вдвойне: человек
+    получает стёртую историю и заново запущенную задачу, которую только что попросил
+    прекратить."""
+    holder = {}
+
+    class StoppedByUser(FakeStreamClient):
+        async def receive_response(self):
+            await holder["core"].interrupt(holder["sid"])
+            return  # SDK рвёт поток на interrupt: Final не приедет
+            yield
+
+    core, pool, built, created = _core(store, client_cls=StoppedByUser)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    store.sessions.set_claude_session_id(sess.id, "old-id")
+    holder["core"], holder["sid"] = core, sess.id
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "stopped"
+    assert len(created) == 1  # остановленную задачу не перезапускаем
+    assert result.note == ""  # и историю не теряли
+    assert store.sessions.get(sess.id).claude_session_id == "old-id"
+    await pool.close_all()
+
+
+async def test_stop_midway_is_not_a_failed_turn(store):
+    """Прерванный SDK честно отдаёт ошибочный финал — и по нему движок обычно перезапускает
+    заход. Здесь перезапуск означал бы «нажал стоп — получил задачу заново»."""
+    holder = {}
+
+    class StoppedMidAnswer(FakeStreamClient):
+        async def receive_response(self):
+            yield FakeMessage("успел написать", self._reply_session)
+            await holder["core"].interrupt(holder["sid"])
+            yield FakeResult(self._reply_session, subtype="error_during_execution", is_error=True)
+
+    core, pool, _, created = _core(store, client_cls=StoppedMidAnswer)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    holder["core"], holder["sid"] = core, sess.id
+
+    result = await core.ask(sess.id, "привет")
+
+    assert result.outcome.kind == "stopped"
+    assert len(created) == 1  # exec_error обычно даёт повтор — но не по просьбе «стоп»
+    assert "успел написать" in result.text  # написанное до стопа не прячем
+    assert store.sessions.get(sess.id).claude_session_id == "claude-generated-id"
+    await pool.close_all()
+
+
 # ── B6: обрыв потока без Final не должен стирать контекст ────────────────────
 
 
