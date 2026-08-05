@@ -325,3 +325,60 @@ async def test_auth_alert_deduplicated(store, tmp_path):
     await core.ask(sess.id, "два")
     assert len(alerts) == 1  # второй auth не переход — алерт не повторяется
     await pool.close_all()
+
+
+# ── B1: после ЛЮБОГО ошибочного финала CLI мёртв — клиента вон ────────────────
+
+
+class ErrorResultClient(FakeStreamClient):
+    """Финал с is_error=True: SDK в этот момент уже завершил CLI ненулевым кодом."""
+
+    subtype = "error_max_turns"
+
+    async def receive_response(self):
+        yield FakeMessage("успел написать", self._reply_session)
+        yield FakeResult(self._reply_session, subtype=self.subtype, is_error=True)
+
+
+async def test_error_result_evicts_dead_client(store):
+    """max_turns: человеку обещают «напиши продолжи» — значит следующий заход обязан
+    получить ЖИВОГО клиента, а не съеденное впустую сообщение."""
+    core, pool, _, _ = _core(store, client_cls=ErrorResultClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    result = await core.ask(sess.id, "привет")
+    assert result.outcome.kind == "max_turns"
+    assert pool.get_live(sess.id) is None
+    await pool.close_all()
+
+
+async def test_error_result_still_saves_claude_session_id(store):
+    """Эвикция не должна стоить контекста: id сессии CLI сохраняется (resume поднимет её)."""
+    core, pool, _, _ = _core(store, client_cls=ErrorResultClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    await core.ask(sess.id, "привет")
+    assert store.sessions.get(sess.id).claude_session_id == "claude-generated-id"
+    await pool.close_all()
+
+
+class OtherErrorClient(ErrorResultClient):
+    subtype = "success"  # is_error=True при subtype success — так SDK отдаёт сбой API
+
+
+async def test_other_error_result_evicts_client(store):
+    core, pool, _, _ = _core(store, client_cls=OtherErrorClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    result = await core.ask(sess.id, "привет")
+    assert result.outcome.kind == "other_error"
+    assert pool.get_live(sess.id) is None
+    await pool.close_all()
+
+
+async def test_ok_result_keeps_warm_client(store):
+    """Обратная сторона замка: штатный ответ клиента НЕ выселяет (иначе теряем весь смысл пула)."""
+    core, pool, _, created = _core(store)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    await core.ask(sess.id, "раз")
+    await core.ask(sess.id, "два")
+    assert pool.get_live(sess.id) is not None
+    assert len(created) == 1
+    await pool.close_all()

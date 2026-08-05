@@ -123,6 +123,11 @@ class AgentCore:
                     return AskResult("", outcome)
 
                 outcome = last.outcome
+                if last.is_error:
+                    # SDK после ЛЮБОГО результата с is_error намеренно завершает CLI ненулевым
+                    # кодом — тёплый клиент в пуле уже мёртв. Не выселить его значит съесть
+                    # следующее сообщение человека впустую (ровно после «напиши "продолжи"»).
+                    await self._pool.evict(session_id)
                 if outcome.kind == "auth_error":
                     await self._pool.evict(session_id)
                     self._flag_unhealthy(outcome)
