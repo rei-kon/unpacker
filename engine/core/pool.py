@@ -67,6 +67,10 @@ class _Entry:
     client: Client
     last_activity: float
     in_use: int = 0  # refcount активных lease — занятого клиента не вытесняем
+    # Отпечаток опций, под которые клиент поднят (у нас — модель сессии). Клиент собирается
+    # ОДИН раз при connect: сменить модель у живого коннекта нельзя, поэтому расхождение
+    # отпечатка = клиент устарел и должен быть пересобран.
+    fingerprint: Any = None
 
 
 class ClientPool:
@@ -114,24 +118,37 @@ class ClientPool:
         return entry.client if entry else None
 
     @contextlib.asynccontextmanager
-    async def lease(self, session_id: str, options: Any) -> AsyncIterator[Client]:
+    async def lease(
+        self, session_id: str, options: Any, fingerprint: Any = None
+    ) -> AsyncIterator[Client]:
         """Взять клиента сессии в работу: поднимает refcount, чтобы его не вытеснили посреди
         стрима. Обязательный путь доступа для генерации — не `get_live` (тот для interrupt).
+
+        `fingerprint` — отпечаток значимых опций. Не совпал с тем, под который поднят тёплый
+        клиент → клиента пересоздаём: иначе `/model` обещает смену модели, а человек
+        продолжает платить за старую (ревью SDK-ядра, находка 6).
         """
-        client = await self._acquire(session_id, options)
+        client = await self._acquire(session_id, options, fingerprint)
         try:
             yield client
         finally:
             await self._release(session_id)
 
-    async def _acquire(self, session_id: str, options: Any) -> Client:
+    async def _acquire(self, session_id: str, options: Any, fingerprint: Any = None) -> Client:
+        stale: Client | None = None
         async with self._pool_lock:
             entry = self._clients.get(session_id)
+            if entry is not None and entry.fingerprint != fingerprint:
+                # опции сессии изменились — тёплый клиент собран под старые и уже не годится
+                self._clients.pop(session_id)
+                stale, entry = entry.client, None
             if entry is not None:
                 entry.last_activity = self._now()
                 entry.in_use += 1
                 self._clients.move_to_end(session_id)
                 return entry.client
+        if stale is not None:
+            await _safe_disconnect(stale)  # disconnect ВНЕ pool_lock
 
         # connect вне pool_lock (реальный ≈12с) и под таймаутом (wedged connect иначе вечен)
         client = self._factory(options)
@@ -152,7 +169,9 @@ class ClientPool:
                 self._clients.move_to_end(session_id)
                 result = existing.client
             else:
-                self._clients[session_id] = _Entry(client, self._now(), in_use=1)
+                self._clients[session_id] = _Entry(
+                    client, self._now(), in_use=1, fingerprint=fingerprint
+                )
                 self._clients.move_to_end(session_id)
                 victims.extend(self._collect_over_ceiling())
                 result = client

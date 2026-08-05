@@ -154,7 +154,9 @@ class AgentCore:
             last: Final | None = None
             for attempt in (0, 1):
                 try:
-                    last = await self._generate(session_id, options, prompt, on_event)
+                    last = await self._generate(
+                        session_id, options, prompt, on_event, fingerprint=session.model
+                    )
                 except asyncio.CancelledError:
                     # отмена (shutdown/таймаут сверху) — НЕ глотаем: evict и пробрасываем,
                     # иначе graceful shutdown ломается (отмена деградирует в other_error)
@@ -254,7 +256,12 @@ class AgentCore:
             logger.warning("не записал usage сессии %s", session_id, exc_info=True)
 
     async def _generate(
-        self, session_id: str, options: Any, prompt: str, on_event: EventFn | None
+        self,
+        session_id: str,
+        options: Any,
+        prompt: str,
+        on_event: EventFn | None,
+        fingerprint: Any = None,
     ) -> Final:
         """Один заход генерации: lease + семафор + событийный сбор до Final.
 
@@ -264,7 +271,7 @@ class AgentCore:
         """
         seen_session_id: str | None = None
         progressed = False
-        async with self._pool.lease(session_id, options) as client:
+        async with self._pool.lease(session_id, options, fingerprint) as client:
             async with self._pool.semaphore:
                 final: Final | None = None
 

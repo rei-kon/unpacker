@@ -696,3 +696,45 @@ async def test_final_without_cost_writes_nothing(store):
     await core.ask(sess.id, "привет")
     assert store.usage.session_cost(sess.id) == 0.0
     await pool.close_all()
+
+
+# ── B5: /model на тёплом клиенте ─────────────────────────────────────────────
+
+
+async def test_model_change_rebuilds_warm_client(store):
+    """`/model` отвечает «применится к следующему сообщению» — а тёплый клиент собран под
+    старую модель, и `_acquire` игнорирует новые опции. Обещание было ложным."""
+    core, pool, built, created = _core(store)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    await core.ask(sess.id, "раз")
+    assert built["model"] == "sonnet"
+
+    store.sessions.set_model(sess.id, "haiku")
+    await core.ask(sess.id, "два")
+
+    assert built["model"] == "haiku"
+    assert len(created) == 2  # старый клиент выселен, новый собран с новой моделью
+    assert created[1].options["model"] == "haiku"
+    await pool.close_all()
+
+
+async def test_same_model_keeps_warm_client(store):
+    """Обратная сторона: без смены модели пул остаётся тёплым (иначе теряем 12с на сообщение)."""
+    core, pool, _, created = _core(store)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    await core.ask(sess.id, "раз")
+    await core.ask(sess.id, "два")
+    assert len(created) == 1
+    await pool.close_all()
+
+
+async def test_resume_change_does_not_rebuild_client(store):
+    """resume меняется после КАЖДОГО первого ответа — реагировать на это пересозданием
+    значило бы убить тёплый пул целиком. Живому клиенту resume уже не нужен."""
+    core, pool, _, created = _core(store)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    await core.ask(sess.id, "раз")
+    assert store.sessions.get(sess.id).claude_session_id  # resume появился
+    await core.ask(sess.id, "два")
+    assert len(created) == 1
+    await pool.close_all()
