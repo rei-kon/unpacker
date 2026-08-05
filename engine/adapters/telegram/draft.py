@@ -29,8 +29,7 @@ from aiogram.types import InlineKeyboardMarkup
 
 from engine.core.formatting import to_telegram_markdown
 from engine.core.sendfile import hide_partial_marker
-from engine.core.streaming import TELEGRAM_LIMIT, split_message, tail_by_units
-from engine.core.streaming import _utf16_units as _units
+from engine.core.streaming import TELEGRAM_LIMIT, split_message, tail_by_units, utf16_units
 
 logger = logging.getLogger("unpacker.engine")
 
@@ -375,7 +374,7 @@ class DraftStreamer:
                 return _Frame(f"{_strip_tail(self._shown)}\n\n{_TRANSITION}", forced=True)
             return None
         self._transition = False
-        return _Frame(self._window(text), forced=False, source_units=_units(text))
+        return _Frame(self._window(text), forced=False, source_units=utf16_units(text))
 
     def _window(self, text: str) -> str:
         """Окно показа: голова, пока влезает, дальше — свежий хвост со счётчиком.
@@ -384,10 +383,10 @@ class DraftStreamer:
         длинном документе человек две минуты из трёх смотрел на мёртвый экран и не знал,
         жив ли бот. Окно едет за генерацией, счётчик говорит, сколько уже написано.
         """
-        if _units(text) <= self._max:
+        if utf16_units(text) <= self._max:
             return text + _CURSOR
         counter = _COUNTER.format(chars=len(text))
-        room = self._max - _units(counter) - _units(_ELLIPSIS) - 2  # 2 — пустая строка
+        room = self._max - utf16_units(counter) - utf16_units(_ELLIPSIS) - 2  # 2 — пустая строка
         return f"{_ELLIPSIS}{tail_by_units(text, room)}\n\n{counter}"
 
     def _worth_showing(self, frame: _Frame) -> bool:
@@ -404,7 +403,7 @@ class DraftStreamer:
         """
         if self._shown is None:
             return True
-        if _units(frame.shown) < _units(self._shown):
+        if utf16_units(frame.shown) < utf16_units(self._shown):
             return True
         return frame.source_units - self._shown_source >= self._tuning.min_delta_units
 

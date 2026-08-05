@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 
 from engine.adapters.telegram.draft import DraftStreamer, DraftTuning
-from engine.core.streaming import _utf16_units
+from engine.core.streaming import utf16_units
 
 
 class ChattyBot:
@@ -97,7 +97,7 @@ async def test_overflow_window_stays_within_the_limit():
     d = DraftStreamer(bot, chat_id=1, thread_id=None, tuning=_tuning(max_units=200))
     d.on_delta("я" * 2000)
     await asyncio.sleep(0.05)
-    assert _utf16_units(bot.shown) <= 200, f"окно шире лимита: {_utf16_units(bot.shown)}"
+    assert utf16_units(bot.shown) <= 200, f"окно шире лимита: {utf16_units(bot.shown)}"
 
 
 async def test_overflow_does_not_throw_deltas_away():

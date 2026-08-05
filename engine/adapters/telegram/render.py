@@ -11,7 +11,7 @@ _PLACEHOLDER = "…"
 def render_result(result: AskResult) -> str:
     """Превратить результат ask в текст сообщения пользователю по контракту §5.4."""
     body = _body(result)
-    note = getattr(result, "note", "")
+    note = result.note
     return f"{note}\n\n{body}".strip() if note else body
 
 

@@ -219,6 +219,9 @@ def _build(stand, *, bot=None, core=None, buttons=True, uploads=True, send_file=
         if uploads
         else None,
         send_file=SendFilePolicy(state_root=stand.state) if send_file else None,
+        # Пауза между кусками доставки проверяется отдельно (test_bot_streaming.py);
+        # здесь она только жгла бы секунды на каждом многокусковом ответе.
+        delivery_pause=0.0,
     )
     return SimpleNamespace(tg=tg, bot=bot, core=core, router=router)
 

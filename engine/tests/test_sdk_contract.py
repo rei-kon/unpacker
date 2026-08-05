@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from engine.core.streaming import collect_response_with_session, extract_text, is_result
+from engine.core.streaming import extract_text, is_result
 
 
 def _result(session_id: str = "sess-1") -> ResultMessage:
@@ -39,18 +39,6 @@ def test_extract_text_reads_real_assistant_message():
 def test_is_result_recognises_real_result_message():
     assert is_result(_result()) is True
     assert is_result(AssistantMessage(content=[TextBlock("x")], model="m")) is False
-
-
-async def test_collect_reads_real_stream():
-    """Полный путь ядра по реальным объектам SDK: последний текст + session_id из ResultMessage."""
-
-    async def stream():
-        yield AssistantMessage(content=[TextBlock("финальный ответ")], model="m")
-        yield _result(session_id="sess-42")
-
-    text, session_id = await collect_response_with_session(stream())
-    assert text == "финальный ответ"
-    assert session_id == "sess-42"
 
 
 async def test_stream_events_reads_real_stream_event():

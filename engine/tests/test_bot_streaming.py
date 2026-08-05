@@ -30,7 +30,7 @@ from engine.core.pool import ClientPool
 from engine.core.security import AllowList
 from engine.core.sendfile import SendFilePolicy
 from engine.core.store import Store
-from engine.core.streaming import TELEGRAM_LIMIT, _utf16_units
+from engine.core.streaming import TELEGRAM_LIMIT, utf16_units
 
 OWNER = 111
 BUTTONS = [ButtonSpec(label="Создать КП", prompt="Собери КП")]
@@ -151,7 +151,7 @@ def stand(tmp_path):
     store.close()
 
 
-def _build(stand, core, *, bot=None):
+def _build(stand, core, *, bot=None, delivery_pause=0.0):
     bot = bot or JournalBot()
     tg = TelegramBot(
         bot=bot,
@@ -161,6 +161,8 @@ def _build(stand, core, *, bot=None):
         pool=ClientPool(factory=lambda options: None, ceiling=2, idle_timeout=60.0),
         buttons=ButtonRegistry(stand.inst / "buttons.yaml"),
         send_file=SendFilePolicy(state_root=stand.state),
+        # Пауза между кусками — предмет отдельного теста; остальным она только жжёт секунды.
+        delivery_pause=delivery_pause,
     )
     return SimpleNamespace(tg=tg, bot=bot, core=core)
 
@@ -257,6 +259,29 @@ async def test_file_goes_after_the_final_edit_and_carries_the_keyboard(stand):
     assert kind == "send_document" and markup is not None
 
 
+# ── FA12: многокусковая доставка не долбит Telegram очередью ────────────────
+
+
+def test_default_delivery_pause_fits_the_chat_ceiling():
+    """Bot API держит около одного сообщения в секунду на чат — секунда впритык не годится."""
+    assert bot_module._DELIVERY_PAUSE > 1.0
+
+
+async def test_long_answer_is_delivered_with_pauses(stand):
+    """Сама доставка провоцировала 429: куски летели подряд, и середина ответа терялась.
+
+    Telegram банит бота ЦЕЛИКОМ, поэтому очередь из пяти сообщений в один чат — не только
+    про этот ответ: под бан попадают и остальные люди.
+    """
+    s = _build(stand, StreamCore(reply="Абзац текста.\n\n" * 700), delivery_pause=0.05)
+    started = asyncio.get_running_loop().time()
+    await s.tg._on_text(_message())
+    elapsed = asyncio.get_running_loop().time() - started
+    pieces = s.bot.methods.count("send_message") + s.bot.methods.count("edit_message_text")
+    assert pieces >= 3, f"тесту нужен многокусковый ответ: {s.bot.methods}"
+    assert elapsed >= 0.05 * (pieces - 1), f"куски ушли подряд, за {elapsed:.3f} с"
+
+
 # ── FA2: черновик не остаётся сиротой ни на одном пути ──────────────────────
 
 
@@ -330,7 +355,7 @@ async def test_max_turns_never_sends_over_the_telegram_limit(stand):
     pieces = [t for m, t in s.bot.calls if m in ("send_message", "edit_message_text")]
     # без эскейпа MarkdownV2: разметка при переполнении честно откатывается в плейн,
     # а вот сам кусок текста больше лимита — это потеря куска целиком
-    assert all(_utf16_units(t.replace("\\", "")) <= TELEGRAM_LIMIT for t in pieces)
+    assert all(utf16_units(t.replace("\\", "")) <= TELEGRAM_LIMIT for t in pieces)
 
 
 async def test_max_turns_does_not_duplicate_the_shown_text(stand):

@@ -1,4 +1,7 @@
-"""Сборка ответа из потока сообщений Agent SDK + нарезка под лимит Telegram.
+"""Разбор сообщений Agent SDK + нарезка текста под лимиты Telegram.
+
+Читатели потока живут в `events.py` (он же собирает ответ); здесь — опознание кусков и
+арифметика длин, которой пользуются и ядро, и черновик адаптера.
 
 Duck-typing по структуре SDK (не импортируем классы SDK — тестируемо и устойчиво к версиям):
 - text-блок  → есть строковый атрибут .text
@@ -8,7 +11,6 @@ Duck-typing по структуре SDK (не импортируем класс�
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from typing import Any
 
 TELEGRAM_LIMIT = 4096  # лимит Telegram — в единицах UTF-16, см. split_message
@@ -40,31 +42,7 @@ def is_result(message: Any) -> bool:
     return hasattr(message, "total_cost_usd")
 
 
-async def collect_response_with_session(
-    messages: AsyncIterator[Any],
-) -> tuple[str, str | None]:
-    """Вернуть текст ПОСЛЕДНЕГО содержательного сообщения агента + session_id (для resume).
-
-    Раньше склеивали ВСЕ промежуточные сообщения — в чат летела вся пошаговая болтовня
-    агента и содержимое прочитанных файлов/скиллов. Для чистого ответа отдаём только
-    финал: последнее непустое assistant-сообщение перед ResultMessage.
-    session_id приходит на ResultMessage — читаем его ДО остановки цикла.
-    """
-    last_text = ""
-    session_id: str | None = None
-    async for message in messages:
-        sid = getattr(message, "session_id", None)
-        if isinstance(sid, str) and sid:
-            session_id = sid
-        if is_result(message):
-            break
-        chunk = extract_text(message)
-        if chunk and chunk.strip():
-            last_text = chunk
-    return last_text, session_id
-
-
-def _utf16_units(s: str) -> int:
+def utf16_units(s: str) -> int:
     """Длина строки в единицах UTF-16 (как считает лимит Telegram)."""
     return len(s.encode("utf-16-le")) // 2
 
@@ -82,7 +60,7 @@ def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     cur: list[str] = []
     cur_units = 0
     for ch in text:
-        ch_units = _utf16_units(ch)
+        ch_units = utf16_units(ch)
         if cur and cur_units + ch_units > limit:
             chunks.append("".join(cur))
             cur, cur_units = [], 0
@@ -104,7 +82,7 @@ def tail_by_units(text: str, units: int) -> str:
     acc: list[str] = []
     total = 0
     for ch in reversed(text):
-        ch_units = _utf16_units(ch)
+        ch_units = utf16_units(ch)
         if total + ch_units > units:
             break
         acc.append(ch)
@@ -128,13 +106,13 @@ def split_for_delivery(text: str, limit: int = DELIVERY_LIMIT) -> list[str]:
     cur = ""
     for para in text.split(_PARAGRAPH):
         candidate = f"{cur}{_PARAGRAPH}{para}" if cur else para
-        if _utf16_units(candidate) <= limit:
+        if utf16_units(candidate) <= limit:
             cur = candidate
             continue
         if cur:
             chunks.append(cur)
             cur = ""
-        if _utf16_units(para) <= limit:
+        if utf16_units(para) <= limit:
             cur = para
             continue
         hard = split_message(para, limit)

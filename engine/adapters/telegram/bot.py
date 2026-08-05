@@ -115,6 +115,11 @@ _DONE_KINDS = ("ok", "max_turns")
 _OVERFLOW = "🤔"
 # Сколько промптов на окно живут одновременно (работающий + ждущие замка).
 _QUEUE_CAP = 3
+# Пауза между кусками одного ответа. Bot API держит примерно одно сообщение в секунду на
+# чат, а длинный ответ уходит очередью из трёх-пяти: без паузы САМА доставка ловит 429 и
+# теряет середину, а бан прилетает боту целиком — вместе с остальными людьми. Секунда
+# впритык — берём с запасом.
+_DELIVERY_PAUSE = 1.1
 # Падение мимо `ask` (баг адаптера, битый апдейт, отвалившийся Telegram) раньше не доходило
 # до человека НИКАК — бот просто замолкал.
 _HANDLER_FAILURE = "⚠️ Что-то сломалось на моей стороне — я уже сообщил владельцу."
@@ -140,10 +145,18 @@ Outgoing = OutText | OutDocument
 
 
 def make_owner_alert(bot: Bot, owner_id: int) -> Callable[[str], None]:
-    """Fire-and-forget алерт владельцу (§5.4): не блокирует ask, сеть висит — ask не ждёт."""
+    """Fire-and-forget алерт владельцу (§5.4): не блокирует ask, сеть висит — ask не ждёт.
+
+    Ссылку на задачу держим до её конца: asyncio хранит только слабую ссылку, и алерт,
+    отпущенный без владельца, сборщик мусора вправе снять посреди отправки — владелец не
+    узнает о деградации ровно тогда, когда это важнее всего.
+    """
+    pending: set[asyncio.Task[None]] = set()
 
     def alert(detail: str) -> None:
-        asyncio.create_task(_safe_send(bot, owner_id, f"⚠️ Движок деградировал: {detail}"))
+        task = asyncio.create_task(_safe_send(bot, owner_id, f"⚠️ Движок деградировал: {detail}"))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
 
     return alert
 
@@ -187,6 +200,7 @@ class TelegramBot:
         draft: DraftTuning | None = _DEFAULT_DRAFT,
         health: HealthMarker | None = None,
         on_alert: Callable[[str], None] | None = None,
+        delivery_pause: float = _DELIVERY_PAUSE,
     ):
         # Bot передаётся готовым (один на процесс): тот же объект шлёт алерты владельцу
         # (make_owner_alert) и ведёт polling — два Bot на один токен не нужны.
@@ -210,11 +224,15 @@ class TelegramBot:
         # падения генерации, снаружи оно должно быть видно так же (§5.4).
         self._health = health
         self._on_alert = on_alert
+        self._delivery_pause = delivery_pause
         # Окна (chat:thread), в которых прямо сейчас идёт генерация — см. _is_busy (ADV-13)
         self._busy: set[str] = set()
         # Сколько промптов окна в работе или ждут замка — счётчик занимается СИНХРОННО,
         # до первого await (см. _window_slot), иначе два тапа проскакивают оба.
         self._queued: dict[str, int] = {}
+        # Фоновые задачи адаптера (статус тула) — asyncio держит на них только слабую
+        # ссылку, поэтому сильную держим сами до их завершения.
+        self._tasks: set[asyncio.Task[None]] = set()
         # Замок на ОКНО: генерацию и так сериализует session_lock ядра, но отпускается он до
         # доставки — и черновик второго сообщения успевал появиться раньше финала первого.
         self._locks: dict[str, asyncio.Lock] = {}
@@ -707,6 +725,7 @@ class TelegramBot:
             items = [OutText("…")]
 
         markup = self._keyboard()
+        spoken = False  # ушёл ли уже кусок этого ответа — от этого зависит пауза
         if draft is not None:
             first = items[0]
             if isinstance(first, OutText):
@@ -715,6 +734,7 @@ class TelegramBot:
                 only = len(items) == 1
                 if await draft.finalize(first.text, markup=markup if only else None):
                     items = items[1:]
+                    spoken = True
             else:
                 # Доставлять черновиком нечего (ответ — один файл): раньше он оставался
                 # висеть с вечным курсором ▌, а фоновый цикл продолжал крутиться.
@@ -722,6 +742,10 @@ class TelegramBot:
 
         last = len(items) - 1
         for i, item in enumerate(items):
+            if i or spoken:
+                # Не после каждого куска, а ПЕРЕД каждым следующим: одиночный ответ
+                # (обычный случай) не ждёт ни секунды.
+                await asyncio.sleep(self._delivery_pause)
             reply_markup = markup if i == last else None
             if isinstance(item, OutDocument):
                 await self._send_document(chat_id, thread_id, item.path, reply_markup)
@@ -786,9 +810,13 @@ class TelegramBot:
         def handler(event: Event) -> None:
             if isinstance(event, ToolStarted) and not shown["done"]:
                 shown["done"] = True
-                asyncio.create_task(
+                # Ссылку держим до конца задачи: у asyncio она слабая, и статус мог
+                # исчезнуть под сборщиком мусора посреди отправки.
+                task = asyncio.create_task(
                     _safe_send(self._bot, chat_id, render_tool_status(event), thread_id)
                 )
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
 
         return handler
 
