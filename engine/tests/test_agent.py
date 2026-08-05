@@ -632,3 +632,67 @@ async def test_truncated_stream_saves_session_id(store):
     # сессия CLI на диске уже создана — её handle сохраняем, иначе диалог теряет кусок истории
     assert store.sessions.get(sess.id).claude_session_id == "claude-generated-id"
     await pool.close_all()
+
+
+# ── B3: расход турна доезжает до базы ────────────────────────────────────────
+
+
+class CostlyClient(FakeStreamClient):
+    async def receive_response(self):
+        yield FakeMessage("ответ агента", self._reply_session)
+        result = FakeResult(self._reply_session)
+        result.total_cost_usd = 0.017
+        result.usage = {"input_tokens": 1200, "output_tokens": 340}
+        result.num_turns = 3
+        yield result
+
+
+async def test_usage_written_after_ask(store):
+    """Таблица usage была написана и мертва: ни одного боевого вызова add."""
+    core, pool, _, _ = _core(store, client_cls=CostlyClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    await core.ask(sess.id, "привет")
+    assert abs(store.usage.session_cost(sess.id) - 0.017) < 1e-9
+    await pool.close_all()
+
+
+async def test_usage_accumulates_over_turns(store):
+    core, pool, _, _ = _core(store, client_cls=CostlyClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    await core.ask(sess.id, "раз")
+    await core.ask(sess.id, "два")
+    assert abs(store.usage.session_cost(sess.id) - 0.034) < 1e-9
+    await pool.close_all()
+
+
+class CostlyErrorClient(FakeStreamClient):
+    async def receive_response(self):
+        result = FakeResult(self._reply_session, subtype="error_max_turns", is_error=True)
+        result.total_cost_usd = 0.009
+        result.usage = {"input_tokens": 500, "output_tokens": 10}
+        yield result
+
+
+async def test_usage_written_even_on_error_outcome(store):
+    """Токены на упавшем турне сгорели по-настоящему — не учитывать их значит врать себе."""
+    core, pool, _, _ = _core(store, client_cls=CostlyErrorClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    await core.ask(sess.id, "привет")
+    assert abs(store.usage.session_cost(sess.id) - 0.009) < 1e-9
+    await pool.close_all()
+
+
+async def test_final_without_cost_writes_nothing(store):
+    """Финал без полей расхода не должен плодить пустые строки в usage."""
+
+    class NoCostClient(FakeStreamClient):
+        async def receive_response(self):
+            result = FakeResult(self._reply_session)
+            del result.total_cost_usd
+            yield result
+
+    core, pool, _, _ = _core(store, client_cls=NoCostClient)
+    sess = store.sessions.create(owner_user_id=111, project_slug="office")
+    await core.ask(sess.id, "привет")
+    assert store.usage.session_cost(sess.id) == 0.0
+    await pool.close_all()

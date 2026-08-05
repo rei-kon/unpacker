@@ -268,3 +268,23 @@ def test_status_survives_resolve_returning_a_gone_session(router, store, monkeyp
     monkeypatch.setattr(store.bindings, "resolve", lambda surface, key: "нет-такой-сессии")
     text = router.status_text(100, 7)
     assert text.strip() and "Traceback" not in text
+
+
+# ── B3: /status показывает расход сессии ─────────────────────────────────────
+
+
+async def test_status_shows_session_cost(router, store):
+    """Расход собирается в usage — но человеку он не виден нигде. Показываем в /status."""
+    await router.on_message(chat_id=100, thread_id=7, user_id=111, text="привет")
+    sid = store.bindings.resolve("tg", "100:7")
+    store.usage.add(
+        session_id=sid, model="sonnet", input_tokens=100, output_tokens=20, cost_usd=0.0123
+    )
+    text = router.status_text(chat_id=100, thread_id=7)
+    assert "0.0123" in text
+
+
+async def test_status_without_usage_shows_zero(router, store):
+    await router.on_message(chat_id=100, thread_id=7, user_id=111, text="привет")
+    text = router.status_text(chat_id=100, thread_id=7)
+    assert "расход" in text.lower()
