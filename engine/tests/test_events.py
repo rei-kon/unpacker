@@ -134,3 +134,71 @@ async def test_non_text_deltas_are_ignored():
 
     events = await _collect(stream_events(gen()))
     assert not any(isinstance(e, TextDelta) for e in events)
+
+
+# ── B3/B1/B6: финал несёт расход, флаг ошибки; обрыв потока не теряет session_id ─
+
+
+class RichResult(Result):
+    """ResultMessage с полями расхода — то, что SDK кладёт в каждый финал (C4)."""
+
+    def __init__(self, session_id, **kw):
+        super().__init__(session_id, **kw)
+        self.total_cost_usd = 0.017
+        self.num_turns = 3
+        self.usage = {"input_tokens": 1200, "output_tokens": 340}
+
+
+async def test_final_carries_cost_usage_and_turns():
+    """Расход приезжает в каждом ResultMessage бесплатно — ядро обязано его донести."""
+
+    async def gen():
+        yield Msg([Text("ответ")], session_id="s9")
+        yield RichResult("s9")
+
+    final = (await _collect(stream_events(gen())))[-1]
+    assert final.total_cost_usd == 0.017
+    assert final.num_turns == 3
+    assert final.usage == {"input_tokens": 1200, "output_tokens": 340}
+
+
+async def test_final_marks_error_result():
+    """is_error проходит насквозь: после ошибочного результата CLI мёртв — ядру это знать."""
+
+    async def gen():
+        yield Result("s10", subtype="error_max_turns", is_error=True)
+
+    final = (await _collect(stream_events(gen())))[-1]
+    assert final.is_error is True
+
+
+async def test_final_of_ok_result_is_not_error():
+    async def gen():
+        yield Result("s11")
+
+    final = (await _collect(stream_events(gen())))[-1]
+    assert final.is_error is False
+
+
+async def test_stream_ended_without_final_reports_seen_session_id():
+    """Поток оборвался без Final: session_id, который успел приехать, не должен пропасть —
+    иначе после рестарта диалог теряет контекст (B6)."""
+    from engine.core.events import StreamEnded
+
+    async def gen():
+        yield Msg([Text("успел написать")], session_id="s12")
+
+    events = await _collect(stream_events(gen()))
+    assert isinstance(events[-1], StreamEnded)
+    assert events[-1].session_id == "s12"
+    assert not any(isinstance(e, Final) for e in events)
+
+
+async def test_no_stream_ended_after_final():
+    """Штатный финал — ровно один Final и никакого StreamEnded следом."""
+
+    async def gen():
+        yield Result("s13")
+
+    events = await _collect(stream_events(gen()))
+    assert isinstance(events[-1], Final)

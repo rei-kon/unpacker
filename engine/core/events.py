@@ -8,7 +8,10 @@ verbose 0 обслуживает collect_response_with_session (только ф�
   • ToolStarted — начат tool-вызов (verbose ≥1 показывает как статус);
   • TextStart  — началось новое assistant-сообщение (черновик «печатает…» начинается заново);
   • TextDelta  — кусок текста по мере генерации (include_partial_messages);
-  • Final — финал: текст последнего содержательного сообщения + session_id + Outcome (§5.4).
+  • Final — финал: текст последнего содержательного сообщения + session_id + Outcome (§5.4)
+    + расход (cost/usage/num_turns) и сырой is_error;
+  • StreamEnded — поток кончился без финала (CLI умер): отдаёт увиденный session_id, чтобы
+    ядро сохранило контекст диалога вместо молчаливой потери.
 
 Дельты субагентов (parent_tool_use_id) не эмитятся — в черновик владельца чужая болтовня
 не течёт. Duck-typing, как в streaming.py — классы SDK не импортируем.
@@ -44,9 +47,27 @@ class Final:
     text: str
     session_id: str | None
     outcome: Outcome
+    # is_error — сырой флаг ResultMessage, а не производная от outcome.kind: SDK после
+    # ошибочного результата намеренно валит CLI-подпроцесс, и ядру нужно знать именно
+    # «клиент мёртв», не пересказывая это через классификацию (ревью SDK-ядра, находка 1).
+    is_error: bool = False
+    # Расход приезжает в каждом финале бесплатно (C4). Поля опциональные: чужой/старый
+    # результат без них не должен ронять разбор.
+    total_cost_usd: float | None = None
+    usage: dict[str, Any] | None = None
+    num_turns: int | None = None
 
 
-Event = ToolStarted | TextStart | TextDelta | Final
+@dataclass(frozen=True)
+class StreamEnded:
+    """Поток кончился без ResultMessage (CLI умер). Несёт session_id, который успел приехать:
+    сессия на диске уже создана, и терять её handle нельзя — иначе после обрыва диалог
+    продолжится с прошлого турна (ревью SDK-ядра, §2)."""
+
+    session_id: str | None
+
+
+Event = ToolStarted | TextStart | TextDelta | Final | StreamEnded
 
 
 async def stream_events(messages: AsyncIterator[Any]) -> AsyncIterator[Event]:
@@ -79,7 +100,7 @@ async def stream_events(messages: AsyncIterator[Any]) -> AsyncIterator[Event]:
             continue
 
         if is_result(message):
-            yield Final(last_text, session_id, classify_result(message))
+            yield _final(last_text, session_id, message)
             return
 
         content = getattr(message, "content", None)
@@ -90,3 +111,23 @@ async def stream_events(messages: AsyncIterator[Any]) -> AsyncIterator[Event]:
         chunk = extract_text(message)
         if chunk and chunk.strip():
             last_text = chunk
+
+    # сюда попадаем только если поток кончился без результата — сообщаем то, что успели узнать
+    yield StreamEnded(session_id)
+
+
+def _final(text: str, session_id: str | None, result: Any) -> Final:
+    """Собрать Final из результата SDK. Расход читаем duck-typing'ом и мягко: поля могут
+    отсутствовать (старый SDK, чужой дублёр), и это не повод терять ответ."""
+    usage = getattr(result, "usage", None)
+    num_turns = getattr(result, "num_turns", None)
+    cost = getattr(result, "total_cost_usd", None)
+    return Final(
+        text=text,
+        session_id=session_id,
+        outcome=classify_result(result),
+        is_error=bool(getattr(result, "is_error", False)),
+        total_cost_usd=cost if isinstance(cost, int | float) else None,
+        usage=usage if isinstance(usage, dict) else None,
+        num_turns=num_turns if isinstance(num_turns, int) else None,
+    )
