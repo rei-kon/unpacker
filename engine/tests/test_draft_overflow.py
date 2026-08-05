@@ -121,6 +121,43 @@ async def test_finalize_after_overflow_shows_the_whole_answer():
     assert bot.edits[-1] == "полный ответ целиком"
 
 
+async def test_overflow_window_keeps_moving_with_the_threshold_on():
+    """FA5: порог прироста меряет ПОКАЗАННОЕ, а в режиме хвоста его длина константна.
+
+    Из-за этого grown всегда выходил нулём, показ откладывался «до следующего раза» — и
+    окно замирало до самого финала. Ровно та мёртвая картинка, ради которой окно и делали.
+    """
+    bot = ChattyBot()
+    d = DraftStreamer(
+        bot,
+        chat_id=1,
+        thread_id=None,
+        tuning=DraftTuning(interval=0.03, min_delta_units=60, max_units=200),
+    )
+    d.on_delta("а" * 400)
+    await asyncio.sleep(0.05)
+    d.on_delta("свежий хвост генерации" + "б" * 100)
+    await asyncio.sleep(0.06)
+    assert "свежий хвост генерации" in bot.shown, f"окно замерло: {bot.shown[-60:]!r}"
+
+
+async def test_overflow_still_skips_tiny_deltas():
+    """Порог не отменён: мелкая правка и в режиме хвоста не стоит вызова API."""
+    bot = ChattyBot()
+    d = DraftStreamer(
+        bot,
+        chat_id=1,
+        thread_id=None,
+        tuning=DraftTuning(interval=0.03, min_delta_units=60, max_units=200),
+    )
+    d.on_delta("а" * 400)
+    await asyncio.sleep(0.05)
+    before = len(bot.edits)
+    d.on_delta("+++")
+    await asyncio.sleep(0.06)
+    assert len(bot.edits) == before, "три символа не стоят правки сообщения"
+
+
 # ── A6: TextStart — переходная строка вместо немой подмены ──────────────────
 
 

@@ -82,6 +82,20 @@ class DraftTuning:
         return self.interval * 4
 
 
+@dataclass(frozen=True)
+class _Frame:
+    """Кадр черновика: что показать сейчас и чем это мерить.
+
+    `source_units` — длина ИСХОДНОГО текста за кадром: порог прироста считается по ней, а
+    не по длине показанного окна (в режиме хвоста та константна). `forced` — показать в
+    обход порога (переходная строка на TextStart).
+    """
+
+    shown: str
+    forced: bool = False
+    source_units: int = 0
+
+
 class DraftStreamer:
     def __init__(
         self,
@@ -103,6 +117,8 @@ class DraftStreamer:
         self._buf: list[str] = []
         self._dirty = False
         self._shown: str | None = None  # что реально висит в TG (дедуп «not modified»)
+        # Длина исходного текста на момент последнего показа — по ней меряется прирост.
+        self._shown_source = 0
         # Текст, который Telegram отверг как некорректный: повторять его бессмысленно —
         # 400 повторным edit того же текста не лечится, только жжёт квоту чата.
         self._rejected: str | None = None
@@ -329,24 +345,21 @@ class DraftStreamer:
             await asyncio.sleep(self.interval)
 
     async def _flush(self) -> None:
-        shown, forced = self._compose()
-        if shown is None:
+        frame = self._compose()
+        if frame is None:
             return
-        if shown == self._shown or shown == self._rejected:
+        if frame.shown == self._shown or frame.shown == self._rejected:
             return
-        if not forced and not self._worth_showing(shown):
+        if not frame.forced and not self._worth_showing(frame):
             self._dirty = True  # копим дальше: покажем, когда наберётся ощутимый кусок
             return
         # Сеть — отдельной shield-задачей: cancel цикла (finish) не убьёт её посреди
         # send_message, поэтому _message_id гарантированно запишется и финал его найдёт.
-        self._inflight = asyncio.ensure_future(self._send_or_edit(shown))
+        self._inflight = asyncio.ensure_future(self._send_or_edit(frame))
         await asyncio.shield(self._inflight)
 
-    def _compose(self) -> tuple[str | None, bool]:
-        """Что показать сейчас: (текст, показывать ли в обход порога дельты).
-
-        None — показывать нечего: буфер пуст и подменять текст не на что.
-        """
+    def _compose(self) -> _Frame | None:
+        """Что показать сейчас. None — показывать нечего: буфер пуст и подменять нечем."""
         # Маркер `[SEND_FILE:]` из черновика убираем ВСЕГДА, включая недописанный хвост:
         # финал его вырежет, а до финала человек видел служебную строку с абсолютным путём
         # на сервере внутри — и через секунду она исчезала (residual-находка ревью).
@@ -355,10 +368,10 @@ class DraftStreamer:
             # TextStart пришёл, новых дельт ещё нет. Молча подменить абзац, который человек
             # читает, — выглядит как сбой; переходная строка читается как прогресс.
             if self._transition and self._shown:
-                return f"{_strip_tail(self._shown)}\n\n{_TRANSITION}", True
-            return None, False
+                return _Frame(f"{_strip_tail(self._shown)}\n\n{_TRANSITION}", forced=True)
+            return None
         self._transition = False
-        return self._window(text), False
+        return _Frame(self._window(text), forced=False, source_units=_units(text))
 
     def _window(self, text: str) -> str:
         """Окно показа: голова, пока влезает, дальше — свежий хвост со счётчиком.
@@ -373,20 +386,26 @@ class DraftStreamer:
         room = self._max - _units(counter) - _units(_ELLIPSIS) - 2  # 2 — пустая строка
         return f"{_ELLIPSIS}{tail_by_units(text, room)}\n\n{counter}"
 
-    def _worth_showing(self, shown: str) -> bool:
+    def _worth_showing(self, frame: _Frame) -> bool:
         """Набралось ли достаточно нового текста, чтобы тратить вызов API.
 
-        Порог считает ПРИРОСТ, и только его. Два исключения обязательны:
+        Прирост считается по ИСХОДНОМУ тексту, а не по показанному окну: в режиме хвоста
+        длина окна константна, прирост по ней всегда ноль — и окно замирало до финала,
+        выбрасывая ровно те дельты, ради показа которых окно и заводили.
+
+        Два исключения обязательны:
           • первый показ — первые буквы человек должен увидеть сразу, даже если их пять;
-          • текст стал короче (после TextStart он другой, а не «чуть подправленный») —
+          • показанное стало короче (после TextStart это другой текст, а не подправленный) —
             держать вместо него старый абзац нельзя.
         """
         if self._shown is None:
             return True
-        grown = _units(shown) - _units(self._shown)
-        return grown < 0 or grown >= self._tuning.min_delta_units
+        if _units(frame.shown) < _units(self._shown):
+            return True
+        return frame.source_units - self._shown_source >= self._tuning.min_delta_units
 
-    async def _send_or_edit(self, shown: str) -> None:
+    async def _send_or_edit(self, frame: _Frame) -> None:
+        shown = frame.shown
         try:
             if self._message_id is None:
                 msg = await self._bot.send_message(
@@ -406,7 +425,7 @@ class DraftStreamer:
             logger.warning("черновик поймал 429, интервал поднят до %.1f с", self._floor)
         except TelegramBadRequest as exc:
             if _NOT_MODIFIED in str(exc):
-                self._shown = shown  # этот текст уже висит в чате — считаем показанным
+                self._remember(frame)  # этот текст уже висит в чате — считаем показанным
                 return
             # Повторять отвергнутый текст бессмысленно: 400 повторным edit не лечится, а
             # раньше `_dirty` вставал обратно и цикл слал одно и то же до конца генерации.
@@ -416,7 +435,12 @@ class DraftStreamer:
             self._dirty = True  # не терять кусок: следующий тик цикла ретрайнет (троттлинг тот же)
             logger.debug("черновик не отправился/не отредактировался", exc_info=True)
         else:
-            self._shown = shown
+            self._remember(frame)
+
+    def _remember(self, frame: _Frame) -> None:
+        """Запомнить показанное — вместе с длиной исходного текста за ним (см. _worth_showing)."""
+        self._shown = frame.shown
+        self._shown_source = frame.source_units
 
 
 def _strip_tail(shown: str) -> str:
