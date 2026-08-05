@@ -7,11 +7,15 @@
 """
 
 from engine.core.streaming import (
+    DELIVERY_LIMIT,
+    TELEGRAM_LIMIT,
     _utf16_units,
     collect_response_with_session,
     extract_text,
     is_result,
+    split_for_delivery,
     split_message,
+    tail_by_units,
 )
 
 
@@ -140,3 +144,60 @@ def test_split_message_never_splits_surrogate_pair():
     chunks = split_message("😀" * 3000, limit=100)
     for c in chunks:
         c.encode("utf-16-le")  # не бросает — пара цела
+
+
+# ── A11: нарезка финала с запасом и по границам абзацев ──────────────────────
+
+
+def test_split_for_delivery_keeps_headroom_under_telegram_limit():
+    """Экранирование MarkdownV2 добавляет символы уже ПОСЛЕ нарезки: кусок ровно на 4096
+    после `\\`-эскейпа перевалит лимит, Telegram вернёт 400, и весь кусок потеряет разметку.
+    Поэтому финал режем с запасом."""
+    chunks = split_for_delivery("абв\n\n" * 4000)
+    assert chunks, "нарезка не должна отдавать пустой список"
+    assert all(_utf16_units(c) <= DELIVERY_LIMIT for c in chunks)
+    assert DELIVERY_LIMIT < TELEGRAM_LIMIT, "запас на экранирование обязан быть"
+
+
+def test_split_for_delivery_cuts_on_paragraph_boundary():
+    """Разрез посреди ```-блока разваливает разметку обоих кусков — режем по абзацам."""
+    para = "а" * 1000
+    text = "\n\n".join([para] * 8)
+    chunks = split_for_delivery(text)
+    assert len(chunks) > 1
+    for c in chunks[:-1]:
+        assert c.endswith(para), f"кусок оборван не по границе абзаца: {c[-20:]!r}"
+    assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
+def test_split_for_delivery_falls_back_to_hard_cut_on_one_long_paragraph():
+    """Абзац сам длиннее лимита — режем жёстко, а не отдаём кусок, который Telegram отвергнет."""
+    chunks = split_for_delivery("я" * 9000)
+    assert len(chunks) >= 3
+    assert all(_utf16_units(c) <= DELIVERY_LIMIT for c in chunks)
+    assert "".join(chunks) == "я" * 9000
+
+
+def test_split_for_delivery_short_text_is_untouched():
+    assert split_for_delivery("короткий ответ") == ["короткий ответ"]
+
+
+def test_split_for_delivery_empty_returns_placeholder():
+    assert split_for_delivery("") == ["…"]
+
+
+# ── A5: хвост по единицам UTF-16 (скользящее окно черновика) ─────────────────
+
+
+def test_tail_by_units_returns_the_end_of_the_text():
+    assert tail_by_units("абвгде", 3) == "где"
+
+
+def test_tail_by_units_counts_utf16_not_codepoints():
+    tail = tail_by_units("😀" * 100, 10)
+    assert _utf16_units(tail) <= 10
+    tail.encode("utf-16-le")  # суррогатная пара не разорвана
+
+
+def test_tail_by_units_shorter_text_is_returned_whole():
+    assert tail_by_units("два", 100) == "два"
