@@ -1,4 +1,4 @@
-"""Приём вложений из Telegram: документ/фото → файл в uploads инстанса (§5.5).
+"""Приём вложений из Telegram: документ/фото/речь → файл в uploads инстанса (§5.5).
 
 Тонкая прослойка над `engine.core.uploads`: политика безопасности (имя, каталог, рамка) живёт
 в ядре и одинакова для всех поверхностей, здесь — только Telegram-специфика: как достать
@@ -25,8 +25,41 @@ from engine.core.uploads import MAX_UPLOAD_BYTES, UploadStore, too_large_message
 
 logger = logging.getLogger("unpacker.engine")
 
-Kind = Literal["документ", "фото"]
-_FALLBACK_NAMES: dict[str, str] = {"фото": "photo.jpg", "документ": "file.bin"}
+Kind = Literal["документ", "фото", "голосовое", "аудио", "видеозаметка"]
+_FALLBACK_NAMES: dict[str, str] = {
+    "фото": "photo.jpg",
+    "документ": "file.bin",
+    "голосовое": "voice.ogg",
+    "аудио": "audio.mp3",
+    "видеозаметка": "video_note.mp4",
+}
+# Речевые типы: их не показывают агенту как файл, а сначала распознают в текст.
+SPEECH_KINDS: frozenset[str] = frozenset({"голосовое", "аудио", "видеозаметка"})
+
+# MIME → расширение. Имени у голосового нет вовсе, а расширение решает, каким
+# Content-Type файл уедет распознавателю: безымянный `file.bin` заставляет провайдера
+# гадать по сигнатуре, и на opus он иногда ошибается.
+_EXT_BY_MIME: dict[str, str] = {
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/flac": ".flac",
+    "audio/webm": ".webm",
+    "video/mp4": ".mp4",
+}
+
+
+def _speech_name(*, prefix: str, unique_id: str | None, mime: str | None, default: str) -> str:
+    """Имя для записи без имени: `<префикс>-<id><расширение по MIME>`."""
+    ext = _EXT_BY_MIME.get((mime or "").lower(), "")
+    if not ext:
+        ext = Path(default).suffix
+    return f"{prefix}-{unique_id or 'tg'}{ext}"
 
 
 @dataclass(frozen=True)
@@ -73,6 +106,48 @@ def attachment_from_message(message: Any) -> Attachment | None:
             file_name=getattr(document, "file_name", None),
             size=getattr(document, "file_size", None),
             kind="документ",
+        )
+    # Речевые типы — до фото: у видеозаметки есть превью-фото, и хендлер фото
+    # перехватил бы её молча, отдав агенту картинку вместо слов человека.
+    voice = getattr(message, "voice", None)
+    if voice is not None:
+        return Attachment(
+            file_id=voice.file_id,
+            file_name=_speech_name(
+                prefix="voice",
+                unique_id=getattr(voice, "file_unique_id", None),
+                mime=getattr(voice, "mime_type", None),
+                default=_FALLBACK_NAMES["голосовое"],
+            ),
+            size=getattr(voice, "file_size", None),
+            kind="голосовое",
+        )
+    audio = getattr(message, "audio", None)
+    if audio is not None:
+        return Attachment(
+            file_id=audio.file_id,
+            file_name=getattr(audio, "file_name", None)
+            or _speech_name(
+                prefix="audio",
+                unique_id=getattr(audio, "file_unique_id", None),
+                mime=getattr(audio, "mime_type", None),
+                default=_FALLBACK_NAMES["аудио"],
+            ),
+            size=getattr(audio, "file_size", None),
+            kind="аудио",
+        )
+    video_note = getattr(message, "video_note", None)
+    if video_note is not None:
+        return Attachment(
+            file_id=video_note.file_id,
+            file_name=_speech_name(
+                prefix="video_note",
+                unique_id=getattr(video_note, "file_unique_id", None),
+                mime=None,  # у кружка MIME не приходит вовсе, он всегда mp4
+                default=_FALLBACK_NAMES["видеозаметка"],
+            ),
+            size=getattr(video_note, "file_size", None),
+            kind="видеозаметка",
         )
     photo = getattr(message, "photo", None)
     if photo:

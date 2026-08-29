@@ -63,6 +63,11 @@ from engine.core.sendfile import (
 )
 from engine.core.store import Store
 from engine.core.streaming import split_message
+from engine.core.transcribe import (
+    Transcriber,
+    TranscriptionError,
+    frame_voice_prompt,
+)
 from engine.core.uploads import frame_attachment_prompt
 
 logger = logging.getLogger("unpacker.engine")
@@ -85,6 +90,18 @@ _HELP = (
 _UNSUPPORTED = (
     "Такой тип сообщений я пока не принимаю (голос, видео, аудио, стикеры).\n"
     "Пришли текст, документ или фото — их разберу."
+)
+# Когда распознавание включено, речь мы УЖЕ принимаем — старый текст стал бы враньём,
+# и человек перестал бы присылать голосовые, которые работают.
+_UNSUPPORTED_WITH_VOICE = (
+    "Такой тип сообщений я пока не принимаю (видео, стикеры, геолокация).\n"
+    "Пришли текст, голосовое, документ или фото — их разберу."
+)
+# Отказ на речь, когда распознаватель не настроен. Говорим ПРИЧИНУ: «не принимаю» без
+# причины выглядит поломкой, а тут не хватает одной строки в .env.
+_VOICE_DISABLED = (
+    "Голосовые я пока не расшифровываю — не настроен сервис распознавания.\n"
+    "Пришли текстом, или добавь ключ распознавания в .env инстанса."
 )
 _REAPER_INTERVAL = 60.0
 
@@ -136,6 +153,7 @@ class TelegramBot:
         buttons: ButtonRegistry | None = None,
         intake: AttachmentIntake | None = None,
         send_file: SendFilePolicy | None = None,
+        transcriber: Transcriber | None = None,
     ):
         # Bot передаётся готовым (один на процесс): тот же объект шлёт алерты владельцу
         # (make_owner_alert) и ведёт polling — два Bot на один токен не нужны.
@@ -152,6 +170,7 @@ class TelegramBot:
         self._buttons = buttons
         self._intake = intake
         self._send_file = send_file
+        self._transcriber = transcriber
         # Окна (chat:thread), в которых прямо сейчас идёт генерация — см. _is_busy (ADV-13)
         self._busy: set[str] = set()
         self._register()
@@ -175,6 +194,10 @@ class TelegramBot:
         # держим явным, чтобы будущий хендлер не перехватил файлы молча.
         self._dp.message(F.document)(self._on_attachment)
         self._dp.message(F.photo)(self._on_attachment)
+        # Речь — до F.text и до финального хендлера. Отдельный хендлер, а не ветка внутри
+        # _on_attachment: у файла судьба «лечь на диск и получить путь», у речи — «стать
+        # текстом владельца». Разные исходы, разные ошибки, разные сообщения человеку.
+        self._dp.message(F.voice | F.audio | F.video_note)(self._on_speech)
         self._dp.message(F.text)(self._on_text)
         # Финальный хендлер — ПОСЛЕДНИМ и без фильтра (C18/K11). До него доходят голос,
         # видео, аудио, стикеры, локации: раньше хендлера не было вовсе, и бот на них
@@ -338,6 +361,61 @@ class TelegramBot:
             chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
         )
 
+    async def _on_speech(self, message: Message) -> None:
+        """Голосовое/аудио/кружок → текст → обычный путь промпта (§5.5).
+
+        Порядок шагов важен и он не косметический: сначала файл ложится на диск (тот же
+        UploadStore, те же лимиты и та же проверка размера, что у документов), и только
+        потом идёт распознавание. Так у расшифровки всегда есть оригинал: если текст вышел
+        кривым, запись лежит рядом и её можно переслушать или прогнать заново.
+
+        Про размер отдельно: проверка живёт в AttachmentIntake и работает для ВСЕХ типов, а
+        не только для голосовых. Голосовые в лимит Bot API упереться практически не могут
+        (opus — это 120-240 КБ на минуту), а вот присланный музыкальный файл или WAV с
+        диктофона перебирает 20 МБ легко — типовая дыра в чужих реализациях.
+        """
+        if not self._guard(message):
+            return
+        if self._transcriber is None or self._intake is None:
+            await self._reply(message, _VOICE_DISABLED)
+            return
+        attachment = attachment_from_message(message)
+        if attachment is None:
+            return
+        chat_id, thread_id, user_id = self._coords(message)
+        await self._react(message)
+        try:
+            sid = self._router.ensure_session(chat_id=chat_id, thread_id=thread_id, user_id=user_id)
+        except NoProjectError:
+            await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
+            return
+
+        result = await self._intake.take(session_id=sid, attachment=attachment)
+        if result.path is None:
+            await self._send(chat_id, thread_id, result.error or "Файл не принят.")
+            return
+        try:
+            text = await self._transcriber.transcribe(result.path)
+        except TranscriptionError as exc:
+            # Текст исключения написан для человека — отдаём как есть, не переформулируем.
+            await self._send(chat_id, thread_id, str(exc))
+            return
+
+        # Пересланную запись помечаем: там говорит не владелец, и агент не должен
+        # приписать чужие слова ему — особенно если он ведёт долгую память о человеке.
+        forwarded = getattr(message, "forward_origin", None) is not None or (
+            getattr(message, "forward_date", None) is not None
+        )
+        prompt = frame_voice_prompt(
+            text=text, kind=attachment.kind, path=result.path, forwarded=forwarded
+        )
+        caption = (message.caption or "").strip()
+        if caption:
+            prompt = f"{caption}\n\n{prompt}"
+        await self._handle_prompt(
+            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
+        )
+
     async def _on_unsupported(self, message: Message) -> None:
         """Тип сообщения, который движок пока не умеет (голос, видео, стикер, локация).
 
@@ -346,7 +424,8 @@ class TelegramBot:
         """
         if not self._guard(message):
             return
-        await self._reply(message, _UNSUPPORTED)
+        text = _UNSUPPORTED_WITH_VOICE if self._transcriber else _UNSUPPORTED
+        await self._reply(message, text)
 
     async def _on_callback(self, callback: CallbackQuery) -> None:
         """Нажатие кнопки-вкладки (§9).

@@ -27,6 +27,7 @@ from engine.core.pool import ClientPool, compute_pool_ceiling
 from engine.core.security import AllowList
 from engine.core.sendfile import SEND_FILE_INSTRUCTIONS, SendFilePolicy
 from engine.core.store import Store
+from engine.core.transcribe import DeepgramTranscriber, load_keyterms
 from engine.core.uploads import UploadStore
 
 
@@ -114,6 +115,17 @@ def build_bot(settings: Settings) -> TelegramBot:
             uploads=UploadStore(settings.uploads_path),
             max_bytes=settings.max_upload_bytes,
         )
+    # Распознавание речи: объект есть — фича включена (та же конвенция, что выше).
+    # Ключа нет → None → голосовые получают честный отказ, как и раньше.
+    transcriber = None
+    if settings.voice_enabled and settings.deepgram_api_key:
+        transcriber = DeepgramTranscriber(
+            api_key=settings.deepgram_api_key,
+            language=settings.voice_language,
+            keyterms=load_keyterms(settings.voice_keyterms_path),
+            timeout=settings.voice_timeout,
+        )
+
     # Второй корень проверки путей `[SEND_FILE:]` — state/ инстанса (там же uploads):
     # принятый файл агент вправе вернуть. Берём ЯВНЫЙ STATE_DIR, а не parent(db_path):
     # при дефолтном `DB_PATH=state.db` корнем становился каталог инстанса с `.env`,
@@ -133,4 +145,5 @@ def build_bot(settings: Settings) -> TelegramBot:
         buttons=buttons,
         intake=intake,
         send_file=send_file,
+        transcriber=transcriber,
     )
