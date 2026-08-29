@@ -25,7 +25,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import assert_never
+from typing import Any, assert_never
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
@@ -83,7 +83,8 @@ _HELP = (
     "/model opus|sonnet|haiku — сменить модель\n"
     "/verbose 0|1 — показывать шаги работы\n\n"
     # Кнопки видно под ответом, а вот про файлы догадаться нельзя — говорим прямо (§9).
-    "Ещё можно прислать файл — документ или фото, разберу. Кнопки под ответом — быстрые задачи."
+    "Ещё можно прислать файл — документ или фото, разберу. "
+    "Голосовое расшифрую и отвечу по смыслу. Кнопки под ответом — быстрые задачи."
 )
 # Ответ на тип сообщения, которого движок не умеет (C18/K11). Говорим ЧТО не приняли и
 # что делать вместо этого: «не понял» без альтернативы — тупик для новичка.
@@ -101,7 +102,8 @@ _UNSUPPORTED_WITH_VOICE = (
 # причины выглядит поломкой, а тут не хватает одной строки в .env.
 _VOICE_DISABLED = (
     "Голосовые я пока не расшифровываю — не настроен сервис распознавания.\n"
-    "Пришли текстом, или добавь ключ распознавания в .env инстанса."
+    "Пришли текстом. Как включить расшифровку — написано в README движка "
+    "(нужен ключ Deepgram)."
 )
 _REAPER_INTERVAL = 60.0
 
@@ -132,6 +134,23 @@ def make_owner_alert(bot: Bot, owner_id: int) -> Callable[[str], None]:
         asyncio.create_task(_safe_send(bot, owner_id, f"⚠️ Движок деградировал: {detail}"))
 
     return alert
+
+
+def _is_own_voice(message: Any, kind: str) -> bool:  # noqa: ANN401 — как attachment_from_message
+    """Доверяем ли записи как собственной речи владельца (см. frame_voice_prompt).
+
+    Доверенное — ровно одно: голосовое, записанное здесь и не пересланное. Ни тип, ни факт
+    пересылки поодиночке границу не проводят: пересланное голосовое остаётся типом `voice`
+    (запись психолога проехала бы как команда владельца), а признак пересылки снимается
+    скачиванием и переотправкой — но переотправленная запись приезжает уже файлом, а файл
+    не доверен по типу. Работает связка, не признаки по отдельности.
+    """
+    if kind != "голосовое":
+        return False
+    forwarded = getattr(message, "forward_origin", None) is not None or (
+        getattr(message, "forward_date", None) is not None
+    )
+    return not forwarded
 
 
 async def _safe_send(bot: Bot, chat_id: int, text: str, thread_id: int | None = None) -> None:
@@ -173,6 +192,14 @@ class TelegramBot:
         self._transcriber = transcriber
         # Окна (chat:thread), в которых прямо сейчас идёт генерация — см. _is_busy (ADV-13)
         self._busy: set[str] = set()
+        # Замок на окно для речи. Нужен потому, что распознавание идёт ДО session_lock ядра:
+        # два голосовых уходят распознаваться одновременно, короткое возвращается раньше
+        # длинного и первым добегает до замка сессии. Замок дальше честно строит очередь —
+        # только уже в перепутанном порядке, и человек получает ответы не на те сообщения.
+        # Лечится тем, что забега просто не происходит: речь в одном окне обрабатывается
+        # строго по одной. Отдельный замок, а не session_lock ядра: тот берётся внутри
+        # agent.ask, и повторный захват снаружи повесил бы бота (asyncio.Lock не реентрантен).
+        self._speech_locks: dict[str, asyncio.Lock] = {}
         self._register()
 
     @property
@@ -372,7 +399,11 @@ class TelegramBot:
         Про размер отдельно: проверка живёт в AttachmentIntake и работает для ВСЕХ типов, а
         не только для голосовых. Голосовые в лимит Bot API упереться практически не могут
         (opus — это 120-240 КБ на минуту), а вот присланный музыкальный файл или WAV с
-        диктофона перебирает 20 МБ легко — типовая дыра в чужих реализациях.
+        диктофона перебирает 20 МБ легко.
+
+        Всё тело — под замком речи этого окна, и окно помечается занятым СРАЗУ, не после
+        распознавания: иначе два голосовых подряд обгоняют друг друга (см. _speech_locks), а
+        кнопка под предыдущим ответом успевает запустить второй прогон агента мимо ADV-13.
         """
         if not self._guard(message):
             return
@@ -383,38 +414,47 @@ class TelegramBot:
         if attachment is None:
             return
         chat_id, thread_id, user_id = self._coords(message)
-        await self._react(message)
-        try:
-            sid = self._router.ensure_session(chat_id=chat_id, thread_id=thread_id, user_id=user_id)
-        except NoProjectError:
-            await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
-            return
+        busy_key = self._router.surface_key(chat_id, thread_id)
 
-        result = await self._intake.take(session_id=sid, attachment=attachment)
-        if result.path is None:
-            await self._send(chat_id, thread_id, result.error or "Файл не принят.")
-            return
-        try:
-            text = await self._transcriber.transcribe(result.path)
-        except TranscriptionError as exc:
-            # Текст исключения написан для человека — отдаём как есть, не переформулируем.
-            await self._send(chat_id, thread_id, str(exc))
-            return
+        async with self._speech_lock(chat_id, thread_id):
+            self._busy.add(busy_key)
+            try:
+                await self._react(message)
+                try:
+                    sid = self._router.ensure_session(
+                        chat_id=chat_id, thread_id=thread_id, user_id=user_id
+                    )
+                except NoProjectError:
+                    await self._send(chat_id, thread_id, "Пока нет ни одного развёрнутого проекта.")
+                    return
 
-        # Пересланную запись помечаем: там говорит не владелец, и агент не должен
-        # приписать чужие слова ему — особенно если он ведёт долгую память о человеке.
-        forwarded = getattr(message, "forward_origin", None) is not None or (
-            getattr(message, "forward_date", None) is not None
-        )
-        prompt = frame_voice_prompt(
-            text=text, kind=attachment.kind, path=result.path, forwarded=forwarded
-        )
-        caption = (message.caption or "").strip()
-        if caption:
-            prompt = f"{caption}\n\n{prompt}"
-        await self._handle_prompt(
-            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
-        )
+                result = await self._intake.take(session_id=sid, attachment=attachment)
+                if result.path is None:
+                    await self._send(chat_id, thread_id, result.error or "Файл не принят.")
+                    return
+                try:
+                    text = await self._transcriber.transcribe(result.path)
+                except TranscriptionError as exc:
+                    # Текст исключения написан для человека — отдаём как есть.
+                    await self._send(chat_id, thread_id, str(exc))
+                    return
+
+                prompt = frame_voice_prompt(
+                    text=text,
+                    kind=attachment.kind,
+                    path=result.path,
+                    trusted=_is_own_voice(message, attachment.kind),
+                )
+                caption = (message.caption or "").strip()
+                if caption:
+                    prompt = f"{caption}\n\n{prompt}"
+                await self._handle_prompt(
+                    chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
+                )
+            finally:
+                # _handle_prompt снимает пометку сам; здесь — страховка на ранние выходы,
+                # иначе отказ на середине запер бы окно навсегда. discard идемпотентен.
+                self._busy.discard(busy_key)
 
     async def _on_unsupported(self, message: Message) -> None:
         """Тип сообщения, который движок пока не умеет (голос, видео, стикер, локация).
@@ -523,6 +563,15 @@ class TelegramBot:
             )
         finally:
             self._busy.discard(busy_key)
+
+    def _speech_lock(self, chat_id: int, thread_id: int | None) -> asyncio.Lock:
+        """Замок речи для окна. Создаётся лениво: окон может быть много, замков — сколько нужно."""
+        key = self._router.surface_key(chat_id, thread_id)
+        lock = self._speech_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._speech_locks[key] = lock
+        return lock
 
     def _is_busy(self, chat_id: int, thread_id: int | None) -> bool:
         """Идёт ли прямо сейчас генерация в этом окне (chat:thread).

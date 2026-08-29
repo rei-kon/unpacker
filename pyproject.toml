@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.15",
+    # Приезжает и транзитивно с aiogram, но распознавание речи зовёт его напрямую —
+    # объявляем явно, иначе смена HTTP-слоя в aiogram молча сломает голосовые.
+    "aiohttp>=3.9",
     "pydantic>=2.7",
     "pydantic-settings>=2.7",
     # Точный пин, а не >=: 0.2.121 несёт фикс «Stream closed» на долгих MCP-вызовах
