@@ -120,6 +120,13 @@ class AgentCore:
                     await self._pool.evict(session_id)
                     if outcome.kind == "auth_error":
                         self._flag_unhealthy(outcome)
+                    else:
+                        # Без этой строки причина исчезает бесследно: пользователю уходит
+                        # «детали в логах», а в логах пусто — outcome.detail нигде не писался.
+                        logger.error(
+                            "ask: исключение SDK — kind=%s тип=%s деталь=%s",
+                            outcome.kind, type(exc).__name__, outcome.detail, exc_info=True,
+                        )
                     return AskResult("", outcome)
 
                 outcome = last.outcome
@@ -144,6 +151,14 @@ class AgentCore:
                 # повторный exec_error — устойчиво сломан мозг/MCP; делаем видимым в health,
                 # иначе тихо жжёт двойной бюджет (ревью C: exec_error не поднимал health)
                 self._flag_unhealthy(Outcome("exec_error", "повторный сбой выполнения (мозг/MCP?)"))
+            else:
+                # other_error: единственное место, где эта причина вообще может быть записана.
+                # Health не трогаем (разовый обрыв связи — не повод объявлять бота больным),
+                # но в лог кладём, иначе разбираться придётся по транскриптам Claude-сессии.
+                logger.error(
+                    "ask: сессия %s завершилась как %s — %s",
+                    session_id, outcome.kind, outcome.detail or "деталь пустая",
+                )
             return AskResult(last.text, outcome)
 
     async def _generate(
