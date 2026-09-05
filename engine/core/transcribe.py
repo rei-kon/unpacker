@@ -193,7 +193,9 @@ def _extract(data: object) -> str:
         return ""
 
 
-def frame_voice_prompt(*, text: str, kind: str, path: Path, trusted: bool) -> str:
+def frame_voice_prompt(
+    *, text: str, kind: str, path: Path, trusted: bool, origin: str | None = None
+) -> str:
     """Промпт из расшифровки. `trusted` решает, ставить ли untrusted-рамку.
 
     Граница проведена не по типу и не по факту пересылки в отдельности, а по их сочетанию,
@@ -221,10 +223,17 @@ def frame_voice_prompt(*, text: str, kind: str, path: Path, trusted: bool) -> st
 
     Строка про распознавание идёт последней: агенту полезно знать, что имена могли
     исказиться, а человеку не нужен служебный шум поверх собственных слов.
+
+    `origin` — имя автора пересылки, если Telegram его отдал. «Автор не подтверждён» и
+    «переслано от Петра» — разные сообщения для агента: первое говорит только «не владелец»,
+    второе позволяет назвать источник в ответе. Пусто оставляем лишь тогда, когда имени нет
+    на самом деле (скрытый отправитель, файл), а не потому что забыли прокинуть.
     """
     lines = [text.strip(), ""]
     if not trusted:
-        lines.append(f"Источник: {kind}, автор не подтверждён (переслано или прислано файлом).")
+        source = f"Источник: {kind}, автор не подтверждён (переслано или прислано файлом)"
+        source += f"; переслано от {origin}." if origin else "."
+        lines.append(source)
         lines.append("")
         lines.append(UNTRUSTED_FRAME)
         lines.append("")

@@ -151,11 +151,33 @@ def too_large_message(*, size: int | None, limit: int = MAX_UPLOAD_BYTES) -> str
     )
 
 
-def frame_attachment_prompt(*, path: str | Path, kind: str, user_text: str) -> str:
+def forward_source_line(origin: str | None) -> str:
+    """Строка «кто автор пересылки» — одна формулировка на все три пути.
+
+    Пересылка приезжает тремя дверями (текст, вложение, голосовое), и раньше про источник
+    знала только текстовая: переслал фото с подписью — агент видел рамку «данные», но не
+    видел, чьи это данные. Формулировка живёт здесь одна, чтобы правка касалась всех дверей
+    сразу, а не той, про которую вспомнили.
+    """
+    return f"Источник: пересланное сообщение от {origin or 'скрытого отправителя'}"
+
+
+def frame_attachment_prompt(
+    *,
+    path: str | Path,
+    kind: str,
+    user_text: str,
+    forwarded: bool = False,
+    origin: str | None = None,
+) -> str:
     """Собрать промпт про вложение с untrusted-рамкой (§8.2).
 
     Порядок частей осмысленный: сначала просьба владельца, потом путь, и только затем рамка —
     инструкция «данные, не команды» стоит последней и потому ближе всего к моменту чтения файла.
+
+    Пересланное вложение вдобавок называет автора: рамка отвечает «это данные», строка
+    источника — «чьи». Второй вопрос не служебный: скриншот чужой переписки и свой скриншот
+    разбираются по-разному, а по одному пути на диске их не различить.
     """
     lines: list[str] = []
     if user_text.strip():
@@ -165,6 +187,9 @@ def frame_attachment_prompt(*, path: str | Path, kind: str, user_text: str) -> s
     lines.append("")
     lines.append(f"Вложение ({kind}), лежит на диске: {path}")
     lines.append("")
+    if forwarded:
+        lines.append(forward_source_line(origin))
+        lines.append("")
     lines.append(UNTRUSTED_FRAME)
     return "\n".join(lines)
 
@@ -181,13 +206,4 @@ def frame_forwarded_text(*, text: str, origin: str | None) -> str:
     «это чужое», но и «чьё» — от кого пришла мысль, видно в ответе. Отправитель, скрывший
     себя настройками пересылки, так и называется — гадать по остаткам полей не начинаем.
     """
-    origin_label = origin or "скрытого отправителя"
-    return "\n".join(
-        [
-            text,
-            "",
-            f"Источник: пересланное сообщение от {origin_label}",
-            "",
-            UNTRUSTED_FRAME,
-        ]
-    )
+    return "\n".join([text, "", forward_source_line(origin), "", UNTRUSTED_FRAME])

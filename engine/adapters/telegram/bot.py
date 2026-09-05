@@ -429,7 +429,13 @@ class TelegramBot:
         if result.path is None:
             await self._send(chat_id, thread_id, result.error or "Файл не принят.")
             return
-        prompt = frame_attachment_prompt(path=result.path, kind=attachment.kind, user_text=caption)
+        prompt = frame_attachment_prompt(
+            path=result.path,
+            kind=attachment.kind,
+            user_text=caption,
+            forwarded=_is_forwarded(message),
+            origin=_forward_origin_label(message),
+        )
         await self._handle_prompt(
             chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
         )
@@ -492,6 +498,7 @@ class TelegramBot:
                     kind=attachment.kind,
                     path=result.path,
                     trusted=_is_own_voice(message, attachment.kind),
+                    origin=_forward_origin_label(message),
                 )
                 caption = (message.caption or "").strip()
                 if caption:

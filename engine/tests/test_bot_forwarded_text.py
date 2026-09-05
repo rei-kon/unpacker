@@ -19,8 +19,14 @@ from engine.core.pool import ClientPool
 from engine.core.security import AllowList
 from engine.core.sendfile import SendFilePolicy
 from engine.core.store import Store
-from engine.core.uploads import UNTRUSTED_FRAME, UploadStore, frame_forwarded_text
+from engine.core.uploads import (
+    UNTRUSTED_FRAME,
+    UploadStore,
+    frame_attachment_prompt,
+    frame_forwarded_text,
+)
 from engine.tests.test_bot_attachments import BUTTONS_YAML, OWNER, FakeBot, FakeCore
+from engine.tests.test_bot_speech import FakeTranscriber
 
 # ── рамка сама по себе ───────────────────────────────────────────────────────
 
@@ -139,7 +145,7 @@ def stand(tmp_path):
     store.close()
 
 
-def _build(stand):
+def _build(stand, *, transcriber=None):
     bot = FakeBot()
     core = FakeCore()
     router = SessionRouter(store=stand.store, core=core, default_project_slug="office")
@@ -152,6 +158,7 @@ def _build(stand):
         buttons=ButtonRegistry(stand.inst / "buttons.yaml"),
         intake=AttachmentIntake(bot=bot, uploads=UploadStore(stand.state / "uploads")),
         send_file=SendFilePolicy(state_root=stand.state),
+        transcriber=transcriber,
     )
     return SimpleNamespace(tg=tg, bot=bot, core=core)
 
@@ -181,3 +188,77 @@ async def test_own_text_stays_a_command(stand):
     s = _build(stand)
     await s.tg._on_text(_text_message("напомни завтра про замерщика"))
     assert s.core.prompts == ["напомни завтра про замерщика"]
+
+
+# ── вложения и голосовые: та же строка источника ─────────────────────────────
+
+
+def test_attachment_frame_names_origin_only_when_forwarded():
+    """Своё фото источника не получает: строка «переслано от…» поверх своего же скриншота
+    сбивала бы агента с толку не меньше, чем её отсутствие у чужого."""
+    own = frame_attachment_prompt(path="/tmp/a.jpg", kind="фото", user_text="что тут")
+    assert "Источник:" not in own
+    fwd = frame_attachment_prompt(
+        path="/tmp/a.jpg", kind="фото", user_text="что тут", forwarded=True, origin="Пётр Иванов"
+    )
+    assert "Источник: пересланное сообщение от Пётр Иванов" in fwd
+    assert fwd.endswith(UNTRUSTED_FRAME)
+
+
+def _photo_message(*, caption=None, origin=None, forward_date=None):
+    """Фото — тот же дублёр, что в test_bot_attachments, плюс поля пересылки."""
+    reacted: list = []
+    msg = SimpleNamespace(
+        text=None,
+        caption=caption,
+        document=None,
+        photo=[SimpleNamespace(file_id="P1", file_size=10, file_unique_id="u1")],
+        forward_origin=origin,
+        forward_date=forward_date,
+        message_thread_id=7,
+        chat=SimpleNamespace(id=100, type="private"),
+        from_user=SimpleNamespace(id=OWNER),
+        reacted=reacted,
+    )
+
+    async def react(items):
+        reacted.append(items)
+
+    msg.react = react
+    return msg
+
+
+async def test_forwarded_photo_with_caption_names_the_author(stand):
+    """Живой случай, из-за которого правка и появилась: фото с подписью ехало через путь
+    вложений, рамку получало, а автора — нет."""
+    s = _build(stand)
+    origin = SimpleNamespace(sender_user=SimpleNamespace(full_name="Пётр Иванов", username="petya"))
+    await s.tg._on_attachment(_photo_message(caption="глянь, что прислали", origin=origin))
+    prompt = s.core.prompts[0]
+    assert "глянь, что прислали" in prompt
+    assert "Источник: пересланное сообщение от Пётр Иванов (@petya)" in prompt
+    assert UNTRUSTED_FRAME in prompt
+
+
+async def test_own_photo_has_no_source_line(stand):
+    """Обратная сторона: своё фото остаётся своим — рамка есть, источника нет."""
+    s = _build(stand)
+    await s.tg._on_attachment(_photo_message(caption="мой скрин"))
+    prompt = s.core.prompts[0]
+    assert "Источник:" not in prompt
+    assert UNTRUSTED_FRAME in prompt
+
+
+async def test_forwarded_voice_names_the_author(stand):
+    """Третья дверь: у пересланной записи автор тоже должен быть виден."""
+    from engine.tests.test_bot_speech import _voice_message
+
+    s = _build(stand, transcriber=FakeTranscriber(text="я подумал вот что"))
+    msg = _voice_message()
+    msg.forward_origin = SimpleNamespace(
+        sender_user=SimpleNamespace(full_name="Пётр Иванов", username=None)
+    )
+    await s.tg._on_speech(msg)
+    prompt = s.core.prompts[0]
+    assert "переслано от Пётр Иванов" in prompt
+    assert UNTRUSTED_FRAME in prompt
