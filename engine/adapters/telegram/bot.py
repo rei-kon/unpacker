@@ -68,7 +68,7 @@ from engine.core.transcribe import (
     TranscriptionError,
     frame_voice_prompt,
 )
-from engine.core.uploads import frame_attachment_prompt
+from engine.core.uploads import frame_attachment_prompt, frame_forwarded_text
 
 logger = logging.getLogger("unpacker.engine")
 
@@ -136,6 +136,50 @@ def make_owner_alert(bot: Bot, owner_id: int) -> Callable[[str], None]:
     return alert
 
 
+def _is_forwarded(message: Any) -> bool:  # noqa: ANN401 — как attachment_from_message
+    """Переслано ли сообщение. Одно место на все проверки недоверия.
+
+    Два поля, а не одно: `forward_origin` приезжает не всегда (скрытый отправитель, старые
+    клиенты), а `forward_date` стоит у любой пересылки. Раньше эта связка жила внутри
+    `_is_own_voice`; текстовому пути нужна та же, и дублировать её значило бы однажды
+    поправить только одну копию.
+    """
+    return getattr(message, "forward_origin", None) is not None or (
+        getattr(message, "forward_date", None) is not None
+    )
+
+
+def _forward_origin_label(message: Any) -> str | None:  # noqa: ANN401 — как выше
+    """Кто автор пересланного сообщения — строкой для человека, или None.
+
+    Типов origin в Bot API четыре (пользователь, скрытый пользователь, чат, канал), и поля у
+    них разные. Читаем через `getattr`: незнакомый или будущий тип должен дать «источник не
+    определён», а не уронить приём сообщения — потеря имени тут дешевле потери сообщения.
+    """
+    origin = getattr(message, "forward_origin", None)
+    if origin is None:
+        return None
+    sender_user = getattr(origin, "sender_user", None)
+    if sender_user is not None:  # MessageOriginUser
+        name = (getattr(sender_user, "full_name", None) or "").strip()
+        username = (getattr(sender_user, "username", None) or "").strip()
+        if name and username:
+            return f"{name} (@{username})"
+        if username:
+            return f"@{username}"
+        return name or None
+    hidden = (getattr(origin, "sender_user_name", None) or "").strip()
+    if hidden:  # MessageOriginHiddenUser
+        return hidden
+    sender_chat = getattr(origin, "sender_chat", None)
+    if sender_chat is not None:  # MessageOriginChat
+        return (getattr(sender_chat, "title", None) or "").strip() or None
+    chat = getattr(origin, "chat", None)
+    if chat is not None:  # MessageOriginChannel
+        return (getattr(chat, "title", None) or "").strip() or None
+    return None
+
+
 def _is_own_voice(message: Any, kind: str) -> bool:  # noqa: ANN401 — как attachment_from_message
     """Доверяем ли записи как собственной речи владельца (см. frame_voice_prompt).
 
@@ -147,10 +191,7 @@ def _is_own_voice(message: Any, kind: str) -> bool:  # noqa: ANN401 — как a
     """
     if kind != "голосовое":
         return False
-    forwarded = getattr(message, "forward_origin", None) is not None or (
-        getattr(message, "forward_date", None) is not None
-    )
-    return not forwarded
+    return not _is_forwarded(message)
 
 
 async def _safe_send(bot: Bot, chat_id: int, text: str, thread_id: int | None = None) -> None:
@@ -350,8 +391,13 @@ class TelegramBot:
             return
         chat_id, thread_id, user_id = self._coords(message)
         await self._react(message)
+        prompt = (
+            frame_forwarded_text(text=message.text, origin=_forward_origin_label(message))
+            if _is_forwarded(message)
+            else message.text
+        )
         await self._handle_prompt(
-            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=message.text
+            chat_id=chat_id, thread_id=thread_id, user_id=user_id, prompt=prompt
         )
 
     async def _on_attachment(self, message: Message) -> None:
